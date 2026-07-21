@@ -18,9 +18,10 @@ operation-skill/
 │   │   ├── SKILL.md
 │   │   ├── scripts/
 │   │   └── references/
-│   └── <future-skill>/
+│   └── facebook-daily-comment/
 │       ├── SKILL.md
-│       └── ...
+│       ├── scripts/
+│       └── references/
 └── README.md
 ```
 
@@ -38,7 +39,9 @@ hermes skills tap add 02030708dw/operation-skill
 
 ```powershell
 hermes skills search facebook-daily-like
+hermes skills search facebook-daily-comment
 hermes skills install 02030708dw/operation-skill/facebook-daily-like
+hermes skills install 02030708dw/operation-skill/facebook-daily-comment
 ```
 
 安装后，如果 Hermes 会话已经打开，执行：
@@ -51,6 +54,7 @@ hermes skills install 02030708dw/operation-skill/facebook-daily-like
 
 ```text
 /facebook-daily-like
+/facebook-daily-comment
 ```
 
 检查和更新通过 Hermes 安装的 Skill：
@@ -73,6 +77,7 @@ hermes skills tap remove 02030708dw/operation-skill
 
 ```powershell
 hermes skills install 02030708dw/operation-skill/skills/facebook-daily-like
+hermes skills install 02030708dw/operation-skill/skills/facebook-daily-comment
 ```
 
 ### 方法三：使用 Git 拉取整个仓库
@@ -97,6 +102,7 @@ git pull
 | Skill | 版本 | 用途 | 支持平台 | 使用说明 |
 |---|---:|---|---|---|
 | `facebook-daily-like` | 2.1.0 | 通过 MYT HTTP API 并发操作云手机，为 Facebook 动态按指定数量点赞 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-daily-like/SKILL.md) |
+| `facebook-daily-comment` | 2.3.0 | 通过 MYT HTTP API 并发操作云手机，为 Facebook 动态发表指定数量和内容的评论 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-daily-comment/SKILL.md) |
 
 ## Skill 使用说明
 
@@ -149,6 +155,58 @@ git pull
 - 首次登录、短信验证、双因素验证和安全检查必须人工完成。
 - 实际执行前建议先预演，确认 Facebook 页面语言和按钮识别正常。
 - 详细参数、端口映射和排查方法请阅读 [`skills/facebook-daily-like/SKILL.md`](skills/facebook-daily-like/SKILL.md)。
+
+### `facebook-daily-comment`
+
+通过魔云腾（MYT）V1 HTTP API 操作一个或多个 Android 云手机，在已登录的 Facebook App 中查找动态，并按用户本次指定的数量和内容发表评论。
+
+主要特点：
+
+- 支持 T1001、T1002 等多个云手机同时执行。
+- 评论数量和内容没有默认值，必须由用户每次明确指定。
+- 根据当前 UI XML 动态识别评论按钮、输入框和发送按钮，不使用固定坐标。
+- 默认执行预演；只有用户明确授权后才会输入并发送评论。
+- 评论内容默认仅支持 1 至 200 个可打印 ASCII 字符。
+- 不保存 Facebook 账号、密码、验证码或 Token。
+
+#### 使用前准备
+
+- 安装 Python 3.9 或更高版本。
+- Hermes 所在电脑能够访问 MYT 控制器。
+- Facebook 已在目标云手机中人工登录完成。
+- 在本机配置 `MYT_HOST`，其值为 MYT 控制器的主机名或 IP。
+
+首次使用建议先检查连接：
+
+```text
+/facebook-daily-comment 检查 T1001 和 T1002 的连接，不要评论
+```
+
+#### 预演
+
+预演会同时启动目标云手机的任务并识别评论入口，但不会输入或发送评论：
+
+```text
+/facebook-daily-comment 为 T1001 和 T1002 各查找 3 篇可评论动态，评论内容为 Nice post!，只预演，不要执行
+```
+
+#### 执行评论
+
+用户必须明确填写设备、每台评论数量、评论内容和执行意图：
+
+```text
+/facebook-daily-comment 给 T1001 和 T1002 各评论 3 篇，内容为 Nice post!，立即执行
+```
+
+脚本会为每台目标云手机建立独立并发任务，全部任务结束后分别汇总已评论数量、剩余数量、搜索轮数和错误。部分完成时只能按汇总中的剩余数量补跑，避免重复评论。
+
+#### 常见注意事项
+
+- 除连接检查外，缺少评论数量或内容时不会执行。
+- 首次登录、短信验证、双因素验证和安全检查必须人工完成。
+- 中文、Emoji 和换行默认不受 Android `input text` 支持，请使用 ASCII 评论内容。
+- 实际执行前建议先预演；排障时不要同时使用详细诊断和真实执行模式。
+- 详细参数、恢复规则和排查方法请阅读 [`skills/facebook-daily-comment/SKILL.md`](skills/facebook-daily-comment/SKILL.md)。
 
 ## 添加新的 Skill
 
