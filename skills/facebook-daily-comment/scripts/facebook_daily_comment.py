@@ -125,7 +125,7 @@ class MytError(RuntimeError):
 
 
 class RuntimeLimitError(MytError):
-    """Raised before the outer Hermes terminal timeout can kill the script."""
+    """Raised when the inactivity watchdog or an explicit hard limit expires."""
 
 
 class ScreenStateError(MytError):
@@ -167,6 +167,7 @@ class MytClient:
         timeout: float,
         verbose: bool = False,
         deadline: float | None = None,
+        stall_timeout: float = 120.0,
         ui_dump_retries: int = 4,
         ui_dump_retry_wait: float = 1.0,
     ):
@@ -175,6 +176,11 @@ class MytClient:
         self.timeout = timeout
         self.verbose = verbose
         self.deadline = deadline
+        self.stall_timeout = stall_timeout
+        self.stall_deadline = (
+            time.monotonic() + stall_timeout if stall_timeout > 0 else None
+        )
+        self.last_progress = "device task started"
         self.ui_dump_retries = ui_dump_retries
         self.ui_dump_retry_wait = ui_dump_retry_wait
 
@@ -182,43 +188,73 @@ class MytClient:
     def base_url(self) -> str:
         return f"http://{self.host}:{self.port}"
 
+    def mark_progress(self, context: str) -> None:
+        """Refresh the inactivity watchdog after meaningful workflow progress."""
+        self.last_progress = context
+        if self.stall_timeout > 0:
+            self.stall_deadline = time.monotonic() + self.stall_timeout
+
+    def _active_limit(self) -> tuple[float, str] | None:
+        limits: list[tuple[float, str]] = []
+        if self.deadline is not None:
+            limits.append((self.deadline, "maximum runtime"))
+        if self.stall_deadline is not None:
+            limits.append((self.stall_deadline, "inactivity timeout"))
+        return min(limits, key=lambda item: item[0]) if limits else None
+
+    def _raise_expired_limit(self, context: str) -> None:
+        active = self._active_limit()
+        if active is None or active[0] > time.monotonic():
+            return
+        _, kind = active
+        if kind == "inactivity timeout":
+            raise RuntimeLimitError(
+                f"{self.host}:{self.port}: inactivity timeout after "
+                f"{self.stall_timeout:g}s without progress during {context}; "
+                f"last progress={self.last_progress}"
+            )
+        raise RuntimeLimitError(
+            f"{self.host}:{self.port}: optional maximum runtime reached during {context}"
+        )
+
     def _get(self, path: str, params: dict[str, str] | None = None) -> bytes:
         timeout = self.timeout
-        if self.deadline is not None:
-            remaining = self.deadline - time.monotonic()
+        active = self._active_limit()
+        if active is not None:
+            remaining = active[0] - time.monotonic()
             if remaining <= 0:
-                raise RuntimeLimitError(
-                    f"{self.host}:{self.port}: device runtime limit reached"
-                )
+                self._raise_expired_limit("HTTP request")
             timeout = min(timeout, max(0.1, remaining))
         query = f"?{urllib.parse.urlencode(params)}" if params else ""
         url = f"{self.base_url}{path}{query}"
         if self.verbose:
             log(f"    [{self.port}] GET {url}")
         request = urllib.request.Request(
-            url, headers={"User-Agent": "Hermes-MYT-Comment-Skill/2.7.2"}
+            url, headers={"User-Agent": "Hermes-MYT-Comment-Skill/2.8.0"}
         )
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 return response.read()
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            if self.deadline is not None and time.monotonic() >= self.deadline:
-                raise RuntimeLimitError(
-                    f"{self.host}:{self.port}: device runtime limit reached"
-                ) from exc
+            try:
+                self._raise_expired_limit("HTTP request")
+            except RuntimeLimitError as limit_exc:
+                raise limit_exc from exc
             raise MytError(f"{self.host}:{self.port}: {exc}") from exc
 
     def remaining_runtime(self) -> float | None:
+        active = self._active_limit()
+        if active is None:
+            return None
+        return active[0] - time.monotonic()
+
+    def remaining_hard_runtime(self) -> float | None:
         if self.deadline is None:
             return None
         return self.deadline - time.monotonic()
 
     def ensure_time(self, context: str = "operation") -> None:
-        remaining = self.remaining_runtime()
-        if remaining is not None and remaining <= 0:
-            raise RuntimeLimitError(
-                f"{self.host}:{self.port}: device runtime limit reached during {context}"
-            )
+        self._raise_expired_limit(context)
 
     def sleep(self, seconds: float, context: str = "wait") -> None:
         if seconds <= 0:
@@ -227,9 +263,7 @@ class MytClient:
         remaining = self.remaining_runtime()
         if remaining is not None:
             if remaining <= 0:
-                raise RuntimeLimitError(
-                    f"{self.host}:{self.port}: device runtime limit reached during {context}"
-                )
+                self._raise_expired_limit(context)
             seconds = min(seconds, max(0.0, remaining))
         time.sleep(seconds)
         self.ensure_time(context)
@@ -1103,7 +1137,7 @@ def recover_facebook(
             error=True,
         )
         return False
-    remaining = client.remaining_runtime()
+    remaining = client.remaining_hard_runtime()
     if remaining is not None and remaining < args.recovery_min_runtime:
         log(
             f"  [{device_label}] not enough runtime left for recovery "
@@ -1121,6 +1155,7 @@ def recover_facebook(
     try:
         close_facebook_for_recovery(client, args, device_label)
         state = prepare_facebook_screen(client, args, device_label)
+        client.mark_progress("automatic recovery reached Facebook")
         if args.verbose:
             log(f"  [{device_label}] recovery prepared screen state: {state}")
         for _ in range(args.recovery_scrolls):
@@ -1165,7 +1200,8 @@ def run_device(
         device.port,
         args.timeout,
         args.verbose,
-        deadline=started_at + args.max_runtime,
+        deadline=(started_at + args.max_runtime if args.max_runtime > 0 else None),
+        stall_timeout=args.stall_timeout,
         ui_dump_retries=args.ui_dump_retries,
         ui_dump_retry_wait=args.ui_dump_retry_wait,
     )
@@ -1205,6 +1241,7 @@ def run_device(
             screen_state = "feed"
         if args.verbose:
             log(f"  [{device.label}] prepared screen state: {screen_state}")
+        client.mark_progress(f"Facebook screen prepared: {screen_state}")
         for _ in range(args.initial_scrolls):
             client.ensure_time("initial scroll")
             client.swipe_up(args.swipe)
@@ -1213,9 +1250,22 @@ def run_device(
         no_button_cycles = 0
         skipped_duplicate_keys: set[str] = set()
         processed_keys: set[str] = set()
-        for cycle in range(1, args.max_cycles + 1):
+        search_cycles_without_verified = 0
+        total_cycles = 0
+        while int(summary["commented"]) < args.count:
+            if search_cycles_without_verified >= args.max_cycles:
+                reason = (
+                    f"no verified comment completed for {args.max_cycles} "
+                    "consecutive search cycles"
+                )
+                summary["status"] = "search-timeout"
+                summary["error"] = reason
+                log(f"  [{device.label}] SEARCH TIMEOUT: {reason}", error=True)
+                return summary
+            search_cycles_without_verified += 1
+            total_cycles += 1
             client.ensure_time("comment search")
-            summary["cycles"] = cycle
+            summary["cycles"] = total_cycles
             try:
                 xml_data = client.dump_ui()
             except MytError as exc:
@@ -1229,7 +1279,7 @@ def run_device(
             state = classify_screen(xml_data)
             if args.verbose:
                 log(
-                    f"  [{device.label}] cycle {cycle}: "
+                    f"  [{device.label}] cycle {total_cycles}: "
                     f"{len(buttons)} comment candidate(s), state={state}"
                 )
                 if not buttons:
@@ -1300,6 +1350,7 @@ def run_device(
                 continue
 
             button, post_signature, key = random.choice(candidate_infos)
+            client.mark_progress("new comment candidate selected")
             log(
                 f"  [{device.label}] candidate: ({button.x}, {button.y}) "
                 f"description={button.description!r} "
@@ -1360,6 +1411,7 @@ def run_device(
                     continue
                 return_to_feed(client, args, device.label)
                 continue
+            client.mark_progress("comment input field found")
 
             if args.visible_dedupe and visible_duplicate_comment_exists(
                 panel_xml, args.comment
@@ -1440,6 +1492,7 @@ def run_device(
                 client.sleep(0.5, "dismiss keyboard")
                 return_to_feed(client, args, device.label)
                 continue
+            client.mark_progress("send button found after text input")
 
             summary["sent_taps"] = int(summary["sent_taps"]) + 1
             try:
@@ -1491,6 +1544,8 @@ def run_device(
                 post_signature,
                 verify_reason,
             )
+            client.mark_progress("comment send verified")
+            search_cycles_without_verified = 0
             if int(summary["commented"]) >= args.count:
                 log(
                     f"  [{device.label}] target reached; "
@@ -1511,14 +1566,14 @@ def run_device(
                     continue
                 raise
 
-        summary["status"] = "target-not-reached"
-        return summary
     except RuntimeLimitError as exc:
-        summary["status"] = "time-limit-reached"
+        stalled = "inactivity timeout" in str(exc)
+        summary["status"] = "stalled-timeout" if stalled else "time-limit-reached"
         summary["error"] = str(exc)
         log(
-            f"  [{device.label}] TIME LIMIT: returning partial result "
-            f"before Hermes terminal timeout ({summary['commented']}/{args.count})",
+            f"  [{device.label}] "
+            f"{'STALL TIMEOUT' if stalled else 'OPTIONAL TIME LIMIT'}: "
+            f"returning partial result ({summary['commented']}/{args.count})",
             error=True,
         )
         return summary
@@ -1606,8 +1661,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-runtime",
         type=float,
-        default=os.getenv("MYT_MAX_RUNTIME", "80"),
-        help="per-device runtime limit in seconds; default 80",
+        default=0,
+        help="optional hard per-device limit in seconds; 0 disables it (default)",
+    )
+    parser.add_argument(
+        "--stall-timeout",
+        type=float,
+        default=os.getenv("MYT_STALL_TIMEOUT", "120"),
+        help="seconds without meaningful progress before stopping; default 120",
     )
     parser.add_argument(
         "--ui-dump-retries", type=int, default=4,
@@ -1802,8 +1863,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ConfigurationError("--port-stride must be at least 1")
     if args.timeout <= 0:
         raise ConfigurationError("--timeout must be greater than 0")
-    if args.max_runtime <= 0:
-        raise ConfigurationError("--max-runtime must be greater than 0")
+    if args.max_runtime < 0:
+        raise ConfigurationError("--max-runtime cannot be negative")
+    if args.stall_timeout <= 0:
+        raise ConfigurationError("--stall-timeout must be greater than 0")
     if args.panel_retries < 1 or args.send_retries < 1:
         raise ConfigurationError("retry counts must be at least 1")
     if args.post_send_verify_retries < 1:

@@ -101,8 +101,8 @@ git pull
 
 | Skill | 版本 | 用途 | 支持平台 | 使用说明 |
 |---|---:|---|---|---|
-| `facebook-daily-like` | 2.1.0 | 通过 MYT HTTP API 并发操作云手机，为 Facebook 动态按指定数量点赞 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-daily-like/SKILL.md) |
-| `facebook-daily-comment` | 2.3.0 | 通过 MYT HTTP API 并发操作云手机，为 Facebook 动态发表指定数量和内容的评论 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-daily-comment/SKILL.md) |
+| `facebook-daily-like` | 2.2.1 | 通过 MYT HTTP API 并发操作云手机，为 Facebook 动态按指定数量点赞 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-daily-like/SKILL.md) |
+| `facebook-daily-comment` | 2.8.0 | 通过 MYT HTTP API 并发操作云手机，为 Facebook 动态发表指定数量和内容的评论 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-daily-comment/SKILL.md) |
 
 ## Skill 使用说明
 
@@ -166,6 +166,8 @@ git pull
 - 评论数量和内容没有默认值，必须由用户每次明确指定。
 - 根据当前 UI XML 动态识别评论按钮、输入框和发送按钮，不使用固定坐标。
 - 默认执行预演；只有用户明确授权后才会输入并发送评论。
+- 默认记录已评论帖子的指纹，并扫描可见的相同评论，降低重复评论风险。
+- 页面异常时可自动恢复；正常任务不设固定总时限，仅在连续 120 秒无实质进展时停止。
 - 评论内容默认仅支持 1 至 200 个可打印 ASCII 字符。
 - 不保存 Facebook 账号、密码、验证码或 Token。
 
@@ -198,7 +200,7 @@ git pull
 /facebook-daily-comment 给 T1001 和 T1002 各评论 3 篇，内容为 Nice post!，立即执行
 ```
 
-脚本会为每台目标云手机建立独立并发任务，全部任务结束后分别汇总已评论数量、剩余数量、搜索轮数和错误。部分完成时只能按汇总中的剩余数量补跑，避免重复评论。
+脚本会为每台目标云手机建立独立并发任务，全部任务结束后分别汇总已评论数量、发送点击次数、恢复次数、跳过的重复帖子、剩余数量、搜索轮数和错误。部分完成时只能按汇总中的剩余数量补跑，避免重复评论。
 
 #### 常见注意事项
 
@@ -206,6 +208,9 @@ git pull
 - 首次登录、短信验证、双因素验证和安全检查必须人工完成。
 - 中文、Emoji 和换行默认不受 Android `input text` 支持，请使用 ASCII 评论内容。
 - 实际执行前建议先预演；排障时不要同时使用详细诊断和真实执行模式。
+- 正常执行保持 `--max-runtime 0`；外层命令超时至少设置为 `max(600, 120 + 每台目标数量 × 90)` 秒。
+- `sent_taps` 不代表评论成功；出现 `unverified-send` 时必须先人工核对，不能直接补跑。
+- 自动恢复或防重复跳过不会改变补跑原则：仅对未完成设备按汇总中的 `remaining` 执行。
 - 详细参数、恢复规则和排查方法请阅读 [`skills/facebook-daily-comment/SKILL.md`](skills/facebook-daily-comment/SKILL.md)。
 
 ## 添加新的 Skill
