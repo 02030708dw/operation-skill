@@ -22,10 +22,15 @@ operation-skill/
 │   │   ├── SKILL.md
 │   │   ├── scripts/
 │   │   └── references/
-│   └── facebook-followed-video-download/
+│   ├── facebook-followed-video-download/
+│   │   ├── SKILL.md
+│   │   ├── scripts/
+│   │   ├── examples/
+│   │   └── references/
+│   └── cloudflare-r2-video-upload/
 │       ├── SKILL.md
 │       ├── scripts/
-│       ├── examples/
+│       ├── tests/
 │       └── references/
 └── README.md
 ```
@@ -46,9 +51,11 @@ hermes skills tap add 02030708dw/operation-skill
 hermes skills search facebook-daily-like
 hermes skills search facebook-daily-comment
 hermes skills search facebook-followed-video-download
+hermes skills search cloudflare-r2-video-upload
 hermes skills install 02030708dw/operation-skill/facebook-daily-like
 hermes skills install 02030708dw/operation-skill/facebook-daily-comment
 hermes skills install 02030708dw/operation-skill/facebook-followed-video-download
+hermes skills install 02030708dw/operation-skill/cloudflare-r2-video-upload
 ```
 
 安装后，如果 Hermes 会话已经打开，执行：
@@ -63,6 +70,7 @@ hermes skills install 02030708dw/operation-skill/facebook-followed-video-downloa
 /facebook-daily-like
 /facebook-daily-comment
 /facebook-followed-video-download
+/cloudflare-r2-video-upload
 ```
 
 检查和更新通过 Hermes 安装的 Skill：
@@ -87,6 +95,7 @@ hermes skills tap remove 02030708dw/operation-skill
 hermes skills install 02030708dw/operation-skill/skills/facebook-daily-like
 hermes skills install 02030708dw/operation-skill/skills/facebook-daily-comment
 hermes skills install 02030708dw/operation-skill/skills/facebook-followed-video-download
+hermes skills install 02030708dw/operation-skill/skills/cloudflare-r2-video-upload
 ```
 
 ### 方法三：使用 Git 拉取整个仓库
@@ -113,6 +122,7 @@ git pull
 | `facebook-daily-like` | 2.2.1 | 通过 MYT HTTP API 并发操作云手机，为 Facebook 动态按指定数量点赞 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-daily-like/SKILL.md) |
 | `facebook-daily-comment` | 2.8.0 | 通过 MYT HTTP API 并发操作云手机，为 Facebook 动态发表指定数量和内容的评论 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-daily-comment/SKILL.md) |
 | `facebook-followed-video-download` | 1.0.0 | 扫描获准访问的 Facebook 来源，按来源下载新增视频、去重并生成报告 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-followed-video-download/SKILL.md) |
+| `cloudflare-r2-video-upload` | 1.0.0 | 将本地视频安全上传到 Cloudflare R2，支持预演、并发、自动分片、去重检查和报告 | Windows、Linux、macOS | [查看 SKILL.md](skills/cloudflare-r2-video-upload/SKILL.md) |
 
 ## Skill 使用说明
 
@@ -268,6 +278,47 @@ git pull
 首次全量导入可明确指定“全部”或“不限制数量”。大型任务正常运行时不应被短时间限制误判为超时；应等待同一进程结束，避免重复启动下载。
 
 详细参数、安全边界和故障处理请阅读 [`skills/facebook-followed-video-download/SKILL.md`](skills/facebook-followed-video-download/SKILL.md)。
+
+### `cloudflare-r2-video-upload`
+
+将单个视频或整个本地目录递归上传到 Cloudflare R2 对象存储，保留相对目录结构，并对大视频自动使用 multipart 分片传输。
+
+主要特点：
+
+- 默认仅预演，只有明确要求上传时才执行。
+- 支持多个文件并发上传和单个大文件分片并发。
+- 上传前通过对象键和文件大小判断是否已存在。
+- 同名同大小对象自动跳过；同名不同大小对象默认停止冲突，不会擅自覆盖。
+- 上传完成后重新读取远端对象大小进行验证。
+- 凭据仅从本机 `CLOUDFLARE_R2_*` 环境变量读取，不写入命令、报告或仓库。
+
+#### 使用前准备
+
+- 在 Cloudflare R2 创建仅限目标存储桶的 Object Read & Write S3 API 凭据。
+- 在 Hermes 使用的本机环境中配置 `CLOUDFLARE_R2_ACCOUNT_ID`、`CLOUDFLARE_R2_ACCESS_KEY_ID`、`CLOUDFLARE_R2_SECRET_ACCESS_KEY` 和 `CLOUDFLARE_R2_BUCKET`。
+- 安装 Python 依赖 `boto3`。
+
+检查连接：
+
+```text
+/cloudflare-r2-video-upload 检查 R2 配置和存储桶连接，不要上传
+```
+
+预演：
+
+```text
+/cloudflare-r2-video-upload 检查 C:\Users\me\Desktop\Facebook 下准备上传的前 10 个视频，R2 前缀为 facebook，不要上传
+```
+
+执行：
+
+```text
+/cloudflare-r2-video-upload 把 C:\Users\me\Desktop\Facebook 下全部视频上传到 R2 的 facebook 前缀，并发 3 个，立即执行
+```
+
+大型任务正常运行时不应被短时间限制误判为超时。终端暂时停止等待时，应继续监控同一进程，不能重复启动上传。
+
+详细配置、安全规则和冲突处理请阅读 [`skills/cloudflare-r2-video-upload/SKILL.md`](skills/cloudflare-r2-video-upload/SKILL.md)。
 
 ## 添加新的 Skill
 
