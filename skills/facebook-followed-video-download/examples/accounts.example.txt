@@ -1,0 +1,6 @@
+# facebook-followed-video-download source list
+# Each active line uses: folder-name<TAB>facebook-url
+# Use public or explicitly permitted Facebook creator/page/Reels/video URLs.
+#
+# example-page	https://www.facebook.com/example/reels/
+# single-video	https://www.facebook.com/reel/1234567890

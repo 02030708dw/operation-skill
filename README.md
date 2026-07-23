@@ -18,9 +18,14 @@ operation-skill/
 │   │   ├── SKILL.md
 │   │   ├── scripts/
 │   │   └── references/
-│   └── facebook-daily-comment/
+│   ├── facebook-daily-comment/
+│   │   ├── SKILL.md
+│   │   ├── scripts/
+│   │   └── references/
+│   └── facebook-followed-video-download/
 │       ├── SKILL.md
 │       ├── scripts/
+│       ├── examples/
 │       └── references/
 └── README.md
 ```
@@ -40,8 +45,10 @@ hermes skills tap add 02030708dw/operation-skill
 ```powershell
 hermes skills search facebook-daily-like
 hermes skills search facebook-daily-comment
+hermes skills search facebook-followed-video-download
 hermes skills install 02030708dw/operation-skill/facebook-daily-like
 hermes skills install 02030708dw/operation-skill/facebook-daily-comment
+hermes skills install 02030708dw/operation-skill/facebook-followed-video-download
 ```
 
 安装后，如果 Hermes 会话已经打开，执行：
@@ -55,6 +62,7 @@ hermes skills install 02030708dw/operation-skill/facebook-daily-comment
 ```text
 /facebook-daily-like
 /facebook-daily-comment
+/facebook-followed-video-download
 ```
 
 检查和更新通过 Hermes 安装的 Skill：
@@ -78,6 +86,7 @@ hermes skills tap remove 02030708dw/operation-skill
 ```powershell
 hermes skills install 02030708dw/operation-skill/skills/facebook-daily-like
 hermes skills install 02030708dw/operation-skill/skills/facebook-daily-comment
+hermes skills install 02030708dw/operation-skill/skills/facebook-followed-video-download
 ```
 
 ### 方法三：使用 Git 拉取整个仓库
@@ -103,6 +112,7 @@ git pull
 |---|---:|---|---|---|
 | `facebook-daily-like` | 2.2.1 | 通过 MYT HTTP API 并发操作云手机，为 Facebook 动态按指定数量点赞 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-daily-like/SKILL.md) |
 | `facebook-daily-comment` | 2.8.0 | 通过 MYT HTTP API 并发操作云手机，为 Facebook 动态发表指定数量和内容的评论 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-daily-comment/SKILL.md) |
+| `facebook-followed-video-download` | 1.0.0 | 扫描获准访问的 Facebook 来源，按来源下载新增视频、去重并生成报告 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-followed-video-download/SKILL.md) |
 
 ## Skill 使用说明
 
@@ -212,6 +222,52 @@ git pull
 - `sent_taps` 不代表评论成功；出现 `unverified-send` 时必须先人工核对，不能直接补跑。
 - 自动恢复或防重复跳过不会改变补跑原则：仅对未完成设备按汇总中的 `remaining` 执行。
 - 详细参数、恢复规则和排查方法请阅读 [`skills/facebook-daily-comment/SKILL.md`](skills/facebook-daily-comment/SKILL.md)。
+
+### `facebook-followed-video-download`
+
+从用户配置的 Facebook Page、创作者、Reels、watch 或视频链接中查找新视频，按来源保存到独立目录，并通过 URL 与 `yt-dlp` 双重归档避免重复下载。
+
+主要特点：
+
+- 支持 Windows、Linux 和 macOS，不包含固定用户名、盘符或 Chrome 路径。
+- 默认只预演；只有用户明确要求下载时才使用真实执行模式。
+- `--count` 表示每个来源本次最多下载多少个，`0` 表示不限制。
+- 每次真实执行生成 Markdown、JSON 和原始日志报告。
+- 不保存账号、密码、Token 或 cookie 内容；可选 cookie 只能通过本地文件路径引用。
+
+#### 使用前准备
+
+- 安装 Python、Node.js、npm、Google Chrome/Chromium 和 `yt-dlp`。
+- 在 Skill 的 `scripts/` 目录运行一次 `npm install`。
+- 只添加公开内容或用户明确获准下载的 Facebook 来源。
+
+初始化来源文件：
+
+```text
+/facebook-followed-video-download 初始化来源配置
+```
+
+添加来源：
+
+```text
+/facebook-followed-video-download 添加来源 creator-one，地址为 https://www.facebook.com/example/reels/
+```
+
+#### 预演
+
+```text
+/facebook-followed-video-download 查找每个来源最新 3 个视频，详细预演，不要下载
+```
+
+#### 执行下载
+
+```text
+/facebook-followed-video-download 下载每个来源最新 3 个视频，立即执行
+```
+
+首次全量导入可明确指定“全部”或“不限制数量”。大型任务正常运行时不应被短时间限制误判为超时；应等待同一进程结束，避免重复启动下载。
+
+详细参数、安全边界和故障处理请阅读 [`skills/facebook-followed-video-download/SKILL.md`](skills/facebook-followed-video-download/SKILL.md)。
 
 ## 添加新的 Skill
 
