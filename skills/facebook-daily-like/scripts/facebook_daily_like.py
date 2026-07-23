@@ -39,6 +39,16 @@ DEFAULT_CONTEXT_EXCLUDE_LABELS = (
     "回覆",
     "留下心情",
 )
+EXPLICIT_POST_LIKE_PREFIXES = (
+    "赞按钮",
+    "讚按鈕",
+    "like button",
+)
+COMMENT_REACTION_PATTERNS = (
+    re.compile(r"(?:赞|讚).{1,100}(?:的评论|的評論)(?:按钮|按鈕)"),
+    re.compile(r"\blike\b.{1,100}\b(?:a |the |this )?comment\b", re.IGNORECASE),
+    re.compile(r"\breact to\b.{0,100}\bcomment\b", re.IGNORECASE),
+)
 BOUNDS_RE = re.compile(r"^\[(\d+),(\d+)\]\[(\d+),(\d+)\]$")
 PRINT_LOCK = threading.Lock()
 FACEBOOK_PACKAGE = "com.facebook.katana"
@@ -87,6 +97,7 @@ class MytClient:
         timeout: float,
         verbose: bool = False,
         deadline: float | None = None,
+        stall_timeout: float = 120.0,
         ui_dump_retries: int = 4,
         ui_dump_retry_wait: float = 1.0,
     ):
@@ -95,6 +106,11 @@ class MytClient:
         self.timeout = timeout
         self.verbose = verbose
         self.deadline = deadline
+        self.stall_timeout = stall_timeout
+        self.stall_deadline = (
+            time.monotonic() + stall_timeout if stall_timeout > 0 else None
+        )
+        self.last_progress = "device task started"
         self.ui_dump_retries = ui_dump_retries
         self.ui_dump_retry_wait = ui_dump_retry_wait
 
@@ -102,14 +118,42 @@ class MytClient:
     def base_url(self) -> str:
         return f"http://{self.host}:{self.port}"
 
+    def mark_progress(self, context: str) -> None:
+        """Refresh the inactivity watchdog after meaningful workflow progress."""
+        self.last_progress = context
+        if self.stall_timeout > 0:
+            self.stall_deadline = time.monotonic() + self.stall_timeout
+
+    def _active_limit(self) -> tuple[float, str] | None:
+        limits: list[tuple[float, str]] = []
+        if self.deadline is not None:
+            limits.append((self.deadline, "maximum runtime"))
+        if self.stall_deadline is not None:
+            limits.append((self.stall_deadline, "inactivity timeout"))
+        return min(limits, key=lambda item: item[0]) if limits else None
+
+    def _raise_expired_limit(self, context: str) -> None:
+        active = self._active_limit()
+        if active is None or active[0] > time.monotonic():
+            return
+        _, kind = active
+        if kind == "inactivity timeout":
+            raise RuntimeLimitError(
+                f"{self.host}:{self.port}: inactivity timeout after "
+                f"{self.stall_timeout:g}s without progress during {context}; "
+                f"last progress={self.last_progress}"
+            )
+        raise RuntimeLimitError(
+            f"{self.host}:{self.port}: optional maximum runtime reached during {context}"
+        )
+
     def _get(self, path: str, params: dict[str, str] | None = None) -> bytes:
         timeout = self.timeout
-        if self.deadline is not None:
-            remaining = self.deadline - time.monotonic()
+        active = self._active_limit()
+        if active is not None:
+            remaining = active[0] - time.monotonic()
             if remaining <= 0:
-                raise RuntimeLimitError(
-                    f"{self.host}:{self.port}: device runtime limit reached"
-                )
+                self._raise_expired_limit("HTTP request")
             timeout = min(timeout, max(0.1, remaining))
         query = f"?{urllib.parse.urlencode(params)}" if params else ""
         url = f"{self.base_url}{path}{query}"
@@ -117,29 +161,31 @@ class MytClient:
             safe_url = url.replace("%2F", "/")
             log(f"    [{self.port}] GET {safe_url}")
         request = urllib.request.Request(
-            url, headers={"User-Agent": "Hermes-MYT-Like-Skill/2.2.1"}
+            url, headers={"User-Agent": "Hermes-MYT-Like-Skill/2.4.0"}
         )
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 return response.read()
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            if self.deadline is not None and time.monotonic() >= self.deadline:
-                raise RuntimeLimitError(
-                    f"{self.host}:{self.port}: device runtime limit reached"
-                ) from exc
+            try:
+                self._raise_expired_limit("HTTP request")
+            except RuntimeLimitError as limit_exc:
+                raise limit_exc from exc
             raise MytError(f"{self.host}:{self.port}: {exc}") from exc
 
     def remaining_runtime(self) -> float | None:
+        active = self._active_limit()
+        if active is None:
+            return None
+        return active[0] - time.monotonic()
+
+    def remaining_hard_runtime(self) -> float | None:
         if self.deadline is None:
             return None
         return self.deadline - time.monotonic()
 
     def ensure_time(self, context: str = "operation") -> None:
-        remaining = self.remaining_runtime()
-        if remaining is not None and remaining <= 0:
-            raise RuntimeLimitError(
-                f"{self.host}:{self.port}: device runtime limit reached during {context}"
-            )
+        self._raise_expired_limit(context)
 
     def sleep(self, seconds: float, context: str = "wait") -> None:
         if seconds <= 0:
@@ -148,9 +194,7 @@ class MytClient:
         remaining = self.remaining_runtime()
         if remaining is not None:
             if remaining <= 0:
-                raise RuntimeLimitError(
-                    f"{self.host}:{self.port}: device runtime limit reached during {context}"
-                )
+                self._raise_expired_limit(context)
             seconds = min(seconds, max(0.0, remaining))
         time.sleep(seconds)
         self.ensure_time(context)
@@ -296,11 +340,26 @@ def is_feed_like_description(
     description: str,
     include_labels: Iterable[str],
 ) -> bool:
-    """Accept a Like control while excluding comment/reply reaction controls."""
+    """Accept a post Like control while excluding comment reaction controls.
+
+    Some Facebook Chinese builds expose the main post control as
+    ``赞按钮，双击并长按即可给评论留下心情。``.  The word ``评论`` in that
+    generic accessibility hint does not mean this is a comment-level button.
+    A real comment reaction normally names the comment or its author, such as
+    ``赞Pierre的评论按钮``.  Prefer that structural sentence distinction over
+    rejecting every description that contains the word ``评论``.
+    """
     folded = description.casefold()
-    return bool(description) and any(
+    if not description or not any(
         label.casefold() in folded for label in include_labels
-    ) and not any(label in folded for label in DEFAULT_CONTEXT_EXCLUDE_LABELS)
+    ):
+        return False
+    stripped = folded.strip()
+    if any(stripped.startswith(prefix) for prefix in EXPLICIT_POST_LIKE_PREFIXES):
+        return True
+    if any(pattern.search(description) for pattern in COMMENT_REACTION_PATTERNS):
+        return False
+    return not any(label in folded for label in DEFAULT_CONTEXT_EXCLUDE_LABELS)
 
 
 def node_rect(node: ET.Element) -> tuple[int, int, int, int] | None:
@@ -619,6 +678,7 @@ def recover_facebook(
         prepare_facebook_screen(
             client, args, device_label, include_labels, exclude_labels
         )
+        client.mark_progress("automatic recovery reached Facebook")
         for _ in range(args.recovery_scrolls):
             client.ensure_time("recovery scroll")
             client.swipe_up(args.swipe)
@@ -644,7 +704,8 @@ def run_device(
         device.port,
         args.timeout,
         args.verbose,
-        deadline=started_at + args.max_runtime,
+        deadline=(started_at + args.max_runtime if args.max_runtime > 0 else None),
+        stall_timeout=args.stall_timeout,
         ui_dump_retries=args.ui_dump_retries,
         ui_dump_retry_wait=args.ui_dump_retry_wait,
     )
@@ -679,11 +740,25 @@ def run_device(
                 exclude_labels,
             ):
                 raise
+        client.mark_progress("Facebook screen prepared")
 
         no_button_cycles = 0
-        for cycle in range(1, args.max_cycles + 1):
+        search_cycles_without_verified = 0
+        total_cycles = 0
+        while int(summary["liked"]) < args.count:
+            if search_cycles_without_verified >= args.max_cycles:
+                reason = (
+                    f"no verified like completed for {args.max_cycles} "
+                    "consecutive search cycles"
+                )
+                summary["status"] = "search-timeout"
+                summary["error"] = reason
+                log(f"  [{device.label}] SEARCH TIMEOUT: {reason}", error=True)
+                return summary
+            search_cycles_without_verified += 1
+            total_cycles += 1
             client.ensure_time("like search")
-            summary["cycles"] = cycle
+            summary["cycles"] = total_cycles
             client.swipe_up(args.swipe)
             client.sleep(args.scroll_wait, "search scroll")
             try:
@@ -706,7 +781,7 @@ def run_device(
 
             if args.verbose:
                 log(
-                    f"  [{device.label}] cycle {cycle}: "
+                    f"  [{device.label}] cycle {total_cycles}: "
                     f"{len(buttons)} unliked candidate(s), state={state}"
                 )
                 if not buttons:
@@ -764,6 +839,7 @@ def run_device(
             no_button_cycles = 0
 
             button = buttons[0]
+            client.mark_progress("new like candidate selected")
             log(
                 f"  [{device.label}] candidate: ({button.x}, {button.y}) "
                 f"description={button.description!r}"
@@ -822,6 +898,8 @@ def run_device(
                     print_clickable_nodes(verify_xml, device.label)
                 return summary
             summary["liked"] = int(summary["liked"]) + 1
+            client.mark_progress("like tap verified")
+            search_cycles_without_verified = 0
             log(
                 f"  [{device.label}] like verified: {verify_reason} "
                 f"({summary['liked']}/{args.count})"
@@ -829,14 +907,15 @@ def run_device(
             if int(summary["liked"]) >= args.count:
                 return summary
 
-        summary["status"] = "target-not-reached"
         return summary
     except RuntimeLimitError as exc:
-        summary["status"] = "time-limit-reached"
+        stalled = "inactivity timeout" in str(exc)
+        summary["status"] = "stalled-timeout" if stalled else "time-limit-reached"
         summary["error"] = str(exc)
         log(
-            f"  [{device.label}] TIME LIMIT: returning partial result "
-            f"before Hermes terminal timeout ({summary['liked']}/{args.count})",
+            f"  [{device.label}] "
+            f"{'STALL TIMEOUT' if stalled else 'OPTIONAL TIME LIMIT'}: "
+            f"returning partial result ({summary['liked']}/{args.count})",
             error=True,
         )
         return summary
@@ -924,8 +1003,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-runtime",
         type=float,
-        default=os.getenv("MYT_MAX_RUNTIME", "80"),
-        help="per-device runtime limit in seconds; default 80",
+        default=0,
+        help="optional hard per-device limit in seconds; 0 disables it (default)",
+    )
+    parser.add_argument(
+        "--stall-timeout",
+        type=float,
+        default=os.getenv("MYT_STALL_TIMEOUT", "120"),
+        help="seconds without meaningful progress before stopping; default 120",
     )
     parser.add_argument(
         "--ui-dump-retries", type=int, default=4,
@@ -1076,8 +1161,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ConfigurationError("--port-stride must be at least 1")
     if args.timeout <= 0:
         raise ConfigurationError("--timeout must be greater than 0")
-    if args.max_runtime <= 0:
-        raise ConfigurationError("--max-runtime must be greater than 0")
+    if args.max_runtime < 0:
+        raise ConfigurationError("--max-runtime cannot be negative")
+    if args.stall_timeout <= 0:
+        raise ConfigurationError("--stall-timeout must be greater than 0")
     if args.ui_dump_retries < 1:
         raise ConfigurationError("--ui-dump-retries must be at least 1")
     if args.feed_ready_retries < 1:

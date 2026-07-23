@@ -119,7 +119,7 @@ git pull
 
 | Skill | 版本 | 用途 | 支持平台 | 使用说明 |
 |---|---:|---|---|---|
-| `facebook-daily-like` | 2.2.1 | 通过 MYT HTTP API 并发操作云手机，为 Facebook 动态按指定数量点赞 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-daily-like/SKILL.md) |
+| `facebook-daily-like` | 2.4.0 | 通过 MYT HTTP API 并发操作云手机，为 Facebook 动态按指定数量点赞 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-daily-like/SKILL.md) |
 | `facebook-daily-comment` | 2.8.0 | 通过 MYT HTTP API 并发操作云手机，为 Facebook 动态发表指定数量和内容的评论 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-daily-comment/SKILL.md) |
 | `facebook-followed-video-download` | 1.0.0 | 扫描获准访问的 Facebook 来源，按来源下载新增视频、去重并生成报告 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-followed-video-download/SKILL.md) |
 | `cloudflare-r2-video-upload` | 1.0.0 | 将本地视频安全上传到 Cloudflare R2，支持预演、并发、自动分片、去重检查和报告 | Windows、Linux、macOS | [查看 SKILL.md](skills/cloudflare-r2-video-upload/SKILL.md) |
@@ -135,6 +135,8 @@ git pull
 - 支持 T1001、T1002 等多个云手机同时执行。
 - 点赞数量没有固定默认值，必须由用户每次指定。
 - 根据当前 UI XML 动态识别点赞按钮，不使用固定点赞坐标。
+- 兼容新版中文 Facebook 的“赞按钮，双击并长按即可给评论留下心情”主帖入口，并按完整句型排除“赞某人的评论按钮”等评论点赞。
+- 正常任务默认不设固定总时限；持续找到候选或验证点赞时会刷新进度，只有连续 120 秒无实质进展才触发看门狗超时。
 - 默认执行预演；只有用户明确授权后才会真正点击。
 - 不保存 Facebook 账号、密码、验证码或 Token。
 
@@ -172,6 +174,8 @@ git pull
 #### 常见注意事项
 
 - `--count` 没有默认值；缺少点赞数量时不会执行。
+- 正常执行保持 `--max-runtime 0`，不要因为数量较大而添加 80 或 120 秒硬时限；`--stall-timeout 120` 只处理持续无进展。
+- Hermes 外层命令超时至少使用 `max(600, 120 + 每台目标数量 × 90)` 秒；多设备并发时按单台数量计算。
 - 首次登录、短信验证、双因素验证和安全检查必须人工完成。
 - 实际执行前建议先预演，确认 Facebook 页面语言和按钮识别正常。
 - 详细参数、端口映射和排查方法请阅读 [`skills/facebook-daily-like/SKILL.md`](skills/facebook-daily-like/SKILL.md)。
