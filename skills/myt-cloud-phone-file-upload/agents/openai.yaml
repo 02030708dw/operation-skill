@@ -1,0 +1,4 @@
+interface:
+  display_name: "MYT Cloud Phone File Upload"
+  short_description: "Upload files or folders to MYT cloud phones"
+  default_prompt: "Use $myt-cloud-phone-file-upload to preview uploading a user-specified file or folder to selected MYT cloud phones."

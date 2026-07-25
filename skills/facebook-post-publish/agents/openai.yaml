@@ -1,0 +1,4 @@
+interface:
+  display_name: "Facebook Post Publish"
+  short_description: "Publish text, image, or video posts on MYT phones"
+  default_prompt: "Use $facebook-post-publish to preview publishing a text, image, or video post on selected MYT cloud phones."

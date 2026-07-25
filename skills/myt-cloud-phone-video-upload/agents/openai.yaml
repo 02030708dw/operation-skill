@@ -1,0 +1,4 @@
+interface:
+  display_name: "MYT File Upload (Legacy Alias)"
+  short_description: "Backward-compatible MYT file upload command"
+  default_prompt: "Use $myt-cloud-phone-video-upload as a compatibility alias to upload a user-specified file or folder to selected MYT cloud phones."
