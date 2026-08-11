@@ -39,6 +39,11 @@ operation-skill/
 │   │   ├── scripts/
 │   │   ├── tests/
 │   │   └── references/
+│   ├── facebook-video-ingest/
+│   │   ├── SKILL.md
+│   │   ├── scripts/
+│   │   ├── tests/
+│   │   └── references/
 │   ├── myt-cloud-phone-video-upload/  # 旧命令兼容别名
 │   │   ├── SKILL.md
 │   │   ├── scripts/
@@ -75,6 +80,7 @@ hermes skills search facebook-daily-comment
 hermes skills search facebook-post-publish
 hermes skills search facebook-followed-video-download
 hermes skills search cloudflare-r2-video-upload
+hermes skills search facebook-video-ingest
 hermes skills search myt-cloud-phone-file-upload
 hermes skills search philippines-lottery-result-media
 hermes skills install 02030708dw/operation-skill/facebook-daily-like
@@ -82,6 +88,7 @@ hermes skills install 02030708dw/operation-skill/facebook-daily-comment
 hermes skills install 02030708dw/operation-skill/facebook-post-publish
 hermes skills install 02030708dw/operation-skill/facebook-followed-video-download
 hermes skills install 02030708dw/operation-skill/cloudflare-r2-video-upload
+hermes skills install 02030708dw/operation-skill/facebook-video-ingest
 hermes skills install 02030708dw/operation-skill/myt-cloud-phone-file-upload
 hermes skills install 02030708dw/operation-skill/philippines-lottery-result-media
 ```
@@ -100,6 +107,7 @@ hermes skills install 02030708dw/operation-skill/philippines-lottery-result-medi
 /facebook-post-publish
 /facebook-followed-video-download
 /cloudflare-r2-video-upload
+/facebook-video-ingest
 /myt-cloud-phone-file-upload
 /philippines-lottery-result-media
 ```
@@ -128,6 +136,7 @@ hermes skills install 02030708dw/operation-skill/skills/facebook-daily-comment
 hermes skills install 02030708dw/operation-skill/skills/facebook-post-publish
 hermes skills install 02030708dw/operation-skill/skills/facebook-followed-video-download
 hermes skills install 02030708dw/operation-skill/skills/cloudflare-r2-video-upload
+hermes skills install 02030708dw/operation-skill/skills/facebook-video-ingest
 hermes skills install 02030708dw/operation-skill/skills/myt-cloud-phone-file-upload
 hermes skills install 02030708dw/operation-skill/skills/philippines-lottery-result-media
 ```
@@ -156,8 +165,9 @@ git pull
 | `facebook-daily-like` | 2.4.0 | 通过 MYT HTTP API 并发操作云手机，为 Facebook 动态按指定数量点赞 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-daily-like/SKILL.md) |
 | `facebook-daily-comment` | 2.8.0 | 通过 MYT HTTP API 并发操作云手机，为 Facebook 动态发表指定数量和内容的评论 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-daily-comment/SKILL.md) |
 | `facebook-post-publish` | 1.2.0 | 在 MYT 云手机的 Facebook 中发布纯文字、图片或视频帖子，并严格校验图库素材类型 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-post-publish/SKILL.md) |
-| `facebook-followed-video-download` | 1.0.0 | 扫描获准访问的 Facebook 来源，按来源下载新增视频、去重并生成报告 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-followed-video-download/SKILL.md) |
-| `cloudflare-r2-video-upload` | 1.0.0 | 将本地视频安全上传到 Cloudflare R2，支持预演、并发、自动分片、去重检查和报告 | Windows、Linux、macOS | [查看 SKILL.md](skills/cloudflare-r2-video-upload/SKILL.md) |
+| `facebook-followed-video-download` | 1.1.0 | 扫描获准访问的 Facebook 来源，按来源下载新增视频、去重并输出可供后台消费的结果清单 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-followed-video-download/SKILL.md) |
+| `cloudflare-r2-video-upload` | 1.1.0 | 将本地视频或下载结果清单安全上传到 Cloudflare R2，支持校验、去重、并发和结果清单 | Windows、Linux、macOS | [查看 SKILL.md](skills/cloudflare-r2-video-upload/SKILL.md) |
+| `facebook-video-ingest` | 1.1.0 | 按后台任务编号定向认领，串联 Facebook 下载、R2 上传，并回写逐视频和执行记录 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-video-ingest/SKILL.md) |
 | `myt-cloud-phone-file-upload` | 2.0.0 | 将用户指定的单个文件或目录内全部文件并发上传到魔云腾云手机，保持相对子目录并验证每个文件 | Windows、Linux、macOS | [查看 SKILL.md](skills/myt-cloud-phone-file-upload/SKILL.md) |
 | `philippines-lottery-result-media` | 2.2.1 | 并发对比多个菲律宾彩票结果来源，为 2D、3D、4D、6D 生成高对比号码和时间字体、电影感动画、共享品牌素材和音乐的竖屏图片或视频 | Windows、Linux、macOS | [查看 SKILL.md](skills/philippines-lottery-result-media/SKILL.md) |
 
@@ -387,6 +397,28 @@ git pull
 大型任务正常运行时不应被短时间限制误判为超时。终端暂时停止等待时，应继续监控同一进程，不能重复启动上传。
 
 详细配置、安全规则和冲突处理请阅读 [`skills/cloudflare-r2-video-upload/SKILL.md`](skills/cloudflare-r2-video-upload/SKILL.md)。
+
+### `facebook-video-ingest`
+
+作为第一期后台执行 Worker，把一次 Facebook 抓取任务完整串联为：后台定向认领 → 本地下载并校验 → 上传 Cloudflare R2 → 回写逐视频结果和执行记录。后台的每个开始时间会同步为一个可见的 Hermes 五段式 Cron；点击“立即执行”会触发对应任务，但不改变每日 Cron 表达式。
+
+管理员需要同时安装本 Skill、`facebook-followed-video-download` 和 `cloudflare-r2-video-upload`，并在 Hermes 运行环境配置 `HM_BACKEND_URL`、`HM_WORKER_ID`、`HM_WORKER_TOKEN` 及 R2 环境变量。Worker Token 只能由管理员配置，不能发到聊天窗口或放进命令参数。
+
+首次检查：
+
+```text
+/facebook-video-ingest 检查后台、下载器和 R2 Worker 是否准备完成，不要认领任务
+```
+
+认领并执行至多一条任务：
+
+```text
+/facebook-video-ingest 认领并完整执行一条后台视频抓取任务
+```
+
+生产环境使用 `scripts/facebook_video_ingest.py --watch` 持续轮询，并交给操作系统服务管理器保持运行。脚本会在下载和上传期间持续发送心跳，并按执行编号持久保留下载清单；Worker 异常退出且租约过期后，后台会把执行记录重新放回队列，并复用仍通过文件大小和 SHA-256 校验的本地下载。
+
+详细配置、状态映射和后台 API 协议请阅读 [`skills/facebook-video-ingest/SKILL.md`](skills/facebook-video-ingest/SKILL.md)。
 
 ### `myt-cloud-phone-file-upload`
 

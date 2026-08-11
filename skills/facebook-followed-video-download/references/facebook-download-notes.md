@@ -6,6 +6,9 @@ Use this workflow only for content the user has permission to download. Do not b
 
 `yt-dlp` performs the media download. Keep both duplicate-prevention files enabled:
 
+The engine forces IPv4 and uses a 60-second socket timeout with two retries. This
+avoids Facebook media requests stalling on hosts whose IPv6 route is unavailable.
+
 - `.fb-video-urls.txt`: URLs successfully handled by this workflow
 - `.yt-dlp-archive.txt`: `yt-dlp` media archive
 

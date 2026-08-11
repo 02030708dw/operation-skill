@@ -1,8 +1,8 @@
 ---
 name: facebook-followed-video-download
-description: Find and download new, permitted Facebook Page, creator, Reels, watch, or direct video URLs into local per-source folders with duplicate prevention and reports. Use when the user asks Hermes to configure followed Facebook video sources, preview new videos, download the latest or all videos, list sources, check dependencies, or troubleshoot this downloader. Defaults to preview and downloads only with explicit execution approval.
+description: Find, download, or locally reuse recent permitted Facebook Page, creator, Reels, watch, or direct video URLs in per-source folders with archive-backed duplicate prevention and reports. Use when the user asks Hermes to configure followed Facebook video sources, preview recent videos, download the latest or all videos, list sources, check dependencies, or troubleshoot this downloader. Defaults to preview and downloads only with explicit execution approval.
 metadata:
-  version: "1.0.0"
+  version: "1.5.1"
   platforms:
     - windows
     - macos
@@ -54,9 +54,11 @@ Paths with `/` are intentional and work with Python on Windows. Do not call the 
 - Sources: `<state>/accounts.txt`
 - Reports: `<state>/reports/`
 - Downloads: the current user's `Desktop/Facebook/<source-folder>/`
-- Daily mode: at most 30 new videos per source and 8 scroll rounds
+- Daily mode: the first execution selects at most 10 recent videos; later executions select every update before the previous archive boundary, or fall back to the 10 most recent videos when there are no updates
+- Daily scanning: up to 80 adaptive scroll rounds, stopping early after the first archived video or three rounds without new links
 - Full mode: unlimited new videos per source and 80 scroll rounds
 - Execution: dry run unless `--execute` is present
+- Login profile: disabled until the user explicitly runs `--login`; stored only in the isolated Skill state directory
 
 The entry point infers `<hermes-home>` from its installed location. All defaults can be overridden with arguments, so the Skill is portable across computers.
 
@@ -78,12 +80,12 @@ Map the user's words to arguments:
 - “立即执行、开始下载、下载” -> add `--execute`
 - “最新、每日、新增” -> `--mode daily`
 - “全部、首次导入、全量” -> `--mode full`
-- “每个来源 N 个” -> `--count N`
-- “不限制数量” -> `--count 0`
+- “首次每个来源 N 个” -> `--initial-count N`
+- “首次不限制数量” -> `--initial-count 0`
 - “详细” -> `--verbose`
 - A custom destination -> `--output "<path>"`
 
-`--count` applies independently to every configured source. Never silently replace the user's number with a fixed value.
+`--initial-count` applies independently to every configured source and defines the recent-video fallback window (`--count` remains a compatibility alias). Never silently replace the user's number with a fixed value. The first execution selects that recent window. Later executions select every newest-first URL before the first archived video: two updates means two selected and 30 updates means all 30 selected. When there are no updates, the Skill selects the 10 most recent discovered videos instead.
 
 ## Common Operations
 
@@ -94,6 +96,16 @@ python "<skill-dir>/scripts/facebook_followed_video_download.py" --check
 ```
 
 Report the source count and whether preview and execution are ready. `yt-dlp` is required only for actual downloads. If the `ws` module is missing, run `npm install` inside `<skill-dir>/scripts`, then check again.
+
+### Authorize An Isolated Facebook Login
+
+Only after the user explicitly authorizes browser login, run:
+
+```text
+python "<skill-dir>/scripts/facebook_followed_video_download.py" --login
+```
+
+This opens Facebook in a dedicated Chrome profile under the Skill state directory. The user enters credentials directly on `facebook.com`, verifies the configured source is visible, and closes the dedicated window. The Skill never prints the password or cookie values. Backend runs reuse only this isolated profile; they never reuse the user's normal Chrome profile.
 
 ### Initialize Sources
 
@@ -133,6 +145,16 @@ Preview scans Facebook but does not create download folders, media files, archiv
 python "<skill-dir>/scripts/facebook_followed_video_download.py" --mode daily --count 3 --execute
 ```
 
+### Run One Backend-Supplied Source
+
+Use `--source` when an orchestrator supplies one source for this execution. This does not edit the persistent source file:
+
+```text
+python "<skill-dir>/scripts/facebook_followed_video_download.py" --source "C-0123456789AB" "https://www.facebook.com/example/reels/" --mode daily --initial-count 10 --execute --execution-id "E-0123456789ABCDEF" --result-json "<result.json>"
+```
+
+`--result-json` writes the machine-readable download manifest even when the engine fails. Each successfully downloaded video includes its canonical URL, local path, byte size, and SHA-256. Use this manifest as the input to the R2 Skill; do not rediscover the output directory.
+
 ### Initial Full Import
 
 ```text
@@ -158,7 +180,7 @@ Each source output folder keeps:
 - `.fb-video-urls.txt` for URLs successfully handled by this workflow
 - `.yt-dlp-archive.txt` for media IDs recorded by `yt-dlp`
 
-Do not delete or rewrite these files during routine use. A dry run never appends to either archive.
+Do not delete or rewrite these files during routine use. A dry run never appends to either archive. The first daily execution is detected when both archives are empty; afterward the newest archived video is the boundary separating current updates from older backlog.
 
 ## Troubleshooting
 
@@ -166,6 +188,7 @@ Do not delete or rewrite these files during routine use. A dry run never appends
 - `ready_for_execute: false`: install or configure `yt-dlp`.
 - Chrome not found: pass `--chrome "<executable-path>"` or set `FACEBOOK_FOLLOWED_CHROME`.
 - Direct Reel URLs work but Page scanning finds nothing: treat this as a discovery limitation; do not claim the Page contains no videos.
+- Zero discovered URLs is a discovery failure, not a successful no-update result. The recent-video fallback requires at least one publicly discoverable URL.
 - Access/login errors: stop unless the user has an authorized, non-bypassing access method.
 - Large jobs: reduce `--count` only when the user agrees; do not mislabel normal runtime as a timeout.
 

@@ -2,7 +2,7 @@
 name: cloudflare-r2-video-upload
 description: Safely preview and upload local video files or directories to Cloudflare R2 object storage using its S3-compatible API, with recursive discovery, per-run limits, multipart transfers, concurrent files, duplicate checks, post-upload verification, and reports. Use when the user asks Hermes to configure or check R2 access, preview video object keys, upload downloaded videos, upload a folder, resume a batch, or troubleshoot R2 uploads.
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
   platforms:
     - windows
     - macos
@@ -111,6 +111,16 @@ Preview recursively discovers videos and checks each planned object key with `He
 ```text
 python "<skill-dir>/scripts/cloudflare_r2_video_upload.py" --source "<video-folder>" --prefix "facebook" --count 10 --workers 3 --execute
 ```
+
+### Upload A Download Manifest
+
+Use the downloader's result manifest in an automated ingest pipeline:
+
+```text
+python "<skill-dir>/scripts/cloudflare_r2_video_upload.py" --manifest "<download-result.json>" --prefix "PH/Sports/202608/10" --flatten --execute --execution-id "E-0123456789ABCDEF" --result-json "<upload-result.json>"
+```
+
+The manifest mode selects only verified downloaded files, validates each current file size and recorded SHA-256, and carries source URL, canonical URL, platform ID, filename, and SHA-256 into the upload result. By default it builds `<prefix>/<source>/<filename>` keys. With `--flatten` it builds `<prefix>/<filename>`, which the HM pipeline uses for `PH/Sports/yyyyMM/dd/<filename>`. Use either `--source` or `--manifest`, never both.
 
 ### Upload One Video
 

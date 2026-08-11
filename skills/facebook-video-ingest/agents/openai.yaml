@@ -1,0 +1,4 @@
+interface:
+  display_name: "Facebook Video Ingest"
+  short_description: "Download Facebook videos, upload to R2, and report results"
+  default_prompt: "Use $facebook-video-ingest to claim and run one backend Facebook video ingest job."

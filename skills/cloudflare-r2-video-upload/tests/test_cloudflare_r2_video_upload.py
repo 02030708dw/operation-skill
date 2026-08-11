@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
@@ -81,6 +82,132 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(MODULE.multipart_chunk_mib("5"), 5)
         with self.assertRaises(Exception):
             MODULE.multipart_chunk_mib("4")
+
+    def test_manifest_selects_only_downloaded_videos_and_preserves_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            video = root / "result.mp4"
+            video.write_bytes(b"video")
+            manifest = root / "download.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "name": "creator-one",
+                                "url": "https://www.facebook.com/example/reels/",
+                                "videos": [
+                                    {
+                                        "platform": "Facebook",
+                                        "platformVideoId": "123",
+                                        "originalUrl": "https://www.facebook.com/reel/123",
+                                        "canonicalUrl": "https://www.facebook.com/reel/123",
+                                        "localPath": str(video),
+                                        "fileName": video.name,
+                                        "fileSize": video.stat().st_size,
+                                        "sha256": MODULE.sha256_file(video),
+                                        "status": "downloaded",
+                                    },
+                                    {
+                                        "platformVideoId": "456",
+                                        "status": "download-failed",
+                                    },
+                                ],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            items = MODULE.discover_manifest(manifest, "facebook", 0)
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0].key, "facebook/creator-one/result.mp4")
+            self.assertEqual(items[0].metadata["platformVideoId"], "123")
+            self.assertEqual(items[0].metadata["source"], "creator-one")
+
+    def test_manifest_can_flatten_source_into_required_task_prefix(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            video = root / "result.mp4"
+            video.write_bytes(b"video")
+            manifest = root / "download.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "name": "PH Sports Official",
+                                "videos": [
+                                    {
+                                        "localPath": str(video),
+                                        "fileName": video.name,
+                                        "fileSize": video.stat().st_size,
+                                        "status": "downloaded",
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            items = MODULE.discover_manifest(
+                manifest,
+                "PH/Sports/202608/10",
+                0,
+                flatten=True,
+            )
+            self.assertEqual(
+                items[0].key,
+                "PH/Sports/202608/10/result.mp4",
+            )
+
+    def test_manifest_rejects_size_mismatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            video = root / "result.mp4"
+            video.write_bytes(b"video")
+            manifest = root / "download.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "videos": [
+                            {
+                                "localPath": str(video),
+                                "fileSize": 999,
+                                "status": "downloaded",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                MODULE.discover_manifest(manifest, "", 0)
+
+    def test_manifest_rejects_sha256_mismatch_even_when_size_matches(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            video = root / "result.mp4"
+            video.write_bytes(b"video")
+            manifest = root / "download.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "videos": [
+                            {
+                                "localPath": str(video),
+                                "fileSize": video.stat().st_size,
+                                "sha256": "0" * 64,
+                                "status": "downloaded",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                MODULE.discover_manifest(manifest, "", 0)
 
 
 if __name__ == "__main__":

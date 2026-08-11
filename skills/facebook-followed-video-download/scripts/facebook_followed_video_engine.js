@@ -7,6 +7,7 @@
  */
 
 const fs = require('fs');
+const crypto = require('crypto');
 const http = require('http');
 const os = require('os');
 const path = require('path');
@@ -20,6 +21,7 @@ const DEFAULT_COOKIES = process.env.FACEBOOK_FOLLOWED_COOKIES || process.env.FB_
 const DEFAULT_DESKTOP = process.env.FACEBOOK_FOLLOWED_OUTPUT || process.env.FB_FOLLOWED_DESKTOP || path.join(HOME, 'Desktop', 'Facebook');
 const DEFAULT_YTDLP = process.env.FACEBOOK_FOLLOWED_YTDLP || process.env.FB_FOLLOWED_YTDLP || process.env.YTDLP || 'yt-dlp';
 const CDP_PORT = Number(process.env.FACEBOOK_FOLLOWED_CDP_PORT || process.env.FB_CDP_PORT || String(9300 + Math.floor(Math.random() * 500)));
+const SKILL_VERSION = '1.5.1';
 
 function detectChrome() {
   const configured = process.env.FACEBOOK_FOLLOWED_CHROME || process.env.FB_FOLLOWED_CHROME;
@@ -59,9 +61,14 @@ const desktopDir = argValue('--desktop', DEFAULT_DESKTOP);
 const chromePath = argValue('--chrome', DEFAULT_CHROME);
 const ytdlpPath = argValue('--yt-dlp', DEFAULT_YTDLP);
 const dryRun = hasFlag('--dry-run');
-const scrollRounds = Number(argValue('--scroll-rounds', mode === 'full' ? '80' : '8'));
+const scrollRounds = Number(argValue('--scroll-rounds', '80'));
 const waitMs = Number(argValue('--wait-ms', '1400'));
-const maxDownloads = Number(argValue('--max-downloads', mode === 'full' ? '0' : '30'));
+const firstRunLimit = Number(argValue(
+  '--first-run-limit',
+  argValue('--max-downloads', mode === 'full' ? '0' : '10')
+));
+const resultJsonPath = argValue('--result-json', '');
+const browserProfileDir = argValue('--browser-profile', '');
 let cdpId = 10;
 
 function nextCdpId() {
@@ -276,7 +283,7 @@ async function injectCookies(ws) {
   return count;
 }
 
-async function discoverOnPage(ws, url) {
+async function discoverOnPage(ws, url, stopKeys = new Set(), minimumItems = 0) {
   console.log(`  掃描: ${url}`);
   const extractExpression = `
                 (() => {
@@ -294,6 +301,8 @@ async function discoverOnPage(ws, url) {
       `;
   const collected = new Set();
   let lastCount = 0;
+  let stagnantRounds = 0;
+  let reachedKnownVideo = false;
   async function collectVisibleLinks() {
     const result = await cdpCall(ws, {
       id: nextCdpId(),
@@ -310,10 +319,17 @@ async function discoverOnPage(ws, url) {
     const raw = JSON.parse(
       (result.result && result.result.result && result.result.result.value) || '[]'
     );
-    for (const videoUrl of raw) collected.add(normalizeVideoUrl(videoUrl));
+    for (const rawVideoUrl of raw) {
+      const videoUrl = normalizeVideoUrl(rawVideoUrl);
+      collected.add(videoUrl);
+      if (stopKeys.has(videoKey(videoUrl))) reachedKnownVideo = true;
+    }
     if (collected.size > lastCount) {
       console.log(`    已收集: ${collected.size}`);
+      stagnantRounds = 0;
       lastCount = collected.size;
+    } else {
+      stagnantRounds += 1;
     }
   }
 
@@ -327,6 +343,7 @@ async function discoverOnPage(ws, url) {
   await sleep(10000);
   await collectVisibleLinks();
   for (let i = 0; i < scrollRounds; i++) {
+    if (reachedKnownVideo || (minimumItems > 0 && collected.size >= minimumItems) || stagnantRounds >= 3) break;
     await cdpCall(ws, {
       id: nextCdpId(),
       method: 'Runtime.evaluate',
@@ -359,6 +376,66 @@ function appendArchive(archivePath, value) {
   fs.appendFileSync(archivePath, `${value}\n`);
 }
 
+function appendArchiveOnce(archivePath, value) {
+  const key = videoKey(value);
+  if (!readArchiveKeys(archivePath).has(key)) appendArchive(archivePath, value);
+}
+
+/**
+ * Facebook's Reels/videos pages expose links newest-first. The first daily run
+ * is limited to the requested recent window. Later daily runs take every URL
+ * before the first archived boundary; when that update set is empty, they
+ * return the requested recent window. Full imports remain incremental.
+ */
+function selectVideoUrls(discoveredUrls, existingKeys, runMode, limit) {
+  const unique = new Map();
+  for (const videoUrl of discoveredUrls) {
+    const key = videoKey(videoUrl);
+    if (!unique.has(key)) unique.set(key, videoUrl);
+  }
+  const entries = Array.from(unique.entries());
+  if (runMode !== 'daily') {
+    const candidates = entries
+      .filter(([key]) => !existingKeys.has(key))
+      .map(([, videoUrl]) => videoUrl);
+    return limit > 0 ? candidates.slice(0, limit) : candidates;
+  }
+  return selectDailyVideoUrls(
+    [entries.map(([, videoUrl]) => videoUrl)],
+    existingKeys,
+    limit
+  );
+}
+
+function selectDailyVideoUrls(discoveredPages, existingKeys, limit) {
+  const allRecent = new Map();
+  for (const pageUrls of discoveredPages) {
+    for (const videoUrl of pageUrls) {
+      const key = videoKey(videoUrl);
+      if (!allRecent.has(key)) allRecent.set(key, videoUrl);
+    }
+  }
+  const recentWindow = () => {
+    const recent = Array.from(allRecent.values());
+    return limit > 0 ? recent.slice(0, limit) : recent;
+  };
+  if (existingKeys.size === 0) return recentWindow();
+
+  const updates = [];
+  const updateKeys = new Set();
+  for (const pageUrls of discoveredPages) {
+    for (const videoUrl of pageUrls) {
+      const key = videoKey(videoUrl);
+      if (existingKeys.has(key)) break;
+      if (!updateKeys.has(key)) {
+        updateKeys.add(key);
+        updates.push(videoUrl);
+      }
+    }
+  }
+  return updates.length ? updates : recentWindow();
+}
+
 function assertRunnable(command, label) {
   const result = spawnSync(command, ['--version'], { encoding: 'utf8', timeout: 15000 });
   if (result.error || (typeof result.status === 'number' && result.status !== 0)) {
@@ -366,35 +443,114 @@ function assertRunnable(command, label) {
   }
 }
 
-function downloadVideo(url, outputDir, archivePath) {
+function sha256File(filePath) {
+  const hash = crypto.createHash('sha256');
+  const descriptor = fs.openSync(filePath, 'r');
+  const buffer = Buffer.allocUnsafe(1024 * 1024);
+  try {
+    while (true) {
+      const bytes = fs.readSync(descriptor, buffer, 0, buffer.length, null);
+      if (!bytes) break;
+      hash.update(buffer.subarray(0, bytes));
+    }
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  return hash.digest('hex');
+}
+
+function findDownloadedFile(outputDir, platformVideoId, output) {
+  const marker = String(output || '').split(/\r?\n/)
+    .find(line => line.startsWith('__HERMES_FILE__:'));
+  if (marker) {
+    const candidate = marker.slice('__HERMES_FILE__:'.length).trim();
+    if (candidate && fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+  }
+  if (!fs.existsSync(outputDir)) return '';
+  const needle = `_${platformVideoId}_`;
+  const candidates = fs.readdirSync(outputDir)
+    .filter(name => name.includes(needle) && name.toLowerCase().endsWith('.mp4'))
+    .map(name => path.join(outputDir, name))
+    .filter(candidate => {
+      try { return fs.statSync(candidate).isFile(); } catch { return false; }
+    })
+    .sort((left, right) => fs.statSync(right).mtimeMs - fs.statSync(left).mtimeMs);
+  return candidates[0] || '';
+}
+
+function baseVideoResult(account, url) {
+  return {
+    platform: 'Facebook',
+    source: account.folder,
+    sourceUrl: account.url,
+    platformVideoId: videoKey(url),
+    originalUrl: url,
+    canonicalUrl: normalizeVideoUrl(url),
+    localPath: null,
+    fileName: null,
+    fileSize: null,
+    sha256: null,
+    status: 'pending',
+    error: null
+  };
+}
+
+function completedVideoResult(item, downloadedPath) {
+  const stat = fs.statSync(downloadedPath);
+  item.localPath = path.resolve(downloadedPath);
+  item.fileName = path.basename(downloadedPath);
+  item.fileSize = stat.size;
+  item.sha256 = sha256File(downloadedPath);
+  item.status = 'downloaded';
+  return item;
+}
+
+function downloadVideo(account, url, outputDir, archivePath) {
+  const item = baseVideoResult(account, url);
   if (dryRun) {
     console.log(`  DRY-RUN: ${url}`);
-    return true;
+    item.status = 'preview';
+    return item;
+  }
+  const cachedPath = findDownloadedFile(outputDir, item.platformVideoId, '');
+  if (cachedPath) {
+    appendArchiveOnce(archivePath, url);
+    console.log('    復用本地檔案');
+    return completedVideoResult(item, cachedPath);
   }
   const args = [];
   if (cookiesFile && fs.existsSync(cookiesFile)) {
     args.push('--cookies', cookiesFile);
+  } else if (browserProfileDir) {
+    args.push('--cookies-from-browser', `chrome:${browserProfileDir}`);
   }
   args.push(
+    '--force-ipv4',
+    '--socket-timeout', '60',
+    '--retries', '2',
     '--ignore-errors',
     '--no-warnings',
     '--no-playlist',
     '--download-archive', path.join(outputDir, '.yt-dlp-archive.txt'),
     '-f', 'hd/best',
     '--merge-output-format', 'mp4',
+    '--print', 'after_move:__HERMES_FILE__:%(filepath)s',
     '-o', path.join(outputDir, '%(upload_date)s_%(id)s_%(title).120B.%(ext)s'),
     url
   );
-  const result = spawnSync(ytdlpPath, args, { encoding: 'utf8', timeout: 600000 });
+  const result = spawnSync(ytdlpPath, args, { encoding: 'utf8' });
   const output = `${result.stdout || ''}${result.stderr || ''}`.trim();
-  if (result.status === 0 || output.includes('100%') || output.includes('has already been recorded in the archive')) {
-    appendArchive(archivePath, url);
+  const downloadedPath = findDownloadedFile(outputDir, item.platformVideoId, output);
+  if ((result.status === 0 || output.includes('100%')) && downloadedPath) {
+    appendArchiveOnce(archivePath, url);
     console.log('    完成');
-    return true;
+    return completedVideoResult(item, downloadedPath);
   }
   const errorLine = output.split(/\r?\n/).find(line => line.includes('ERROR')) || output.split(/\r?\n/).slice(-1)[0] || '下載失敗';
   console.log(`    失敗: ${errorLine.slice(0, 220)}`);
-  return false;
+  item.status = 'download-failed';
+  item.error = errorLine.slice(0, 500);
+  return item;
 }
 
 async function main() {
@@ -404,8 +560,20 @@ async function main() {
   const accounts = readAccounts(accountsFile);
   if (!accounts.length) throw new Error('No accounts configured');
 
-  const profile = path.join(os.tmpdir(), `hermes_facebook_followed_${Date.now()}`);
-  fs.mkdirSync(profile, { recursive: true });
+  const temporaryProfile = !browserProfileDir;
+  const profile = browserProfileDir || path.join(os.tmpdir(), `hermes_facebook_followed_${Date.now()}`);
+  const startedAt = new Date().toISOString();
+  const runResult = {
+    schemaVersion: '1.0',
+    skill: 'facebook-followed-video-download',
+    skillVersion: SKILL_VERSION,
+    mode: dryRun ? 'dry-run' : 'execute',
+    status: 'running',
+    startedAt,
+    completedAt: null,
+    sources: []
+  };
+  fs.mkdirSync(profile, { recursive: true, mode: 0o700 });
   const chrome = spawn(chromePath, [
     `--remote-debugging-port=${CDP_PORT}`,
     `--user-data-dir=${profile}`,
@@ -422,6 +590,7 @@ async function main() {
     ws = await connectTab();
     const cookieCount = await injectCookies(ws);
     console.log(`Facebook cookies: ${cookieCount}`);
+    console.log(`Facebook browser session: ${temporaryProfile ? 'ephemeral-public' : 'user-authorized-isolated-profile'}`);
     console.log(`模式: ${mode === 'full' ? '首次全量' : '每日增量'}`);
 
     for (const account of accounts) {
@@ -430,47 +599,107 @@ async function main() {
       const archivePath = path.join(outputDir, '.fb-video-urls.txt');
       const existingKeys = readArchiveKeys(archivePath, path.join(outputDir, '.yt-dlp-archive.txt'));
       const discovered = new Set();
+      const discoveredPages = [];
+      const firstDailyRun = mode === 'daily' && existingKeys.size === 0;
 
       console.log(`\n=== ${account.folder} ===`);
       for (const page of pageCandidates(account.url)) {
         try {
-          const urls = await discoverOnPage(ws, page);
+          const urls = await discoverOnPage(
+            ws,
+            page,
+            firstDailyRun ? new Set() : existingKeys,
+            firstDailyRun ? firstRunLimit : 0
+          );
+          discoveredPages.push(urls);
           urls.forEach(videoUrl => discovered.add(videoUrl));
         } catch (err) {
           console.log(`  掃描失敗: ${err.message}`);
         }
       }
 
-      const discoveredByKey = new Map();
-      for (const videoUrl of Array.from(discovered)) {
-        const key = videoKey(videoUrl);
-        if (!discoveredByKey.has(key)) discoveredByKey.set(key, videoUrl);
-      }
-      const newUrls = Array.from(discoveredByKey.entries())
-        .filter(([key]) => !existingKeys.has(key))
-        .map(([, videoUrl]) => videoUrl);
-      const selected = maxDownloads > 0 ? newUrls.slice(0, maxDownloads) : newUrls;
-      console.log(`  找到影片: ${discovered.size}，待下載: ${selected.length}`);
+      const selected = mode === 'daily'
+        ? selectDailyVideoUrls(discoveredPages, existingKeys, firstRunLimit)
+        : selectVideoUrls(Array.from(discovered), existingKeys, mode, firstRunLimit);
+      console.log(`  找到影片: ${discovered.size}，本次選取: ${selected.length}`);
 
-      let ok = 0;
+      const discoveryFailed = discovered.size === 0;
+      if (discoveryFailed) {
+        console.log('  發現失敗: Facebook 公開頁面沒有返回可解析的影片連結');
+      }
+
+      const sourceResult = {
+        name: account.folder,
+        url: account.url,
+        outputDir: path.resolve(outputDir),
+        discovered: discovered.size,
+        selected: selected.length,
+        succeeded: 0,
+        failed: discoveryFailed ? 1 : 0,
+        error: discoveryFailed
+          ? 'Facebook public page returned no discoverable video links'
+          : null,
+        videos: []
+      };
       for (const videoUrl of selected) {
         console.log(`  下載: ${videoUrl}`);
-        if (downloadVideo(videoUrl, outputDir, archivePath)) ok++;
+        const item = downloadVideo(account, videoUrl, outputDir, archivePath);
+        sourceResult.videos.push(item);
+        if (item.status === 'downloaded' || item.status === 'preview') sourceResult.succeeded++;
+        else sourceResult.failed++;
       }
       if (dryRun) console.log(`  預演: ${selected.length} 個待下載，未寫入檔案`);
-      else console.log(`  成功: ${ok}/${selected.length}`);
+      else console.log(`  成功: ${sourceResult.succeeded}/${selected.length}`);
+      runResult.sources.push(sourceResult);
     }
+    const failures = runResult.sources.reduce((sum, source) => sum + source.failed, 0);
+    const successes = runResult.sources.reduce((sum, source) => sum + source.succeeded, 0);
+    runResult.status = failures === 0 ? 'completed' : (successes > 0 ? 'partial' : 'failed');
+    runResult.completedAt = new Date().toISOString();
+    if (resultJsonPath) {
+      fs.mkdirSync(path.dirname(resultJsonPath), { recursive: true });
+      fs.writeFileSync(resultJsonPath, `${JSON.stringify(runResult, null, 2)}\n`, 'utf8');
+    }
+    return runResult;
   } finally {
     if (ws) ws.close();
     try {
       if (process.platform === 'win32') chrome.kill();
       else process.kill(-chrome.pid);
     } catch {}
-    try { fs.rmSync(profile, { recursive: true, force: true }); } catch {}
+    if (temporaryProfile) {
+      try { fs.rmSync(profile, { recursive: true, force: true }); } catch {}
+    }
   }
 }
 
-main().catch(err => {
-  console.error(`錯誤: ${err.message}`);
-  process.exit(1);
-});
+async function runMain() {
+  try {
+    const result = await main();
+    if (result.status === 'failed') process.exitCode = 1;
+  } catch (err) {
+    console.error(`錯誤: ${err.message}`);
+    if (resultJsonPath) {
+      const failed = {
+        schemaVersion: '1.0',
+        skill: 'facebook-followed-video-download',
+        skillVersion: SKILL_VERSION,
+        mode: dryRun ? 'dry-run' : 'execute',
+        status: 'failed',
+        startedAt: null,
+        completedAt: new Date().toISOString(),
+        sources: [],
+        error: String(err.message || err)
+      };
+      try {
+        fs.mkdirSync(path.dirname(resultJsonPath), { recursive: true });
+        fs.writeFileSync(resultJsonPath, `${JSON.stringify(failed, null, 2)}\n`, 'utf8');
+      } catch {}
+    }
+    process.exit(1);
+  }
+}
+
+if (require.main === module) runMain();
+
+module.exports = { selectDailyVideoUrls, selectVideoUrls, videoKey };

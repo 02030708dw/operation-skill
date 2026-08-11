@@ -10,12 +10,14 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
 
 SKILL_NAME = "facebook-followed-video-download"
+SKILL_VERSION = "1.5.1"
 SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_DIR = SCRIPT_DIR.parent
 
@@ -55,6 +57,9 @@ DEFAULT_REPORTS = Path(
         os.environ.get("FB_FOLLOWED_REPORTS", str(STATE_DIR / "reports")),
     )
 ).expanduser()
+DEFAULT_DAILY_COUNT = 10
+DEFAULT_BROWSER_PROFILE = STATE_DIR / "chrome-profile"
+LOGIN_MARKER = ".hermes-login-enabled"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -69,6 +74,11 @@ def build_parser() -> argparse.ArgumentParser:
     actions.add_argument("--list-sources", action="store_true", help="show configured sources")
     actions.add_argument("--init", action="store_true", help="create an empty example accounts file")
     actions.add_argument(
+        "--login",
+        action="store_true",
+        help="open an isolated Chrome profile for a user-authorized Facebook login",
+    )
+    actions.add_argument(
         "--add-source",
         nargs=2,
         metavar=("FOLDER", "FACEBOOK_URL"),
@@ -76,22 +86,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--mode", choices=("daily", "full"), default="daily")
     parser.add_argument(
+        "--initial-count",
         "--count",
+        dest="count",
         type=non_negative_int,
         default=None,
-        help="maximum downloads per source; 0 means unlimited",
+        help="first daily execution limit per source; 0 means unlimited",
     )
     parser.add_argument("--scroll-rounds", type=non_negative_int, default=None)
     parser.add_argument("--wait-ms", type=positive_int, default=1400)
     parser.add_argument("--accounts", type=Path, default=DEFAULT_ACCOUNTS)
+    parser.add_argument(
+        "--source",
+        nargs=2,
+        metavar=("NAME", "FACEBOOK_URL"),
+        help="run one source without modifying the persistent accounts file",
+    )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--reports", type=Path, default=DEFAULT_REPORTS)
     parser.add_argument("--cookies", type=Path, default=None, help="optional authorized Netscape cookies file")
     parser.add_argument("--chrome", default=None, help="Chrome/Chromium executable path")
+    parser.add_argument(
+        "--browser-profile",
+        type=Path,
+        default=DEFAULT_BROWSER_PROFILE,
+        help="isolated Chrome profile used only after --login completes",
+    )
     parser.add_argument("--yt-dlp", dest="ytdlp", default=None, help="yt-dlp executable path")
     parser.add_argument("--execute", action="store_true", help="actually download files")
     parser.add_argument("--no-report", action="store_true", help="skip report generation after execution")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--json", action="store_true", help="print the final manifest as JSON")
+    parser.add_argument("--result-json", type=Path, help="write the final manifest to this path")
+    parser.add_argument("--execution-id", help="backend execution identifier copied into the manifest")
     return parser
 
 
@@ -200,13 +227,19 @@ def dependency_status(args: argparse.Namespace) -> dict[str, object]:
         )
         ws_ok = probe.returncode == 0
     try:
-        sources = configured_sources(args.accounts.expanduser())
+        if args.source:
+            if not is_facebook_url(args.source[1]):
+                raise ValueError("Source URL must use facebook.com or fb.watch")
+            sources = [(args.source[0], args.source[1])]
+        else:
+            sources = configured_sources(args.accounts.expanduser())
         source_error = None
     except ValueError as exc:
         sources = []
         source_error = str(exc)
     return {
         "skill": SKILL_NAME,
+        "skill_version": SKILL_VERSION,
         "hermes_home": str(HERMES_HOME),
         "accounts": str(args.accounts.expanduser()),
         "accounts_exists": args.accounts.expanduser().is_file(),
@@ -217,9 +250,50 @@ def dependency_status(args: argparse.Namespace) -> dict[str, object]:
         "ws_module": ws_ok,
         "yt_dlp": ytdlp,
         "chrome": chrome,
+        "browser_profile": str(args.browser_profile.expanduser()),
+        "browser_login_ready": enabled_browser_profile(args) is not None,
         "ready_for_preview": bool(node and ws_ok and chrome and sources and not source_error),
         "ready_for_execute": bool(node and ws_ok and chrome and ytdlp and sources and not source_error),
     }
+
+
+def enabled_browser_profile(args: argparse.Namespace) -> Path | None:
+    profile = args.browser_profile.expanduser().resolve()
+    return profile if (profile / LOGIN_MARKER).is_file() else None
+
+
+def prepare_browser_login(args: argparse.Namespace) -> int:
+    chrome = detect_chrome(args.chrome or os.environ.get("FACEBOOK_FOLLOWED_CHROME"))
+    if not chrome:
+        print("Chrome/Chromium is required for Facebook login.", file=sys.stderr)
+        return 2
+    profile = args.browser_profile.expanduser().resolve()
+    profile.mkdir(parents=True, exist_ok=True)
+    try:
+        profile.chmod(0o700)
+    except OSError:
+        pass
+    print("Opening the isolated Hermes Facebook browser profile.")
+    print("Log in only on facebook.com, verify the source page opens, then close that Chrome window.")
+    completed = subprocess.run(
+        [
+            chrome,
+            f"--user-data-dir={profile}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--new-window",
+            "https://www.facebook.com/login",
+        ],
+        check=False,
+    )
+    if completed.returncode != 0:
+        return completed.returncode
+    (profile / LOGIN_MARKER).write_text(
+        "User authorized this isolated profile for Hermes Facebook discovery.\n",
+        encoding="utf-8",
+    )
+    print(f"Facebook login profile enabled: {profile}")
+    return 0
 
 
 def initialize_accounts(accounts: Path) -> None:
@@ -251,7 +325,34 @@ def add_source(accounts: Path, folder: str, url: str) -> None:
     print(f"Accounts file: {accounts}")
 
 
-def run_download(args: argparse.Namespace) -> int:
+def _write_single_source(accounts: Path, source: list[str]) -> None:
+    name, url = source
+    if not is_facebook_url(url):
+        raise ValueError("Source URL must use facebook.com or fb.watch")
+    clean_name = re.sub(r'[/:\\?%*"<>|]', "_", name).strip()[:90]
+    if not clean_name:
+        raise ValueError("Source name cannot be empty")
+    accounts.write_text(f"{clean_name}\t{url}\n", encoding="utf-8")
+
+
+def _load_result(path: Path, exit_code: int, execution_id: str | None) -> dict[str, object]:
+    if path.is_file():
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    else:
+        payload = {
+            "schemaVersion": "1.0",
+            "skill": SKILL_NAME,
+            "mode": "unknown",
+            "status": "failed",
+            "sources": [],
+            "error": "download engine did not produce a result manifest",
+        }
+    payload["executionId"] = execution_id
+    payload["exitCode"] = exit_code
+    return payload
+
+
+def _run_download_with_accounts(args: argparse.Namespace, accounts: Path) -> int:
     status = dependency_status(args)
     if not status["ready_for_preview"]:
         print(json.dumps(status, ensure_ascii=False, indent=2))
@@ -264,11 +365,18 @@ def run_download(args: argparse.Namespace) -> int:
 
     node = str(status["node"])
     engine = SCRIPT_DIR / "facebook_followed_video_engine.js"
-    accounts = args.accounts.expanduser().resolve()
+    accounts = accounts.expanduser().resolve()
     output = args.output.expanduser().resolve()
     reports = args.reports.expanduser().resolve()
-    count = args.count if args.count is not None else (0 if args.mode == "full" else 30)
-    rounds = args.scroll_rounds if args.scroll_rounds is not None else (80 if args.mode == "full" else 8)
+    count = (
+        args.count
+        if args.count is not None
+        else (0 if args.mode == "full" else DEFAULT_DAILY_COUNT)
+    )
+    rounds = args.scroll_rounds if args.scroll_rounds is not None else 80
+    temporary_result = tempfile.TemporaryDirectory(prefix="hermes-fb-result-")
+    requested_result = args.result_json.expanduser().resolve() if args.result_json else None
+    engine_result = Path(temporary_result.name) / "result.json"
     command = [
         node,
         str(engine),
@@ -282,8 +390,10 @@ def run_download(args: argparse.Namespace) -> int:
         str(rounds),
         "--wait-ms",
         str(args.wait_ms),
-        "--max-downloads",
+        "--first-run-limit",
         str(count),
+        "--result-json",
+        str(engine_result),
     ]
     if not args.execute:
         command.append("--dry-run")
@@ -291,6 +401,9 @@ def run_download(args: argparse.Namespace) -> int:
         command.extend(["--cookies", str(args.cookies.expanduser().resolve())])
     if args.chrome:
         command.extend(["--chrome", args.chrome])
+    browser_profile = enabled_browser_profile(args)
+    if browser_profile:
+        command.extend(["--browser-profile", str(browser_profile)])
     if args.execute:
         command.extend(["--yt-dlp", str(status["yt_dlp"])])
 
@@ -302,51 +415,89 @@ def run_download(args: argparse.Namespace) -> int:
     else:
         run_log = None
 
+    print("Skill:", f"{SKILL_NAME}@{SKILL_VERSION}")
     print("Mode:", "EXECUTE" if args.execute else "DRY RUN")
     print("Sources:", len(configured_sources(accounts)))
-    print("Per-source limit:", "unlimited" if count == 0 else count)
+    if args.mode == "daily":
+        print("First-execution per-source limit:", "unlimited" if count == 0 else count)
+        print("Later-execution per-source limit: unlimited until archive boundary")
+        print("Daily strategy: fetch every update; if there are none, fall back to the latest window")
+    else:
+        print("Full-import per-source limit:", "unlimited" if count == 0 else count)
     if args.verbose:
         print("Command:", subprocess.list2cmdline(command))
 
-    process = subprocess.Popen(
-        command,
-        cwd=SCRIPT_DIR,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    captured: list[str] = []
-    assert process.stdout is not None
-    for line in process.stdout:
-        print(line, end="")
-        captured.append(line)
-    exit_code = process.wait()
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=SCRIPT_DIR,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        captured: list[str] = []
+        assert process.stdout is not None
+        for line in process.stdout:
+            print(line, end="")
+            captured.append(line)
+        exit_code = process.wait()
 
-    if run_log:
-        run_log.write_text("".join(captured), encoding="utf-8")
-        report_command = [
-            node,
-            str(SCRIPT_DIR / "facebook_followed_video_report.js"),
-            "--mode",
-            args.mode,
-            "--accounts",
-            str(accounts),
-            "--desktop",
-            str(output),
-            "--reports-dir",
-            str(reports),
-            "--run-log",
-            str(run_log),
-            "--status",
-            str(exit_code),
-            "--print",
-        ]
-        report = subprocess.run(report_command, cwd=SCRIPT_DIR, check=False)
-        if report.returncode != 0 and exit_code == 0:
-            exit_code = report.returncode
-    return exit_code
+        if run_log:
+            run_log.write_text("".join(captured), encoding="utf-8")
+            report_command = [
+                node,
+                str(SCRIPT_DIR / "facebook_followed_video_report.js"),
+                "--mode",
+                args.mode,
+                "--accounts",
+                str(accounts),
+                "--desktop",
+                str(output),
+                "--reports-dir",
+                str(reports),
+                "--run-log",
+                str(run_log),
+                "--status",
+                str(exit_code),
+                "--print",
+            ]
+            report = subprocess.run(report_command, cwd=SCRIPT_DIR, check=False)
+            if report.returncode != 0 and exit_code == 0:
+                exit_code = report.returncode
+
+        payload = _load_result(engine_result, exit_code, args.execution_id)
+        payload_text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        if requested_result:
+            requested_result.parent.mkdir(parents=True, exist_ok=True)
+            requested_result.write_text(payload_text, encoding="utf-8")
+        if args.execute and not args.no_report:
+            reports.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            (reports / f"{stamp}-{args.mode}-manifest.json").write_text(
+                payload_text, encoding="utf-8"
+            )
+            (reports / "latest-manifest.json").write_text(payload_text, encoding="utf-8")
+        if args.json:
+            print(payload_text, end="")
+        return exit_code
+    finally:
+        temporary_result.cleanup()
+
+
+def run_download(args: argparse.Namespace) -> int:
+    if not args.source:
+        return _run_download_with_accounts(args, args.accounts)
+    with tempfile.TemporaryDirectory(prefix="hermes-fb-source-") as temporary:
+        accounts = Path(temporary) / "accounts.txt"
+        _write_single_source(accounts, args.source)
+        original_accounts = args.accounts
+        args.accounts = accounts
+        try:
+            return _run_download_with_accounts(args, accounts)
+        finally:
+            args.accounts = original_accounts
 
 
 def main() -> int:
@@ -355,6 +506,8 @@ def main() -> int:
     args.output = args.output.expanduser()
     args.reports = args.reports.expanduser()
 
+    if args.login:
+        return prepare_browser_login(args)
     if args.check:
         status = dependency_status(args)
         print(json.dumps(status, ensure_ascii=False, indent=2))

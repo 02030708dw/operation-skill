@@ -135,7 +135,7 @@ function parseRunLog(filePath) {
       parsed.errors.push(line.slice(0, 260));
     }
     if (!current) continue;
-    let match = line.match(/找到影片:\s*(\d+).*?待下載:\s*(\d+)/);
+    let match = line.match(/找到影片:\s*(\d+).*?(?:待下載|本次選取):\s*(\d+)/);
     if (match) {
       current.found = Number(match[1]);
       current.pending = Number(match[2]);
@@ -188,9 +188,9 @@ function renderReport(accounts, parsed) {
     totalPending += pending || 0;
     totalFailures += failures;
     let state = '未掃描到摘要';
-    if (ok !== null && pending !== null && pending > ok) state = '有下載失敗';
-    else if (ok !== null && ok > 0) state = `新增 ${ok}`;
-    else if (pending === 0) state = '無新影片';
+    if (ok !== null && pending !== null && pending > ok) state = '有處理失敗';
+    else if (ok !== null && ok > 0) state = `已處理 ${ok}`;
+    else if (pending === 0) state = '未找到影片';
     else if (status !== 0) state = '檢查可能失敗';
     rows.push({
       folder: account.folder,
@@ -212,14 +212,14 @@ function renderReport(accounts, parsed) {
   lines.push(`# ${title}`);
   lines.push('');
   lines.push(`- 時間: ${localTimestamp(now)}`);
-  lines.push(`- 模式: ${mode === 'daily' ? '每日新增檢查' : '首次全量下載'}`);
+  lines.push(`- 模式: ${mode === 'daily' ? '每日影片抓取' : '首次全量下載'}`);
   lines.push(`- 結果: ${result}`);
-  lines.push(`- 本次新下載: ${totalNew}`);
-  lines.push(`- 本次待下載: ${totalPending}`);
-  lines.push(`- 報告給 Hermes: ${totalNew > 0 ? `今天新增 ${totalNew} 個影片。` : '今天沒有新影片。'}`);
+  lines.push(`- 本次成功處理: ${totalNew}`);
+  lines.push(`- 本次選取: ${totalPending}`);
+  lines.push(`- 報告給 Hermes: ${totalPending > 0 ? `最近影片已成功處理 ${totalNew}/${totalPending} 個。` : '來源未顯示可用影片。'}`);
   if (runLog) lines.push(`- 原始日誌: ${runLog}`);
   lines.push('');
-  lines.push('| 博主 | 本次找到 | 待下載 | 成功 | 桌面檔案 | 大小 | URL/yt-dlp 記錄 | 狀態 |');
+  lines.push('| 博主 | 本次找到 | 本次選取 | 成功 | 桌面檔案 | 大小 | URL/yt-dlp 記錄 | 狀態 |');
   lines.push('|---|---:|---:|---:|---:|---:|---:|---|');
   for (const row of rows) {
     lines.push(`| ${safeCell(row.folder)} | ${row.found} | ${row.pending} | ${row.ok} | ${row.files} | ${row.size} | ${row.archive} | ${safeCell(row.state)} |`);
@@ -251,6 +251,8 @@ function renderReport(accounts, parsed) {
       mode,
       status,
       result,
+      totalSucceeded: totalNew,
+      totalSelected: totalPending,
       totalNew,
       totalPending,
       totalFailures,
@@ -276,4 +278,6 @@ function main() {
   if (shouldPrint) process.stdout.write(rendered.markdown);
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { parseRunLog, renderReport };
