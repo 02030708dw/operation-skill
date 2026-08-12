@@ -24,6 +24,7 @@ RUNNER_NAME = "hm_facebook_video_ingest_worker.py"
 DEFAULT_API_HOST = "127.0.0.1"
 DEFAULT_API_PORT = 8642
 DEFAULT_ADMIN_ORIGINS = (
+    "https://hermes.mvkbmb.online",
     "https://live-gateway.mvkbmb.online",
     "http://127.0.0.1:8848",
     "http://localhost:8848",

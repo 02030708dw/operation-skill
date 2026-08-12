@@ -35,6 +35,12 @@ INSTALLER_SPEC.loader.exec_module(INSTALLER)
 
 
 class PipelineTests(unittest.TestCase):
+    def test_installer_allows_production_admin_origin_by_default(self):
+        self.assertIn(
+            "https://hermes.mvkbmb.online",
+            INSTALLER.DEFAULT_ADMIN_ORIGINS,
+        )
+
     def test_daily_recent_video_target_defaults_to_ten(self):
         args = MODULE.build_parser().parse_args(["--check"])
         self.assertEqual(args.count, 10)
