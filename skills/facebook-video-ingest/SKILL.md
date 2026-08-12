@@ -56,7 +56,7 @@ The entry point composes the sibling `facebook-followed-video-download` and `clo
 
 The backend Worker passes `--initial-count 10` to the downloader. The first execution for a source requests at most 10 recent videos. Later executions use the downloader archive as the previous-run boundary and select every newer video without a count limit: two updates selects two and 30 updates selects all 30. When there are no updates, the downloader falls back to the 10 most recent discovered videos. If Facebook exposes no public video URLs at all, treat the execution as failed rather than reporting a false successful no-update result.
 
-The Hermes Cron runner resolves only `<hermes-home>/skills/operation-skill/facebook-video-ingest/scripts/facebook_video_ingest.py`. It must fail clearly if that installed operation-skill is missing; never fall back to a legacy skill directory or a recursive match.
+The Hermes Cron runner resolves only `<hermes-home>/skills/facebook-video-ingest/scripts/facebook_video_ingest.py`. It must fail clearly if that installed Skill is missing; never fall back to a categorized copy or a recursive match.
 
 ## Operations
 

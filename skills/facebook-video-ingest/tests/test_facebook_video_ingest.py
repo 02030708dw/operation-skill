@@ -58,10 +58,17 @@ class PipelineTests(unittest.TestCase):
                 )
                 self.assertEqual(os.environ["HM_WORKER_ID"], "worker-from-process")
 
-    def test_cron_runner_resolves_only_installed_operation_skill(self):
+    def test_cron_runner_resolves_only_standard_installed_skill(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
             expected = (
+                home
+                / "skills"
+                / "facebook-video-ingest"
+                / "scripts"
+                / "facebook_video_ingest.py"
+            )
+            categorized = (
                 home
                 / "skills"
                 / "operation-skill"
@@ -69,17 +76,10 @@ class PipelineTests(unittest.TestCase):
                 / "scripts"
                 / "facebook_video_ingest.py"
             )
-            legacy = (
-                home
-                / "skills"
-                / "facebook-video-ingest"
-                / "scripts"
-                / "facebook_video_ingest.py"
-            )
             expected.parent.mkdir(parents=True)
-            legacy.parent.mkdir(parents=True)
+            categorized.parent.mkdir(parents=True)
             expected.write_text("# current\n", encoding="utf-8")
-            legacy.write_text("# legacy\n", encoding="utf-8")
+            categorized.write_text("# categorized\n", encoding="utf-8")
             self.assertEqual(RUNNER.find_worker_script(home), expected.resolve())
             expected.unlink()
             with self.assertRaises(FileNotFoundError):
@@ -185,7 +185,18 @@ class PipelineTests(unittest.TestCase):
                 "✓ Gateway is supervised by launchd (PID 123)"
             )
         )
+        self.assertTrue(
+            INSTALLER.gateway_is_running(
+                "✓ Gateway process running (PID: 11864)"
+            )
+        )
+        self.assertTrue(
+            INSTALLER.gateway_is_running(
+                "✓ Gateway already running (PID: 11864)"
+            )
+        )
         self.assertFalse(INSTALLER.gateway_is_running("✗ Gateway is not running"))
+        self.assertFalse(INSTALLER.gateway_is_running("✗ No gateway process detected"))
         receiver_listing = (
             "  def456 [active]\n"
             "    Name:      HM 后台任务接收 Worker\n"

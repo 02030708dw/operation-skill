@@ -86,9 +86,9 @@ hermes skills search philippines-lottery-result-media
 hermes skills install 02030708dw/operation-skill/facebook-daily-like
 hermes skills install 02030708dw/operation-skill/facebook-daily-comment
 hermes skills install 02030708dw/operation-skill/facebook-post-publish
-hermes skills install 02030708dw/operation-skill/facebook-followed-video-download --category operation-skill
-hermes skills install 02030708dw/operation-skill/cloudflare-r2-video-upload --category operation-skill
-hermes skills install 02030708dw/operation-skill/facebook-video-ingest --category operation-skill
+hermes skills install 02030708dw/operation-skill/facebook-followed-video-download
+hermes skills install 02030708dw/operation-skill/cloudflare-r2-video-upload
+hermes skills install 02030708dw/operation-skill/facebook-video-ingest
 hermes skills install 02030708dw/operation-skill/myt-cloud-phone-file-upload
 hermes skills install 02030708dw/operation-skill/philippines-lottery-result-media
 ```
@@ -134,9 +134,9 @@ hermes skills tap remove 02030708dw/operation-skill
 hermes skills install 02030708dw/operation-skill/skills/facebook-daily-like
 hermes skills install 02030708dw/operation-skill/skills/facebook-daily-comment
 hermes skills install 02030708dw/operation-skill/skills/facebook-post-publish
-hermes skills install 02030708dw/operation-skill/skills/facebook-followed-video-download --category operation-skill
-hermes skills install 02030708dw/operation-skill/skills/cloudflare-r2-video-upload --category operation-skill
-hermes skills install 02030708dw/operation-skill/skills/facebook-video-ingest --category operation-skill
+hermes skills install 02030708dw/operation-skill/skills/facebook-followed-video-download
+hermes skills install 02030708dw/operation-skill/skills/cloudflare-r2-video-upload
+hermes skills install 02030708dw/operation-skill/skills/facebook-video-ingest
 hermes skills install 02030708dw/operation-skill/skills/myt-cloud-phone-file-upload
 hermes skills install 02030708dw/operation-skill/skills/philippines-lottery-result-media
 ```

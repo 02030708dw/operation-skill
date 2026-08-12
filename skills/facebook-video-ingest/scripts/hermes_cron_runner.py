@@ -49,7 +49,6 @@ def find_worker_script(home: Path) -> Path:
     worker = (
         home
         / "skills"
-        / "operation-skill"
         / "facebook-video-ingest"
         / "scripts"
         / "facebook_video_ingest.py"
@@ -57,7 +56,7 @@ def find_worker_script(home: Path) -> Path:
     if worker.is_file():
         return worker.resolve()
     raise FileNotFoundError(
-        "operation-skill facebook-video-ingest Worker not found: " f"{worker}"
+        "facebook-video-ingest Worker not found: " f"{worker}"
     )
 
 

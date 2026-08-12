@@ -195,6 +195,8 @@ def gateway_is_running(output: str) -> bool:
         for marker in (
             "gateway is running",
             "gateway is supervised",
+            "gateway process running",
+            "gateway already running",
             "service started",
         )
     )
@@ -316,7 +318,6 @@ def stop_legacy_watchers(home: Path) -> int:
         (
             home
             / "skills"
-            / "operation-skill"
             / "facebook-video-ingest"
             / "scripts"
             / "facebook_video_ingest.py"
