@@ -1,6 +1,6 @@
 ---
 name: facebook-video-ingest
-description: Claim backend-managed Facebook capture executions, download permitted new videos locally, upload verified files to Cloudflare R2, and report per-video plus execution results back to HM. Use when Hermes must check, run once, continuously watch, operate, or troubleshoot the HM phase-one video ingest worker.
+description: Run customer-side, on-demand Hermes Workers for backend-managed Facebook capture executions, download permitted new videos locally, upload verified files to Cloudflare R2, and report results to HM. Use when Hermes must install its loopback API, pair with the HM admin browser, create or run local Cron jobs, execute a targeted HM ingest job, or troubleshoot the local video pipeline while HM runs on another server.
 ---
 
 # Facebook Video Ingest
@@ -9,7 +9,9 @@ Run the phase-one HM pipeline as one idempotent Worker: backend execution claim 
 
 ## Boundaries
 
-- Treat HM as the task configuration and execution source. HM manages one visible, task-targeted Hermes no-agent Cron script per configured start time; do not manually create duplicate schedules.
+- Treat HM as the task schedule and execution source. The production backend queues work but never calls a server-local Hermes CLI.
+- Keep the Hermes Gateway and its authenticated loopback API on the customer computer. Do not expose port 8642 beyond `127.0.0.1`.
+- Create the capture Worker only when a local Cron fires. Do not keep a continuous HM polling Worker running in the normal production mode.
 - Download only public content or content the user is authorized to save. Never bypass privacy, login, DRM, payment, or rate-limit controls.
 - Read Worker and R2 secrets only from environment variables. Never print them or place them in command arguments.
 - Keep local files after upload. Do not delete, repost, publish, or change R2 access policies.
@@ -28,6 +30,10 @@ CLOUDFLARE_R2_ACCESS_KEY_ID=<access key id>
 CLOUDFLARE_R2_SECRET_ACCESS_KEY=<secret access key>
 CLOUDFLARE_R2_BUCKET=<bucket>
 ```
+
+The entry point and Cron runner also load missing values from
+`<hermes-home>/.env`. Keep that file private; process environment values take
+precedence and secret values are never printed by readiness checks.
 
 Optional values:
 
@@ -88,30 +94,53 @@ For an immediate HM execution, target both identifiers so an older scheduled exe
 python "<skill-dir>/scripts/facebook_video_ingest.py" --execute --task-no "<task-no>" --execution-no "<execution-no>" --wait-for-work-seconds 30 --json
 ```
 
-### Run The Continuous Worker
+### Run The Legacy Continuous Worker
 
-Use this for normal automatic operation:
+Use this only for temporary diagnostics or migration from the old polling architecture:
 
 ```text
 python "<skill-dir>/scripts/facebook_video_ingest.py" --watch
 ```
 
-Keep this process under the machine's normal service supervisor. Stop it with the supervisor or `Ctrl+C`; do not start a second copy with the same Worker ID while the first is active.
+Do not install this mode as a service. Stop it with `Ctrl+C`; do not start a second copy with the same Worker ID while the first is active.
 
-### Prepare Hermes Cron Execution
+The Worker holds a local lock. A duplicate `--watch` process exits successfully
+instead of claiming the same queue concurrently.
+The legacy receiver writes operational output to
+`<hermes-home>/facebook-video-ingest/receiver.log`; empty queue polls are silent.
+Its backend client sends an explicit `HM-Hermes-Worker` user agent so Cloudflare
+does not reject Python's default `urllib` fingerprint with error 1010.
 
-For desktop operation, run the installer once to start the Hermes Gateway and verify the local Worker runtime:
+### Install The Customer-Side Hermes Bridge
+
+On the customer computer, run the installer once:
 
 ```text
 python "<skill-dir>/scripts/install_hermes_worker.py"
 ```
 
-The installer is idempotent. It starts the Hermes Gateway as a login service and installs the no-agent runner under `~/.hermes/scripts/`. HM creates or updates visible task-specific Cron jobs with five-field Cron expressions such as `30 14 * * *`. Clicking “立即执行” creates and triggers a separate one-shot job bound to that backend execution number; it does not wait for or reuse the daily time slot.
+The installer is idempotent. It installs dependencies and the deterministic
+runner, configures the authenticated Hermes API at `127.0.0.1:8642`, restricts
+CORS to the configured HM admin origins, starts or restarts Hermes Gateway, and
+prints an `HMHERMES1.` pairing code. Paste that code into the HM admin browser;
+the API key stays in that browser's local storage and is never sent to HM.
+
+The installer removes the old `HM 后台任务接收 Worker`, `HM 视频抓取 Worker`,
+and stale `HM 立即抓取 C-*` jobs, and stops the old continuous `--watch`
+process on POSIX machines. Preserve `HM 视频抓取 C-*` scheduled jobs during
+migration so the browser can update or remove them safely.
+
+When an operator creates a task, the HM browser calls `POST /api/jobs` on the
+same computer and creates one visible five-field Hermes Cron for each configured
+start time. Clicking “立即执行” first queues an exact backend execution, then
+calls Hermes `/v1/runs` immediately with that task and execution number; it does
+not wait for a daily time slot. Hermes creates the Worker for that run and the
+Worker exits after reporting completion.
 
 ## Execution Rules
 
 1. Run `--check` before first execution. Fix missing scripts, `yt-dlp`, Node `ws`, `boto3`, Chrome, backend settings, or R2 settings before claiming work.
-2. Claim only through the HM internal Worker API. Never invent an execution ID, source URL, or result.
+2. Claim only through the HM internal Worker API. For a scheduled local Cron, include its backend task number. For immediate execution, include both the backend task and execution numbers. Never invent an execution ID, source URL, or result.
 3. Use the globally unique account name supplied by HM as the local source name. Use the backend-provided `r2Prefix` unchanged; it has the form `PH/Sports/yyyyMM/dd` and is derived from the task region, category, and execution date.
 4. Record the download result before starting R2 upload, then update the same backend video record with its R2 result.
 5. Keep a periodic heartbeat active while child processes run. The backend may return an expired execution to the queue after its configured lease timeout.

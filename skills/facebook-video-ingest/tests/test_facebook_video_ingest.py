@@ -39,6 +39,25 @@ class PipelineTests(unittest.TestCase):
         args = MODULE.build_parser().parse_args(["--check"])
         self.assertEqual(args.count, 10)
 
+    def test_worker_loads_private_hermes_env_without_overwriting_process(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            env_file = Path(temporary) / ".env"
+            env_file.write_text(
+                "HM_BACKEND_URL='https://live.example.com/hm'\n"
+                "export HM_WORKER_ID=worker-from-file\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"HM_WORKER_ID": "worker-from-process"},
+                clear=True,
+            ):
+                MODULE.load_env_file(env_file)
+                self.assertEqual(
+                    os.environ["HM_BACKEND_URL"], "https://live.example.com/hm"
+                )
+                self.assertEqual(os.environ["HM_WORKER_ID"], "worker-from-process")
+
     def test_cron_runner_resolves_only_installed_operation_skill(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
@@ -145,6 +164,19 @@ class PipelineTests(unittest.TestCase):
             home / "facebook-video-ingest" / "worker-E-A6B3318C9D634BF8.lock",
         )
 
+    def test_shared_cron_runner_starts_continuous_customer_side_worker(self):
+        self.assertEqual(
+            RUNNER.worker_command(
+                Path("/tmp/facebook_video_ingest.py"),
+                Path("/tmp/hm_facebook_video_ingest_worker.py"),
+            ),
+            [
+                RUNNER.sys.executable,
+                "/tmp/facebook_video_ingest.py",
+                "--watch",
+            ],
+        )
+
     def test_installer_detects_legacy_shared_job_and_supervised_gateway(self):
         listing = "  abc123 [active]\n    Name:      HM 视频抓取 Worker\n"
         self.assertTrue(INSTALLER.has_legacy_job(listing))
@@ -154,6 +186,83 @@ class PipelineTests(unittest.TestCase):
             )
         )
         self.assertFalse(INSTALLER.gateway_is_running("✗ Gateway is not running"))
+        receiver_listing = (
+            "  def456 [active]\n"
+            "    Name:      HM 后台任务接收 Worker\n"
+        )
+        self.assertTrue(
+            INSTALLER.has_job(receiver_listing, INSTALLER.WORKER_JOB_NAME)
+        )
+
+    def test_installer_removes_only_continuous_receiver_jobs(self):
+        listing = (
+            "  a [active]\n"
+            "    Name:      HM 视频抓取 C-001 14:00\n"
+            "  b [completed]\n"
+            "    Name:      HM 立即抓取 C-001 E-001\n"
+            "  c [active]\n"
+            "    Name:      HM 后台任务接收 Worker\n"
+            "  d [active]\n"
+            "    Name:      HM 视频抓取 Worker\n"
+        )
+        self.assertEqual(
+            INSTALLER.obsolete_job_names(listing),
+            [
+                "HM 立即抓取 C-001 E-001",
+                "HM 后台任务接收 Worker",
+                "HM 视频抓取 Worker",
+            ],
+        )
+
+    def test_installer_configures_loopback_api_without_overwriting_other_env(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            env_file = home / ".env"
+            env_file.write_text(
+                "HM_WORKER_TOKEN=keep-secret\nAPI_SERVER_KEY=existing-long-key\n",
+                encoding="utf-8",
+            )
+            key, url = INSTALLER.configure_api_server(
+                home,
+                port=8642,
+                admin_origins=["https://admin.example.com/"],
+            )
+
+            values = INSTALLER.parse_env_file(env_file)
+            self.assertEqual(key, "existing-long-key")
+            self.assertEqual(url, "http://127.0.0.1:8642")
+            self.assertEqual(values["HM_WORKER_TOKEN"], "keep-secret")
+            self.assertEqual(values["API_SERVER_HOST"], "127.0.0.1")
+            self.assertEqual(values["API_SERVER_PORT"], "8642")
+            self.assertEqual(values["HERMES_ACCEPT_HOOKS"], "1")
+            self.assertEqual(
+                values["API_SERVER_CORS_ORIGINS"],
+                "https://admin.example.com",
+            )
+
+    def test_installer_pairing_code_contains_only_local_api_configuration(self):
+        code = INSTALLER.pairing_code("http://127.0.0.1:8642", "a" * 32)
+        self.assertTrue(code.startswith(INSTALLER.PAIRING_PREFIX))
+        encoded = code[len(INSTALLER.PAIRING_PREFIX) :]
+        encoded += "=" * ((4 - len(encoded) % 4) % 4)
+        payload = json.loads(
+            INSTALLER.base64.urlsafe_b64decode(encoded).decode("utf-8")
+        )
+        self.assertEqual(
+            payload,
+            {"apiBaseUrl": "http://127.0.0.1:8642", "apiKey": "a" * 32},
+        )
+
+    @unittest.skipIf(os.name == "nt", "POSIX lock behavior is covered on this host")
+    def test_watch_mode_allows_only_one_customer_side_worker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            lock_path = Path(temporary) / "watch.lock"
+            first = MODULE.acquire_watch_lock(lock_path)
+            self.assertIsNotNone(first)
+            try:
+                self.assertIsNone(MODULE.acquire_watch_lock(lock_path))
+            finally:
+                first.close()
 
     def test_manifest_videos_inherits_source_name(self):
         videos = MODULE.manifest_videos(
@@ -193,6 +302,35 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(args.worker_token, "secret")
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             parser.parse_args(["--worker-token", "secret", "--check"])
+
+    def test_worker_uses_explicit_cloudflare_safe_user_agent(self):
+        captured = {}
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return b'{"code":200,"message":"success","data":null}'
+
+        def fake_urlopen(outgoing, timeout):
+            captured.update(dict(outgoing.header_items()))
+            return Response()
+
+        with mock.patch.object(MODULE.request, "urlopen", side_effect=fake_urlopen):
+            MODULE.api_call(
+                "https://live.example.com/hm",
+                "secret",
+                "POST",
+                "/api/internal/capture/executions/claim",
+                {"workerId": "worker-01"},
+            )
+
+        self.assertEqual(captured["User-agent"], MODULE.WORKER_USER_AGENT)
+        self.assertEqual(captured["Accept"], "application/json")
 
     def test_no_work_is_successful(self):
         args = MODULE.build_parser().parse_args(

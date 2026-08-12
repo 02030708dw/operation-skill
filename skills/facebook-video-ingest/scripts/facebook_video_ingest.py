@@ -13,11 +13,12 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 from urllib import error, request
 
 
 SKILL_NAME = "facebook-video-ingest"
+WORKER_USER_AGENT = "HM-Hermes-Worker/1.0"
 SKILL_DIR = Path(__file__).resolve().parent.parent
 SKILLS_DIR = SKILL_DIR.parent
 DOWNLOAD_SCRIPT = (
@@ -52,6 +53,26 @@ class PipelineError(RuntimeError):
 
 class BackendError(PipelineError):
     pass
+
+
+def load_env_file(path: Path) -> None:
+    """Load missing Worker settings from Hermes' private environment file."""
+    if not path.is_file():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        key, separator, value = line.partition("=")
+        key = key.strip()
+        if not separator or not key or not key.replace("_", "A").isalnum():
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -135,6 +156,34 @@ def normalize_backend(value: str) -> str:
     return normalized
 
 
+def watch_lock_path(state_dir: Path) -> Path:
+    return state_dir.expanduser().resolve().parent / "watch.lock"
+
+
+def acquire_watch_lock(path: Path) -> IO[str] | None:
+    """Allow only one customer-side polling Worker per local Hermes profile."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+", encoding="utf-8")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            if path.stat().st_size == 0:
+                handle.write("0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, BlockingIOError):
+        handle.close()
+        return None
+    return handle
+
+
 def api_call(
     backend: str,
     token: str,
@@ -147,6 +196,8 @@ def api_call(
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": WORKER_USER_AGENT,
         "X-HM-Worker-Token": token,
     }
     if worker_id:
@@ -471,7 +522,8 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             target = f" for execution {args.execution_no.strip().upper()}"
         else:
             target = f" for task {args.task_no.strip().upper()}" if args.task_no.strip() else ""
-        print(f"No queued Facebook capture execution{target}.")
+        if not args.watch:
+            print(f"No queued Facebook capture execution{target}.")
         return 0, result
 
     execution_id = str(job["executionId"])
@@ -659,10 +711,15 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_env_file(infer_hermes_home() / ".env")
     args = build_parser().parse_args(argv)
     if args.check:
         return check(args)
     if args.watch:
+        watch_lock = acquire_watch_lock(watch_lock_path(args.state_dir))
+        if watch_lock is None:
+            print("Customer-side HM Worker is already running.")
+            return 0
         print(
             f"Watching {args.backend or '<missing backend>'} as "
             f"{args.worker_id or '<missing worker id>'}; poll interval {args.poll_seconds}s.",
@@ -685,6 +742,8 @@ def main(argv: list[str] | None = None) -> int:
         except KeyboardInterrupt:
             print("Worker stopped.")
             return 0
+        finally:
+            watch_lock.close()
     if not args.execute:
         raise PipelineError(
             "Preview is not supported for backend claiming; use --check, --execute, or --watch"

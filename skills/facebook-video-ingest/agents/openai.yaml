@@ -1,4 +1,4 @@
 interface:
   display_name: "Facebook Video Ingest"
-  short_description: "Download Facebook videos, upload to R2, and report results"
-  default_prompt: "Use $facebook-video-ingest to claim and run one backend Facebook video ingest job."
+  short_description: "Run on-demand local HM video Workers and upload to R2"
+  default_prompt: "Use $facebook-video-ingest to pair local Hermes and run a targeted HM video ingest task on demand."

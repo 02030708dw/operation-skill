@@ -16,7 +16,11 @@ X-HM-Worker-Token: <secret>
 {"workerId":"hermes-worker-01","taskNo":"C-0123456789AB","executionNo":"E-0123456789ABCDEF"}
 ```
 
-`taskNo` is optional for the shared Worker and required for task-specific Hermes Cron jobs. `executionNo` is optional for daily jobs and required for immediate one-shot jobs. When present, HM only returns that exact queued execution belonging to the requested task. `data` is `null` when no matching job is queued. A claimed Facebook job contains:
+The normal customer-side scheduled Cron includes `taskNo`; an immediate one-shot
+Cron includes both `taskNo` and `executionNo`. An unfiltered claim is reserved
+for diagnostics and legacy continuous-receiver mode. When filters are present,
+HM only returns the matching execution.
+`data` is `null` when no matching job is queued. A claimed Facebook job contains:
 
 ```json
 {

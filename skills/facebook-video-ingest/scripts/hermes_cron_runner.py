@@ -99,17 +99,39 @@ def execution_no_from_runner(path: Path) -> str | None:
 
 
 def worker_command(worker: Path, runner: Path) -> list[str]:
-    command = [sys.executable, str(worker), "--execute"]
     task_no = task_no_from_runner(runner)
+    execution_no = execution_no_from_runner(runner)
+    if not task_no and not execution_no:
+        return [sys.executable, str(worker), "--watch"]
+    command = [sys.executable, str(worker), "--execute"]
     if task_no:
         command.extend(
             ["--task-no", task_no, "--wait-for-work-seconds", "30"]
         )
-    execution_no = execution_no_from_runner(runner)
     if execution_no:
         command.extend(["--execution-no", execution_no])
     command.append("--json")
     return command
+
+
+def start_detached(command: list[str], log_path: Path) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log = log_path.open("a", encoding="utf-8")
+    options: dict[str, object] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": log,
+        "stderr": subprocess.STDOUT,
+    }
+    if os.name == "nt":
+        options["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        )
+    else:
+        options["start_new_session"] = True
+    try:
+        subprocess.Popen(command, **options)
+    finally:
+        log.close()
 
 
 def worker_lock_path(home: Path, runner: Path) -> Path:
@@ -130,8 +152,15 @@ def main() -> int:
         return 0
     worker = find_worker_script(home)
     try:
+        command = worker_command(worker, runner)
+        if "--watch" in command:
+            start_detached(
+                command,
+                home / "facebook-video-ingest" / "receiver.log",
+            )
+            return 0
         completed = subprocess.run(
-            worker_command(worker, runner),
+            command,
             text=True,
             check=False,
         )
