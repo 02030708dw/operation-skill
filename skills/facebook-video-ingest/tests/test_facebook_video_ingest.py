@@ -194,6 +194,41 @@ class PipelineTests(unittest.TestCase):
             INSTALLER.has_job(receiver_listing, INSTALLER.WORKER_JOB_NAME)
         )
 
+    def test_installer_decodes_hermes_output_as_utf8_on_windows(self):
+        completed = INSTALLER.subprocess.CompletedProcess(
+            ["hermes", "gateway", "status"],
+            0,
+            stdout="✓ Gateway is running\n",
+            stderr="",
+        )
+        with mock.patch.object(
+            INSTALLER.subprocess,
+            "run",
+            return_value=completed,
+        ) as run:
+            INSTALLER.call(["hermes", "gateway", "status"])
+
+        self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
+        self.assertEqual(run.call_args.kwargs["errors"], "replace")
+        self.assertTrue(run.call_args.kwargs["capture_output"])
+
+    def test_installer_keeps_console_attached_for_windows_uac(self):
+        completed = INSTALLER.subprocess.CompletedProcess(
+            ["hermes", "gateway", "install"],
+            0,
+        )
+        with mock.patch.object(
+            INSTALLER.subprocess,
+            "run",
+            return_value=completed,
+        ) as run:
+            INSTALLER.call(
+                ["hermes", "gateway", "install"],
+                interactive=True,
+            )
+
+        self.assertFalse(run.call_args.kwargs["capture_output"])
+
     def test_installer_removes_only_continuous_receiver_jobs(self):
         listing = (
             "  a [active]\n"

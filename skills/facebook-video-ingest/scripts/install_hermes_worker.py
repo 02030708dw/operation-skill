@@ -30,6 +30,8 @@ DEFAULT_ADMIN_ORIGINS = (
 )
 PAIRING_PREFIX = "HMHERMES1."
 ANSI_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
+SUBPROCESS_ENCODING = "utf-8"
+SUBPROCESS_ERRORS = "replace"
 
 
 def parser() -> argparse.ArgumentParser:
@@ -63,8 +65,27 @@ def hermes_command() -> str:
     raise RuntimeError("Hermes CLI is not installed or is not on PATH")
 
 
-def call(command: list[str], *, allow_failure: bool = False) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(command, text=True, capture_output=True, check=False)
+def call(
+    command: list[str],
+    *,
+    allow_failure: bool = False,
+    interactive: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    """Run a Hermes command without relying on the Windows ANSI code page.
+
+    Hermes emits UTF-8 even when native Windows reports GBK/CP936 as its
+    preferred encoding.  Decoding through the locale can therefore crash a
+    ``subprocess.run`` reader thread.  Gateway installation is interactive on
+    Windows when UAC approval is needed, so leave its console attached.
+    """
+    completed = subprocess.run(
+        command,
+        text=True,
+        encoding=SUBPROCESS_ENCODING,
+        errors=SUBPROCESS_ERRORS,
+        capture_output=not interactive,
+        check=False,
+    )
     if completed.stdout:
         print(completed.stdout, end="")
     if completed.stderr:
@@ -146,6 +167,8 @@ def ensure_dependencies(home: Path) -> None:
     probe = subprocess.run(
         [str(python), "-c", "import boto3"],
         text=True,
+        encoding=SUBPROCESS_ENCODING,
+        errors=SUBPROCESS_ERRORS,
         capture_output=True,
         check=False,
     )
@@ -188,7 +211,8 @@ def ensure_gateway(hermes: str) -> None:
             "install",
             "--start-now",
             "--start-on-login",
-        ]
+        ],
+        interactive=True,
     )
     status = call([hermes, "gateway", "status"], allow_failure=True)
     if not gateway_is_running(f"{status.stdout}\n{status.stderr}"):
@@ -301,6 +325,8 @@ def stop_legacy_watchers(home: Path) -> int:
     completed = subprocess.run(
         ["ps", "-axo", "pid=,command="],
         text=True,
+        encoding=SUBPROCESS_ENCODING,
+        errors=SUBPROCESS_ERRORS,
         capture_output=True,
         check=False,
     )
