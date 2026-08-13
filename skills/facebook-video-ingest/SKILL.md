@@ -133,8 +133,14 @@ migration so the browser can update or remove them safely.
 When an operator creates a task, the HM browser calls `POST /api/jobs` on the
 same computer and creates one visible five-field Hermes Cron for each configured
 start time. Clicking “立即执行” first queues an exact backend execution, then
-calls Hermes `/v1/runs` immediately with that task and execution number; it does
-not wait for a daily time slot. Hermes creates the Worker for that run and the
+creates a future one-shot (`repeat=1`) local Cron with this Skill attached and
+both the task and execution numbers in its prompt. The browser calls
+`POST /api/jobs/{job_id}/run` immediately, so the job does not wait for a daily
+time slot. Never use a recurring every-minute schedule for this one-shot: a
+long first run can overlap the following minute before its repeat count is
+committed. Use the Cron route
+instead of a generic `/v1/runs` agent run: the Cron runner preloads this Skill,
+creates an operator-visible task, and records its final status and error. The
 Worker exits after reporting completion.
 
 ## Execution Rules
