@@ -292,6 +292,31 @@ class PipelineTests(unittest.TestCase):
                 "https://admin.example.com",
             )
 
+    def test_installer_preserves_existing_cors_origins_on_reinstall(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            env_file = home / ".env"
+            env_file.write_text(
+                "API_SERVER_KEY=existing-long-key\n"
+                "API_SERVER_CORS_ORIGINS=https://customer.example.com\n",
+                encoding="utf-8",
+            )
+
+            INSTALLER.configure_api_server(
+                home,
+                port=8642,
+                admin_origins=[
+                    "https://hermes.mvkbmb.online",
+                    "https://customer.example.com/",
+                ],
+            )
+
+            values = INSTALLER.parse_env_file(env_file)
+            self.assertEqual(
+                values["API_SERVER_CORS_ORIGINS"],
+                "https://hermes.mvkbmb.online,https://customer.example.com",
+            )
+
     def test_installer_pairing_code_contains_only_local_api_configuration(self):
         code = INSTALLER.pairing_code("http://127.0.0.1:8642", "a" * 32)
         self.assertTrue(code.startswith(INSTALLER.PAIRING_PREFIX))

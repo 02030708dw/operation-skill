@@ -279,7 +279,12 @@ def configure_api_server(
     api_key = current.get("API_SERVER_KEY", "").strip()
     if len(api_key) < 16:
         api_key = secrets.token_urlsafe(32)
-    origins = [origin.strip().rstrip("/") for origin in admin_origins if origin.strip()]
+    existing_origins = current.get("API_SERVER_CORS_ORIGINS", "").split(",")
+    origins = [
+        origin.strip().rstrip("/")
+        for origin in [*admin_origins, *existing_origins]
+        if origin.strip()
+    ]
     if not origins:
         raise ValueError("At least one HM admin origin is required")
     write_env_values(
