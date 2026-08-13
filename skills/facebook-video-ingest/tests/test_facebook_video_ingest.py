@@ -33,12 +33,82 @@ INSTALLER = importlib.util.module_from_spec(INSTALLER_SPEC)
 assert INSTALLER_SPEC and INSTALLER_SPEC.loader
 INSTALLER_SPEC.loader.exec_module(INSTALLER)
 
+EXTENSION_PATH = MODULE_PATH.with_name("hm_capture_gateway_extension.py")
+EXTENSION_SPEC = importlib.util.spec_from_file_location(
+    "hm_capture_gateway_extension", EXTENSION_PATH
+)
+EXTENSION = importlib.util.module_from_spec(EXTENSION_SPEC)
+assert EXTENSION_SPEC and EXTENSION_SPEC.loader
+EXTENSION_SPEC.loader.exec_module(EXTENSION)
+
 
 class PipelineTests(unittest.TestCase):
     def test_installer_allows_production_admin_origin_by_default(self):
         self.assertIn(
             "https://hermes.mvkbmb.online",
             INSTALLER.DEFAULT_ADMIN_ORIGINS,
+        )
+
+    def test_gateway_extension_materializes_exact_no_agent_runner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            scripts = home / "scripts"
+            scripts.mkdir()
+            (scripts / EXTENSION.BASE_RUNNER_NAME).write_text(
+                "# trusted runner\n", encoding="utf-8"
+            )
+            prepared = EXTENSION.prepare_capture_job_body(
+                {
+                    "name": "HM immediate",
+                    "hm_capture_runner": {
+                        "taskNo": "C-5786859AED6E",
+                        "executionNo": "E-A6B3318C9D634BF8",
+                    },
+                },
+                home=home,
+            )
+            expected = "hm_capture_C-5786859AED6E_E-A6B3318C9D634BF8.py"
+            self.assertTrue(prepared["no_agent"])
+            self.assertEqual(prepared["script"], expected)
+            self.assertEqual(prepared["skills"], [])
+            self.assertEqual(
+                (scripts / expected).read_text(encoding="utf-8"),
+                "# trusted runner\n",
+            )
+            EXTENSION.cleanup_capture_job_script(prepared, home=home)
+            self.assertFalse((scripts / expected).exists())
+
+    def test_gateway_extension_rejects_ambiguous_runner_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(ValueError):
+                EXTENSION.prepare_capture_job_body(
+                    {
+                        "hm_capture_runner": {
+                            "taskNo": "C-5786859AED6E",
+                            "executionNo": "E-A6B3318C9D634BF8",
+                            "scheduleKey": "1400",
+                        }
+                    },
+                    home=Path(temporary),
+                )
+
+    def test_installer_gateway_api_patch_is_idempotent(self):
+        api_server = (
+            Path.home()
+            / ".hermes"
+            / "hermes-agent"
+            / "gateway"
+            / "platforms"
+            / "api_server.py"
+        )
+        if not api_server.is_file():
+            self.skipTest("Hermes API server source is not installed")
+        original = api_server.read_text(encoding="utf-8")
+        patched = INSTALLER.patch_gateway_api_source(original)
+        compile(patched, str(api_server), "exec")
+        self.assertEqual(INSTALLER.patch_gateway_api_source(patched), patched)
+        self.assertIn(
+            "prepare_capture_job_body(await request.json())", patched
         )
 
     def test_daily_recent_video_target_defaults_to_ten(self):
@@ -162,6 +232,10 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertIn("--execution-no", exact_command)
         self.assertIn("E-A6B3318C9D634BF8", exact_command)
+        self.assertEqual(
+            exact_command[exact_command.index("--wait-for-work-seconds") + 1],
+            "90",
+        )
         self.assertEqual(
             RUNNER.worker_lock_path(
                 home,

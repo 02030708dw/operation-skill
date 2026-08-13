@@ -104,8 +104,9 @@ def worker_command(worker: Path, runner: Path) -> list[str]:
         return [sys.executable, str(worker), "--watch"]
     command = [sys.executable, str(worker), "--execute"]
     if task_no:
+        wait_seconds = "90" if execution_no else "30"
         command.extend(
-            ["--task-no", task_no, "--wait-for-work-seconds", "30"]
+            ["--task-no", task_no, "--wait-for-work-seconds", wait_seconds]
         )
     if execution_no:
         command.extend(["--execution-no", execution_no])

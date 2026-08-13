@@ -21,6 +21,8 @@ from urllib import error, request
 LEGACY_JOB_NAME = "HM 视频抓取 Worker"
 WORKER_JOB_NAME = "HM 后台任务接收 Worker"
 RUNNER_NAME = "hm_facebook_video_ingest_worker.py"
+GATEWAY_EXTENSION_SOURCE = "hm_capture_gateway_extension.py"
+GATEWAY_EXTENSION_TARGET = "hm_capture_extension.py"
 DEFAULT_API_HOST = "127.0.0.1"
 DEFAULT_API_PORT = 8642
 DEFAULT_ADMIN_ORIGINS = (
@@ -142,6 +144,144 @@ def install_runner(home: Path) -> Path:
         target.write_bytes(source_bytes)
     target.chmod(0o700)
     return target.resolve()
+
+
+def _replace_once(source: str, old: str, new: str, label: str) -> str:
+    count = source.count(old)
+    if count != 1:
+        raise RuntimeError(
+            f"Hermes Gateway API patch point changed ({label}, found {count})"
+        )
+    return source.replace(old, new, 1)
+
+
+def patch_gateway_api_source(source: str) -> str:
+    """Add standard no-agent fields plus the restricted HM runner hook."""
+    marker = "prepare_capture_job_body(await request.json())"
+    if marker in source:
+        return source
+
+    create_start = source.find("    async def _handle_create_job(")
+    create_end = source.find("    async def _handle_get_job(", create_start)
+    if create_start < 0 or create_end < 0:
+        raise RuntimeError("Hermes Gateway create-job handler was not found")
+    create_block = source[create_start:create_end]
+    create_block = _replace_once(
+        create_block,
+        "            body = await request.json()\n"
+        "            name = (body.get(\"name\") or \"\").strip()\n",
+        "            from gateway.platforms.hm_capture_extension import (\n"
+        "                prepare_capture_job_body,\n"
+        "            )\n\n"
+        "            body = prepare_capture_job_body(await request.json())\n"
+        "            name = (body.get(\"name\") or \"\").strip()\n",
+        "prepare create body",
+    )
+    create_block = _replace_once(
+        create_block,
+        "            skills = body.get(\"skills\")\n"
+        "            repeat = body.get(\"repeat\")\n",
+        "            skills = body.get(\"skills\")\n"
+        "            repeat = body.get(\"repeat\")\n"
+        "            script = (body.get(\"script\") or \"\").strip()\n"
+        "            no_agent = bool(body.get(\"no_agent\"))\n",
+        "read script fields",
+    )
+    create_block = _replace_once(
+        create_block,
+        "            if skills:\n"
+        "                kwargs[\"skills\"] = skills\n"
+        "            if repeat is not None:\n",
+        "            if skills:\n"
+        "                kwargs[\"skills\"] = skills\n"
+        "            if script:\n"
+        "                kwargs[\"script\"] = script\n"
+        "            if no_agent:\n"
+        "                if not script:\n"
+        "                    return web.json_response(\n"
+        "                        {\"error\": \"no_agent requires a script\"}, status=400,\n"
+        "                    )\n"
+        "                kwargs[\"no_agent\"] = True\n"
+        "            if repeat is not None:\n",
+        "forward script fields",
+    )
+    source = source[:create_start] + create_block + source[create_end:]
+
+    delete_start = source.find("    async def _handle_delete_job(")
+    delete_end = source.find("    async def _handle_pause_job(", delete_start)
+    if delete_start < 0 or delete_end < 0:
+        raise RuntimeError("Hermes Gateway delete-job handler was not found")
+    delete_block = source[delete_start:delete_end]
+    delete_block = _replace_once(
+        delete_block,
+        "        try:\n"
+        "            success = _cron_remove(job_id)\n"
+        "            if not success:\n"
+        "                return web.json_response({\"error\": \"Job not found\"}, status=404)\n"
+        "            _notify_cron_provider_jobs_changed()\n"
+        "            return web.json_response({\"ok\": True})\n",
+        "        try:\n"
+        "            job = _cron_get(job_id)\n"
+        "            success = _cron_remove(job_id)\n"
+        "            if not success:\n"
+        "                return web.json_response({\"error\": \"Job not found\"}, status=404)\n"
+        "            try:\n"
+        "                from gateway.platforms.hm_capture_extension import (\n"
+        "                    cleanup_capture_job_script,\n"
+        "                )\n\n"
+        "                cleanup_capture_job_script(job)\n"
+        "            except Exception:\n"
+        "                logger.debug(\n"
+        "                    \"HM capture runner cleanup failed\", exc_info=True\n"
+        "                )\n"
+        "            _notify_cron_provider_jobs_changed()\n"
+        "            return web.json_response({\"ok\": True})\n",
+        "cleanup deleted runner",
+    )
+    source = source[:delete_start] + delete_block + source[delete_end:]
+    return source
+
+
+def install_gateway_api_extension(home: Path) -> Path:
+    """Install and idempotently patch Hermes' authenticated loopback API."""
+    source_extension = Path(__file__).resolve().with_name(
+        GATEWAY_EXTENSION_SOURCE
+    )
+    if not source_extension.is_file():
+        raise RuntimeError(
+            f"Gateway extension is missing: {source_extension}"
+        )
+    platform_dir = home / "hermes-agent" / "gateway" / "platforms"
+    api_server = platform_dir / "api_server.py"
+    if not api_server.is_file():
+        raise RuntimeError(f"Hermes Gateway API source is missing: {api_server}")
+
+    platform_dir.mkdir(parents=True, exist_ok=True)
+    extension_target = platform_dir / GATEWAY_EXTENSION_TARGET
+    extension_bytes = source_extension.read_bytes()
+    if (
+        not extension_target.is_file()
+        or extension_target.read_bytes() != extension_bytes
+    ):
+        extension_target.write_bytes(extension_bytes)
+
+    original = api_server.read_text(encoding="utf-8")
+    patched = patch_gateway_api_source(original)
+    compile(patched, str(api_server), "exec")
+    if patched != original:
+        backup = api_server.with_suffix(".py.hm-before-capture")
+        if not backup.exists():
+            shutil.copy2(api_server, backup)
+        temporary = api_server.with_suffix(".py.hm-capture.tmp")
+        try:
+            temporary.write_text(patched, encoding="utf-8")
+            os.replace(temporary, api_server)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+    return extension_target.resolve()
 
 
 def hermes_python(home: Path) -> Path:
@@ -395,6 +535,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     install_runner(home)
+    install_gateway_api_extension(home)
     ensure_dependencies(home)
     api_key, api_base_url = configure_api_server(
         home, port=args.api_port, admin_origins=origins
