@@ -35,6 +35,10 @@ The entry point and Cron runner also load missing values from
 `<hermes-home>/.env`. Keep that file private; process environment values take
 precedence and secret values are never printed by readiness checks.
 
+Use a unique, stable `HM_WORKER_ID` for each customer computer. The installer
+includes that non-secret identity in the browser pairing code so HM can bind
+new tasks to the correct local Hermes instance.
+
 Optional values:
 
 ```text
@@ -122,7 +126,8 @@ python "<skill-dir>/scripts/install_hermes_worker.py"
 The installer is idempotent. It installs dependencies and the deterministic
 runner, configures the authenticated Hermes API at `127.0.0.1:8642`, restricts
 CORS to the configured HM admin origins, starts or restarts Hermes Gateway, and
-prints an `HMHERMES1.` pairing code. Paste that code into the HM admin browser;
+prints an `HMHERMES1.` pairing code containing the configured Worker ID. Paste
+that code into the HM admin browser;
 the API key stays in that browser's local storage and is never sent to HM.
 
 The installer removes the old `HM 后台任务接收 Worker`, `HM 视频抓取 Worker`,

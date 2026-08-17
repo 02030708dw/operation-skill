@@ -440,9 +440,16 @@ def configure_api_server(
     return api_key, f"http://{DEFAULT_API_HOST}:{port}"
 
 
-def pairing_code(api_base_url: str, api_key: str) -> str:
+def pairing_code(api_base_url: str, api_key: str, worker_id: str) -> str:
+    normalized_worker_id = worker_id.strip()
+    if not normalized_worker_id or len(normalized_worker_id) > 80:
+        raise ValueError("HM_WORKER_ID must contain 1-80 characters")
     payload = json.dumps(
-        {"apiBaseUrl": api_base_url, "apiKey": api_key},
+        {
+            "apiBaseUrl": api_base_url,
+            "apiKey": api_key,
+            "workerId": normalized_worker_id,
+        },
         ensure_ascii=True,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -520,6 +527,9 @@ def main(argv: list[str] | None = None) -> int:
     home = hermes_home()
     origins = args.admin_origins or list(DEFAULT_ADMIN_ORIGINS)
     env_values = parse_env_file(home / ".env")
+    worker_id = env_values.get("HM_WORKER_ID", "").strip()
+    if not worker_id:
+        raise RuntimeError("HM_WORKER_ID is missing from ~/.hermes/.env")
 
     if args.check:
         api_key = env_values.get("API_SERVER_KEY", "")
@@ -531,7 +541,10 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError("Hermes local API is not configured or not reachable")
         print(f"Hermes local API ready: {api_base_url}")
         if args.show_pairing_code:
-            print(f"HM Hermes pairing code:\n{pairing_code(api_base_url, api_key)}")
+            print(
+                f"HM Hermes pairing code:\n"
+                f"{pairing_code(api_base_url, api_key, worker_id)}"
+            )
         return 0
 
     install_runner(home)
@@ -552,7 +565,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Stopped {stopped} legacy continuous Worker process(es).")
     if not args.no_pairing_code:
         print("Paste this code into 后台 → 视频抓取任务 → 连接本机 Hermes:")
-        print(pairing_code(api_base_url, api_key))
+        print(pairing_code(api_base_url, api_key, worker_id))
     return 0
 
 

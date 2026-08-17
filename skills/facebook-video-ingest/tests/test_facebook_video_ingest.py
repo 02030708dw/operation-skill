@@ -391,8 +391,10 @@ class PipelineTests(unittest.TestCase):
                 "https://hermes.mvkbmb.online,https://customer.example.com",
             )
 
-    def test_installer_pairing_code_contains_only_local_api_configuration(self):
-        code = INSTALLER.pairing_code("http://127.0.0.1:8642", "a" * 32)
+    def test_installer_pairing_code_contains_local_api_and_worker_identity(self):
+        code = INSTALLER.pairing_code(
+            "http://127.0.0.1:8642", "a" * 32, "hermes-worker-01"
+        )
         self.assertTrue(code.startswith(INSTALLER.PAIRING_PREFIX))
         encoded = code[len(INSTALLER.PAIRING_PREFIX) :]
         encoded += "=" * ((4 - len(encoded) % 4) % 4)
@@ -401,7 +403,11 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertEqual(
             payload,
-            {"apiBaseUrl": "http://127.0.0.1:8642", "apiKey": "a" * 32},
+            {
+                "apiBaseUrl": "http://127.0.0.1:8642",
+                "apiKey": "a" * 32,
+                "workerId": "hermes-worker-01",
+            },
         )
 
     @unittest.skipIf(os.name == "nt", "POSIX lock behavior is covered on this host")
