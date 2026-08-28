@@ -19,6 +19,8 @@ from urllib import error, request
 
 SKILL_NAME = "facebook-video-ingest"
 WORKER_USER_AGENT = "HM-Hermes-Worker/1.0"
+TRANSIENT_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+TRANSIENT_BACKEND_ATTEMPTS = 6
 SKILL_DIR = Path(__file__).resolve().parent.parent
 SKILLS_DIR = SKILL_DIR.parent
 DOWNLOAD_SCRIPT = (
@@ -202,6 +204,7 @@ def api_call(
     payload: dict[str, Any],
     *,
     worker_id: str | None = None,
+    retry_transient: bool = False,
 ) -> Any:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     headers = {
@@ -212,17 +215,25 @@ def api_call(
     }
     if worker_id:
         headers["X-HM-Worker-Id"] = worker_id
-    outgoing = request.Request(
-        f"{backend}{path}", data=body, headers=headers, method=method
-    )
-    try:
-        with request.urlopen(outgoing, timeout=30) as response:
-            parsed = json.loads(response.read().decode("utf-8"))
-    except error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:1000]
-        raise BackendError(f"backend returned HTTP {exc.code}: {detail}") from exc
-    except (error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        raise BackendError(f"backend request failed: {exc}") from exc
+    attempts = TRANSIENT_BACKEND_ATTEMPTS if retry_transient else 1
+    for attempt in range(attempts):
+        outgoing = request.Request(
+            f"{backend}{path}", data=body, headers=headers, method=method
+        )
+        try:
+            with request.urlopen(outgoing, timeout=30) as response:
+                parsed = json.loads(response.read().decode("utf-8"))
+            break
+        except error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:1000]
+            if exc.code not in TRANSIENT_HTTP_STATUSES or attempt + 1 >= attempts:
+                raise BackendError(
+                    f"backend returned HTTP {exc.code}: {detail}"
+                ) from exc
+        except (error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            if attempt + 1 >= attempts:
+                raise BackendError(f"backend request failed: {exc}") from exc
+        time.sleep(min(2 ** attempt, 8))
     if not isinstance(parsed, dict) or parsed.get("code") != 200:
         raise BackendError(f"backend rejected request: {parsed}")
     return parsed.get("data")
@@ -307,6 +318,7 @@ def heartbeat(backend: str, token: str, worker_id: str, execution_id: str, progr
         "POST",
         f"/api/internal/capture/executions/{execution_id}/heartbeat",
         {"workerId": worker_id, "progress": progress},
+        retry_transient=True,
     )
 
 
@@ -405,6 +417,7 @@ def record_video(
         f"/api/internal/capture/executions/{execution_id}/videos",
         payload,
         worker_id=worker_id,
+        retry_transient=True,
     )
 
 
@@ -441,6 +454,7 @@ def complete(
             "errorCode": error_code,
             "errorMessage": error_message,
         },
+        retry_transient=True,
     )
 
 

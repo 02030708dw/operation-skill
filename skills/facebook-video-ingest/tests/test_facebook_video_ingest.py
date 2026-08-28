@@ -700,6 +700,37 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(captured["User-agent"], MODULE.WORKER_USER_AGENT)
         self.assertEqual(captured["Accept"], "application/json")
 
+    def test_transient_backend_failure_is_retried_for_safe_callback(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return b'{"code":200,"message":"success","data":null}'
+
+        with (
+            mock.patch.object(
+                MODULE.request,
+                "urlopen",
+                side_effect=[MODULE.error.URLError("temporary"), Response()],
+            ) as urlopen,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            MODULE.api_call(
+                "https://live.example.com/hm",
+                "secret",
+                "POST",
+                "/api/internal/capture/executions/E-001/heartbeat",
+                {"workerId": "worker-01", "progress": 90},
+                retry_transient=True,
+            )
+
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(1)
+
     def test_no_work_is_successful(self):
         args = MODULE.build_parser().parse_args(
             [
