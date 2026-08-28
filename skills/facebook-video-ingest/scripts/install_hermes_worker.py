@@ -5,17 +5,22 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
+import hmac
+import ipaddress
 import json
 import os
 import re
 import secrets
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
 from pathlib import Path
 from urllib import error, request
+from urllib.parse import urlparse
 
 
 LEGACY_JOB_NAME = "HM 视频抓取 Worker"
@@ -45,6 +50,11 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--show-pairing-code", action="store_true")
     result.add_argument("--no-pairing-code", action="store_true")
     result.add_argument("--api-port", type=int, default=DEFAULT_API_PORT)
+    result.add_argument(
+        "--media-base-url",
+        default=os.getenv("HM_CAPTURE_MEDIA_BASE_URL", ""),
+        help="backend-reachable private HTTP base URL; defaults to an auto-detected LAN IPv4",
+    )
     result.add_argument(
         "--admin-origin",
         action="append",
@@ -160,7 +170,9 @@ def patch_gateway_api_source(source: str) -> str:
     marker = "prepare_capture_job_body(await request.json())"
     media_marker = "resolve_capture_video_path(request.query.get(\"path\"))"
     delete_media_marker = "delete_capture_video_path(request.query.get(\"path\"))"
-    if marker in source and media_marker in source and delete_media_marker in source:
+    media_auth_marker = "_check_hm_capture_media_auth"
+    if (marker in source and media_marker in source and delete_media_marker in source
+            and media_auth_marker in source):
         return source
     if marker not in source:
         create_start = source.find("    async def _handle_create_job(")
@@ -288,6 +300,33 @@ def patch_gateway_api_source(source: str) -> str:
             "            return web.json_response({\"error\": \"Video path is not allowed\"}, status=403)\n\n"
         )
         source = source[:handler_at] + handler + source[handler_at:]
+    if media_auth_marker not in source:
+        handler_at = source.find("    async def _handle_delete_hm_capture_video(")
+        if handler_at < 0:
+            raise RuntimeError("Hermes Gateway capture video delete handler was not found")
+        helper = (
+            "    def _check_hm_capture_media_auth(self, request: \"web.Request\"):\n"
+            "        expected = os.getenv(\"HM_CAPTURE_MEDIA_TOKEN\", \"\").strip()\n"
+            "        auth = request.headers.get(\"Authorization\", \"\")\n"
+            "        token = auth[7:].strip() if auth.startswith(\"Bearer \") else \"\"\n"
+            "        if expected and hmac.compare_digest(token.encode(), expected.encode()):\n"
+            "            return None\n"
+            "        return self._check_auth(request)\n\n"
+        )
+        source = source[:handler_at] + helper + source[handler_at:]
+        for name in ("_handle_delete_hm_capture_video", "_handle_hm_capture_video"):
+            signature = (
+                f"    async def {name}(self, request: \"web.Request\") -> \"web.Response\":\n"
+            )
+            guarded = (
+                signature
+                + "        auth_err = self._check_hm_capture_media_auth(request)\n"
+                + "        if auth_err:\n"
+                + "            return auth_err\n"
+            )
+            source = _replace_once(
+                source, signature, guarded, f"secure {name}"
+            )
     return source
 
 
@@ -458,9 +497,83 @@ def write_env_values(path: Path, updates: dict[str, str]) -> None:
         pass
 
 
+def derive_media_token(worker_token: str, worker_id: str) -> str:
+    digest = hmac.new(
+        worker_token.encode("utf-8"),
+        f"hm-capture-media/v1\n{worker_id}".encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+def is_allowed_private_ipv4(value: str) -> bool:
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    if address.version != 4:
+        return False
+    allowed = (
+        ipaddress.ip_network("10.0.0.0/8"),
+        ipaddress.ip_network("127.0.0.0/8"),
+        ipaddress.ip_network("169.254.0.0/16"),
+        ipaddress.ip_network("172.16.0.0/12"),
+        ipaddress.ip_network("192.168.0.0/16"),
+    )
+    return any(address in network for network in allowed)
+
+
+def discover_lan_ipv4(backend: str) -> str:
+    parsed = urlparse(backend)
+    targets = [(parsed.hostname or "", parsed.port or (443 if parsed.scheme == "https" else 80))]
+    targets.append(("8.8.8.8", 53))
+    for host, port in targets:
+        if not host:
+            continue
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect((host, port))
+            candidate = str(probe.getsockname()[0])
+            if is_allowed_private_ipv4(candidate) and not candidate.startswith("127."):
+                return candidate
+        except OSError:
+            continue
+        finally:
+            probe.close()
+    try:
+        candidates = socket.getaddrinfo(
+            socket.gethostname(), None, socket.AF_INET
+        )
+    except OSError:
+        candidates = []
+    for candidate in candidates:
+        address = str(candidate[4][0])
+        if is_allowed_private_ipv4(address) and not address.startswith("127."):
+            return address
+    raise RuntimeError(
+        "Could not detect a private LAN IPv4; rerun with --media-base-url http://LAN-IP:PORT"
+    )
+
+
+def normalize_media_base_url(value: str, *, backend: str, port: int) -> str:
+    normalized = value.strip().rstrip("/")
+    if not normalized:
+        normalized = f"http://{discover_lan_ipv4(backend)}:{port}"
+    parsed = urlparse(normalized)
+    if (parsed.scheme != "http" or not parsed.hostname or parsed.port is None
+            or parsed.username or parsed.password or parsed.query or parsed.fragment
+            or parsed.path not in {"", "/"}
+            or not is_allowed_private_ipv4(parsed.hostname)):
+        raise ValueError(
+            "media base URL must be a private IPv4 HTTP URL with an explicit port"
+        )
+    return f"http://{parsed.hostname}:{parsed.port}"
+
+
 def configure_api_server(
-    home: Path, *, port: int, admin_origins: list[str]
-) -> tuple[str, str]:
+    home: Path, *, port: int, admin_origins: list[str], worker_id: str,
+    worker_token: str, backend: str, media_base_url: str
+) -> tuple[str, str, str]:
     if port < 1 or port > 65535:
         raise ValueError("API port must be between 1 and 65535")
     env_path = home / ".env"
@@ -468,6 +581,10 @@ def configure_api_server(
     api_key = current.get("API_SERVER_KEY", "").strip()
     if len(api_key) < 16:
         api_key = secrets.token_urlsafe(32)
+    media_token = derive_media_token(worker_token, worker_id)
+    normalized_media_base_url = normalize_media_base_url(
+        media_base_url, backend=backend, port=port
+    )
     existing_origins = current.get("API_SERVER_CORS_ORIGINS", "").split(",")
     origins = [
         origin.strip().rstrip("/")
@@ -480,13 +597,47 @@ def configure_api_server(
         env_path,
         {
             "API_SERVER_KEY": api_key,
-            "API_SERVER_HOST": DEFAULT_API_HOST,
+            "API_SERVER_HOST": "0.0.0.0",
             "API_SERVER_PORT": str(port),
             "API_SERVER_CORS_ORIGINS": ",".join(dict.fromkeys(origins)),
+            "HM_CAPTURE_MEDIA_TOKEN": media_token,
+            "HM_CAPTURE_MEDIA_BASE_URL": normalized_media_base_url,
             "HERMES_ACCEPT_HOOKS": "1",
         },
     )
-    return api_key, f"http://{DEFAULT_API_HOST}:{port}"
+    return api_key, f"http://{DEFAULT_API_HOST}:{port}", normalized_media_base_url
+
+
+def register_media_endpoint(
+    backend: str, worker_token: str, worker_id: str, media_base_url: str
+) -> None:
+    payload = json.dumps(
+        {"workerId": worker_id, "mediaBaseUrl": media_base_url},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    outgoing = request.Request(
+        f"{backend.rstrip('/')}/api/internal/capture/workers/register",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "HM-Hermes-Worker/1.0",
+            "X-HM-Worker-Token": worker_token,
+        },
+        method="POST",
+    )
+    try:
+        with request.urlopen(outgoing, timeout=15) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:500]
+        raise RuntimeError(
+            f"HM backend rejected media endpoint registration: HTTP {exc.code} {detail}"
+        ) from exc
+    except (error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"HM media endpoint registration failed: {exc}") from exc
+    if not isinstance(result, dict) or result.get("code") != 200:
+        raise RuntimeError(f"HM backend rejected media endpoint registration: {result}")
 
 
 def pairing_code(api_base_url: str, api_key: str, worker_id: str) -> str:
@@ -579,6 +730,10 @@ def main(argv: list[str] | None = None) -> int:
     worker_id = env_values.get("HM_WORKER_ID", "").strip()
     if not worker_id:
         raise RuntimeError("HM_WORKER_ID is missing from ~/.hermes/.env")
+    worker_token = env_values.get("HM_WORKER_TOKEN", "").strip()
+    backend = env_values.get("HM_BACKEND_URL", "").strip().rstrip("/")
+    if not worker_token or not backend.startswith(("http://", "https://")):
+        raise RuntimeError("HM_WORKER_TOKEN or HM_BACKEND_URL is missing from ~/.hermes/.env")
 
     if args.check:
         api_key = env_values.get("API_SERVER_KEY", "")
@@ -588,7 +743,14 @@ def main(argv: list[str] | None = None) -> int:
         call([hermes, "gateway", "status"], allow_failure=True)
         if len(api_key) < 16 or not api_is_ready(api_base_url, api_key, 3):
             raise RuntimeError("Hermes local API is not configured or not reachable")
+        media_base_url = env_values.get("HM_CAPTURE_MEDIA_BASE_URL", "").strip()
+        expected_media_token = derive_media_token(worker_token, worker_id)
+        if (not media_base_url or
+                env_values.get("HM_CAPTURE_MEDIA_TOKEN", "") != expected_media_token):
+            raise RuntimeError("Hermes remote review media endpoint is not configured")
+        register_media_endpoint(backend, worker_token, worker_id, media_base_url)
         print(f"Hermes local API ready: {api_base_url}")
+        print(f"HM backend media endpoint registered: {media_base_url}")
         if args.show_pairing_code:
             print(
                 f"HM Hermes pairing code:\n"
@@ -599,8 +761,10 @@ def main(argv: list[str] | None = None) -> int:
     install_runner(home)
     install_gateway_api_extension(home)
     ensure_dependencies(home)
-    api_key, api_base_url = configure_api_server(
-        home, port=args.api_port, admin_origins=origins
+    api_key, api_base_url, media_base_url = configure_api_server(
+        home, port=args.api_port, admin_origins=origins,
+        worker_id=worker_id, worker_token=worker_token, backend=backend,
+        media_base_url=args.media_base_url,
     )
     ensure_gateway(hermes)
     call([hermes, "gateway", "restart"])
@@ -608,7 +772,9 @@ def main(argv: list[str] | None = None) -> int:
     stopped = stop_legacy_watchers(home)
     if not api_is_ready(api_base_url, api_key):
         raise RuntimeError(f"Hermes local API did not become ready at {api_base_url}")
+    register_media_endpoint(backend, worker_token, worker_id, media_base_url)
     print(f"Hermes local API ready: {api_base_url}")
+    print(f"HM backend media endpoint registered: {media_base_url}")
     print("On-demand mode enabled; no continuous HM capture Worker is running.")
     if stopped:
         print(f"Stopped {stopped} legacy continuous Worker process(es).")

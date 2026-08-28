@@ -6,6 +6,32 @@ Use this reference when changing the Worker/backend protocol or diagnosing a rej
 
 Send `X-HM-Worker-Token` on every internal request. Send `X-HM-Worker-Id` on the per-video endpoint. The token is environment-only and must never be logged.
 
+## Worker Media Registration
+
+Before claiming work, register the customer computer's backend-reachable media
+address:
+
+```http
+POST /api/internal/capture/workers/register
+Content-Type: application/json
+X-HM-Worker-Token: <secret>
+
+{"workerId":"hermes-worker-01","mediaBaseUrl":"http://192.168.1.20:8642"}
+```
+
+The backend accepts only explicit-port HTTP URLs whose host is a private IPv4
+or `127.0.0.1`. It stores no Hermes API key. Both sides independently derive a
+Worker-specific HMAC media token from `HM_WORKER_TOKEN` and `workerId`. Hermes
+accepts that token only on GET/DELETE `/api/hm-capture/video`; every other
+Gateway route continues to require `API_SERVER_KEY`.
+
+Authenticated HM operators request
+`GET /api/capture/videos/{videoNo}/preview`; HM checks ownership, resolves the
+task's `hermes_worker_id`, and streams the file from that registered Worker.
+After an operator has saved a rejection, HM calls
+`DELETE /api/capture/videos/{videoNo}/local-file` and forwards the deletion to
+the same Worker. A Worker 404 is treated as idempotent deletion success.
+
 ## Claim
 
 ```http

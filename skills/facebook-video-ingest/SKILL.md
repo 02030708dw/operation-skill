@@ -1,6 +1,6 @@
 ---
 name: facebook-video-ingest
-description: Run customer-side, on-demand Hermes Workers for backend-managed Facebook capture executions, filter videos over 20 minutes before download, hold downloaded videos for operator review, upload only approved files to Cloudflare R2, and report results to HM. Use when Hermes must install its loopback API, pair with the HM admin browser, create or run local Cron jobs, execute a targeted HM ingest job, or troubleshoot the local video pipeline while HM runs on another server.
+description: Run customer-side, on-demand Hermes Workers for backend-managed Facebook capture executions, filter videos over 20 minutes before download, hold downloaded videos for operator review, expose a restricted backend-proxied review stream, upload only approved files to Cloudflare R2, and report results to HM. Use when Hermes must install its local API, pair with the HM admin browser, create or run local Cron jobs, execute a targeted HM ingest job, or troubleshoot the local video pipeline while HM runs on another server.
 ---
 
 # Facebook Video Ingest
@@ -10,12 +10,16 @@ Run the HM review-gated pipeline as one idempotent Worker: backend execution cla
 ## Boundaries
 
 - Treat HM as the task schedule and execution source. The production backend queues work but never calls a server-local Hermes CLI.
-- Keep the Hermes Gateway and its authenticated loopback API on the customer computer. Do not expose port 8642 beyond `127.0.0.1`.
+- Keep browser pairing on `127.0.0.1`. The installer may bind Hermes Gateway to
+  `0.0.0.0:8642` only to let the HM backend reach the exact GET/DELETE
+  `/api/hm-capture/video` routes through a dedicated derived media token. Use
+  this only on a trusted LAN/VPN and restrict the host firewall to the HM
+  backend. All other Hermes routes still require `API_SERVER_KEY`.
 - Create the capture Worker only when a local Cron fires. Do not keep a continuous HM polling Worker running in the normal production mode.
 - Download only public content or content the user is authorized to save. Never bypass privacy, login, DRM, payment, or rate-limit controls.
 - Read Worker and R2 secrets only from environment variables. Never print them or place them in command arguments.
 - Retain local files while review or upload can still be retried. Delete a rejected
-  file through the authenticated loopback API after the rejection is saved.
+  file through the authenticated backend-to-Worker media proxy after the rejection is saved.
   Delete an approved file only after R2 reports `UPLOADED` or
   `SKIPPED_EXISTING` and HM accepts the upload callback. Keep the file on
   conflict, upload failure, or callback failure.
@@ -45,6 +49,7 @@ Optional values:
 HM_WORKER_POLL_SECONDS=15
 HM_WORKER_HEARTBEAT_SECONDS=30
 HM_INGEST_STATE_DIR=<durable local state directory>
+HM_CAPTURE_MEDIA_BASE_URL=http://<customer-private-ip>:8642
 CLOUDFLARE_R2_PUBLIC_BASE_URL=https://media.example.com
 ```
 
@@ -124,10 +129,15 @@ python "<skill-dir>/scripts/install_hermes_worker.py"
 ```
 
 The installer is idempotent. It installs dependencies and the deterministic
-runner, configures the authenticated Hermes API at `127.0.0.1:8642`, restricts
-CORS to the configured HM admin origins, starts or restarts Hermes Gateway, and
-prints an `HMHERMES1.` pairing code. Paste that code into the HM admin browser;
-the API key stays in that browser's local storage and is never sent to HM.
+runner, keeps browser pairing at `127.0.0.1:8642`, binds the authenticated
+Gateway to the local network, derives a Worker-specific media token from
+`HM_WORKER_TOKEN`, and registers `HM_CAPTURE_MEDIA_BASE_URL` with HM. It
+auto-detects the private IPv4; when a computer has multiple network adapters,
+pass `--media-base-url http://<private-ip>:8642`. It restricts CORS to the
+configured HM admin origins, starts or restarts Hermes Gateway, and prints an
+`HMHERMES1.` pairing code. The full API key stays only in that browser's local
+storage and is never sent to HM; the backend can use only the restricted media
+token it derives independently.
 
 The installer removes the old `HM 后台任务接收 Worker`, `HM 视频抓取 Worker`,
 and stale `HM 立即抓取 C-*` jobs, and stops the old continuous `--watch`
@@ -151,6 +161,8 @@ completion.
 ## Execution Rules
 
 1. Run `--check` before first execution. Fix missing scripts, `yt-dlp`, Node `ws`, `boto3`, Chrome, backend settings, or R2 settings before claiming work.
+   The check also refreshes the Worker media-address registration without
+   printing either Worker or media credentials.
 2. Claim only through the HM internal Worker API. For a scheduled local Cron, include its backend task number. For immediate execution, include both the backend task and execution numbers. Never invent an execution ID, source URL, or result.
 3. Use the globally unique account name supplied by HM as the local source name. Use the backend-provided `r2Prefix` unchanged; it has the form `PH/Sports/yyyyMM/dd` and is derived from the task region, category, and execution date.
 4. Record downloaded files as `PENDING_REVIEW`. Never upload a newly captured file before an operator approves it. Upload only jobs claimed from `/api/internal/capture/uploads/claim`.

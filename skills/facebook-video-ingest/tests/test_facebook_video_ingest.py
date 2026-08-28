@@ -136,6 +136,8 @@ class PipelineTests(unittest.TestCase):
             '("DELETE", "/api/hm-capture/video", self._handle_delete_hm_capture_video)',
             patched,
         )
+        self.assertIn("_check_hm_capture_media_auth", patched)
+        self.assertIn('os.getenv("HM_CAPTURE_MEDIA_TOKEN"', patched)
 
     def test_gateway_extension_deletes_only_allowed_video_path(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -407,7 +409,7 @@ class PipelineTests(unittest.TestCase):
             ],
         )
 
-    def test_installer_configures_loopback_api_without_overwriting_other_env(self):
+    def test_installer_configures_lan_media_and_keeps_loopback_pairing(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
             env_file = home / ".env"
@@ -415,18 +417,31 @@ class PipelineTests(unittest.TestCase):
                 "HM_WORKER_TOKEN=keep-secret\nAPI_SERVER_KEY=existing-long-key\n",
                 encoding="utf-8",
             )
-            key, url = INSTALLER.configure_api_server(
+            key, url, media_url = INSTALLER.configure_api_server(
                 home,
                 port=8642,
                 admin_origins=["https://admin.example.com/"],
+                worker_id="worker-01",
+                worker_token="keep-secret",
+                backend="http://192.168.1.10:6200",
+                media_base_url="http://192.168.1.20:8642",
             )
 
             values = INSTALLER.parse_env_file(env_file)
             self.assertEqual(key, "existing-long-key")
             self.assertEqual(url, "http://127.0.0.1:8642")
+            self.assertEqual(media_url, "http://192.168.1.20:8642")
             self.assertEqual(values["HM_WORKER_TOKEN"], "keep-secret")
-            self.assertEqual(values["API_SERVER_HOST"], "127.0.0.1")
+            self.assertEqual(values["API_SERVER_HOST"], "0.0.0.0")
             self.assertEqual(values["API_SERVER_PORT"], "8642")
+            self.assertEqual(
+                values["HM_CAPTURE_MEDIA_TOKEN"],
+                INSTALLER.derive_media_token("keep-secret", "worker-01"),
+            )
+            self.assertEqual(
+                values["HM_CAPTURE_MEDIA_BASE_URL"],
+                "http://192.168.1.20:8642",
+            )
             self.assertEqual(values["HERMES_ACCEPT_HOOKS"], "1")
             self.assertEqual(
                 values["API_SERVER_CORS_ORIGINS"],
@@ -450,12 +465,24 @@ class PipelineTests(unittest.TestCase):
                     "https://hermes.mvkbmb.online",
                     "https://customer.example.com/",
                 ],
+                worker_id="worker-01",
+                worker_token="keep-secret",
+                backend="http://192.168.1.10:6200",
+                media_base_url="http://192.168.1.20:8642",
             )
 
             values = INSTALLER.parse_env_file(env_file)
             self.assertEqual(
                 values["API_SERVER_CORS_ORIGINS"],
                 "https://hermes.mvkbmb.online,https://customer.example.com",
+            )
+
+    def test_installer_rejects_public_media_address(self):
+        with self.assertRaises(ValueError):
+            INSTALLER.normalize_media_base_url(
+                "http://8.8.8.8:8642",
+                backend="https://backend.example.com",
+                port=8642,
             )
 
     def test_installer_pairing_code_contains_only_local_api_configuration(self):

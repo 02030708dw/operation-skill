@@ -82,6 +82,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backend", default=os.getenv("HM_BACKEND_URL", ""))
     parser.add_argument("--worker-id", default=os.getenv("HM_WORKER_ID", ""))
     parser.add_argument(
+        "--media-base-url",
+        default=os.getenv("HM_CAPTURE_MEDIA_BASE_URL", ""),
+        help="private Hermes media base URL registered for cross-computer review",
+    )
+    parser.add_argument(
         "--task-no",
         default=os.getenv("HM_CAPTURE_TASK_NO", ""),
         help="claim only the queued execution for this HM task number",
@@ -241,6 +246,21 @@ def claim(
         "POST",
         "/api/internal/capture/executions/claim",
         payload,
+    )
+
+
+def register_media_endpoint(
+    backend: str, token: str, worker_id: str, media_base_url: str
+) -> None:
+    normalized = media_base_url.strip().rstrip("/")
+    if not normalized:
+        return
+    api_call(
+        backend,
+        token,
+        "POST",
+        "/api/internal/capture/workers/register",
+        {"workerId": worker_id, "mediaBaseUrl": normalized},
     )
 
 
@@ -605,6 +625,7 @@ def check(args: argparse.Namespace) -> int:
         "backendConfigured": bool(args.backend),
         "workerIdConfigured": bool(args.worker_id),
         "workerTokenConfigured": bool(args.worker_token),
+        "mediaBaseUrlConfigured": bool(args.media_base_url),
         "downloadScript": str(DOWNLOAD_SCRIPT),
         "downloadScriptExists": DOWNLOAD_SCRIPT.is_file(),
         "r2Script": str(R2_SCRIPT),
@@ -623,6 +644,7 @@ def check(args: argparse.Namespace) -> int:
             "backendConfigured",
             "workerIdConfigured",
             "workerTokenConfigured",
+            "mediaBaseUrlConfigured",
             "downloadScriptExists",
             "r2ScriptExists",
             "r2BucketConfigured",
@@ -642,6 +664,14 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         raise PipelineError("HM_WORKER_ID is missing")
     if not token:
         raise PipelineError("HM_WORKER_TOKEN is missing")
+    try:
+        register_media_endpoint(
+            backend, token, worker_id, args.media_base_url
+        )
+    except BackendError as exc:
+        # A rolling backend deployment must not prevent capture or approved
+        # upload processing. The next invocation refreshes registration again.
+        print(f"Media endpoint registration warning: {exc}", file=sys.stderr)
     if args.upload_only:
         uploads = drain_upload_jobs(args, backend, token, worker_id, args.task_no)
         return 0, {
