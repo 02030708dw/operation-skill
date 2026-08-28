@@ -125,7 +125,7 @@ def obsolete_job_names(list_output: str) -> list[str]:
             continue
         name = trimmed[len("Name:") :].strip()
         if name in {LEGACY_JOB_NAME, WORKER_JOB_NAME} or name.startswith(
-            "HM 立即抓取 C-"
+            ("HM 立即抓取 C-", "HM 审核上传 C-")
         ):
             names.append(name)
     return names
@@ -158,15 +158,17 @@ def _replace_once(source: str, old: str, new: str, label: str) -> str:
 def patch_gateway_api_source(source: str) -> str:
     """Add standard no-agent fields plus the restricted HM runner hook."""
     marker = "prepare_capture_job_body(await request.json())"
-    if marker in source:
+    media_marker = "resolve_capture_video_path(request.query.get(\"path\"))"
+    delete_media_marker = "delete_capture_video_path(request.query.get(\"path\"))"
+    if marker in source and media_marker in source and delete_media_marker in source:
         return source
-
-    create_start = source.find("    async def _handle_create_job(")
-    create_end = source.find("    async def _handle_get_job(", create_start)
-    if create_start < 0 or create_end < 0:
-        raise RuntimeError("Hermes Gateway create-job handler was not found")
-    create_block = source[create_start:create_end]
-    create_block = _replace_once(
+    if marker not in source:
+        create_start = source.find("    async def _handle_create_job(")
+        create_end = source.find("    async def _handle_get_job(", create_start)
+        if create_start < 0 or create_end < 0:
+            raise RuntimeError("Hermes Gateway create-job handler was not found")
+        create_block = source[create_start:create_end]
+        create_block = _replace_once(
         create_block,
         "            body = await request.json()\n"
         "            name = (body.get(\"name\") or \"\").strip()\n",
@@ -177,7 +179,7 @@ def patch_gateway_api_source(source: str) -> str:
         "            name = (body.get(\"name\") or \"\").strip()\n",
         "prepare create body",
     )
-    create_block = _replace_once(
+        create_block = _replace_once(
         create_block,
         "            skills = body.get(\"skills\")\n"
         "            repeat = body.get(\"repeat\")\n",
@@ -187,7 +189,7 @@ def patch_gateway_api_source(source: str) -> str:
         "            no_agent = bool(body.get(\"no_agent\"))\n",
         "read script fields",
     )
-    create_block = _replace_once(
+        create_block = _replace_once(
         create_block,
         "            if skills:\n"
         "                kwargs[\"skills\"] = skills\n"
@@ -205,14 +207,14 @@ def patch_gateway_api_source(source: str) -> str:
         "            if repeat is not None:\n",
         "forward script fields",
     )
-    source = source[:create_start] + create_block + source[create_end:]
+        source = source[:create_start] + create_block + source[create_end:]
 
-    delete_start = source.find("    async def _handle_delete_job(")
-    delete_end = source.find("    async def _handle_pause_job(", delete_start)
-    if delete_start < 0 or delete_end < 0:
-        raise RuntimeError("Hermes Gateway delete-job handler was not found")
-    delete_block = source[delete_start:delete_end]
-    delete_block = _replace_once(
+        delete_start = source.find("    async def _handle_delete_job(")
+        delete_end = source.find("    async def _handle_pause_job(", delete_start)
+        if delete_start < 0 or delete_end < 0:
+            raise RuntimeError("Hermes Gateway delete-job handler was not found")
+        delete_block = source[delete_start:delete_end]
+        delete_block = _replace_once(
         delete_block,
         "        try:\n"
         "            success = _cron_remove(job_id)\n"
@@ -238,7 +240,54 @@ def patch_gateway_api_source(source: str) -> str:
         "            return web.json_response({\"ok\": True})\n",
         "cleanup deleted runner",
     )
-    source = source[:delete_start] + delete_block + source[delete_end:]
+        source = source[:delete_start] + delete_block + source[delete_end:]
+
+    if media_marker not in source:
+        source = _replace_once(
+            source,
+            '            ("GET", "/api/jobs", self._handle_list_jobs),\n',
+            '            ("GET", "/api/jobs", self._handle_list_jobs),\n'
+            '            ("GET", "/api/hm-capture/video", self._handle_hm_capture_video),\n',
+            "register HM capture video route",
+        )
+        handler_at = source.find("    async def _handle_list_jobs(")
+        if handler_at < 0:
+            raise RuntimeError("Hermes Gateway job handler was not found")
+        handler = (
+            "    async def _handle_hm_capture_video(self, request: \"web.Request\") -> \"web.Response\":\n"
+            "        from gateway.platforms.hm_capture_extension import resolve_capture_video_path\n"
+            "        try:\n"
+            "            path = resolve_capture_video_path(request.query.get(\"path\"))\n"
+            "            return web.FileResponse(path)\n"
+            "        except FileNotFoundError:\n"
+            "            return web.json_response({\"error\": \"Video not found\"}, status=404)\n"
+            "        except (PermissionError, ValueError):\n"
+            "            return web.json_response({\"error\": \"Video path is not allowed\"}, status=403)\n\n"
+        )
+        source = source[:handler_at] + handler + source[handler_at:]
+    if delete_media_marker not in source:
+        source = _replace_once(
+            source,
+            '            ("GET", "/api/hm-capture/video", self._handle_hm_capture_video),\n',
+            '            ("GET", "/api/hm-capture/video", self._handle_hm_capture_video),\n'
+            '            ("DELETE", "/api/hm-capture/video", self._handle_delete_hm_capture_video),\n',
+            "register HM capture video delete route",
+        )
+        handler_at = source.find("    async def _handle_hm_capture_video(")
+        if handler_at < 0:
+            raise RuntimeError("Hermes Gateway capture video handler was not found")
+        handler = (
+            "    async def _handle_delete_hm_capture_video(self, request: \"web.Request\") -> \"web.Response\":\n"
+            "        from gateway.platforms.hm_capture_extension import delete_capture_video_path\n"
+            "        try:\n"
+            "            path = delete_capture_video_path(request.query.get(\"path\"))\n"
+            "            return web.json_response({\"ok\": True, \"deleted\": path.name})\n"
+            "        except FileNotFoundError:\n"
+            "            return web.json_response({\"error\": \"Video not found\"}, status=404)\n"
+            "        except (PermissionError, ValueError):\n"
+            "            return web.json_response({\"error\": \"Video path is not allowed\"}, status=403)\n\n"
+        )
+        source = source[:handler_at] + handler + source[handler_at:]
     return source
 
 

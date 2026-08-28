@@ -19,6 +19,10 @@ EXECUTION_RUNNER_PATTERN = re.compile(
     r"^hm_capture_(C-[A-Za-z0-9-]+)_(E-[A-Za-z0-9-]+)$",
     re.IGNORECASE,
 )
+UPLOAD_RUNNER_PATTERN = re.compile(
+    r"^hm_capture_upload_(C-[A-Za-z0-9-]+)_(V-[A-Za-z0-9-]+)$",
+    re.IGNORECASE,
+)
 
 
 def hermes_home() -> Path:
@@ -85,6 +89,9 @@ def acquire_worker_lock(path: Path) -> IO[str] | None:
 
 
 def task_no_from_runner(path: Path) -> str | None:
+    upload_match = UPLOAD_RUNNER_PATTERN.fullmatch(path.stem)
+    if upload_match:
+        return upload_match.group(1).upper()
     match = EXECUTION_RUNNER_PATTERN.fullmatch(path.stem)
     if match:
         return match.group(1).upper()
@@ -100,6 +107,11 @@ def execution_no_from_runner(path: Path) -> str | None:
 def worker_command(worker: Path, runner: Path) -> list[str]:
     task_no = task_no_from_runner(runner)
     execution_no = execution_no_from_runner(runner)
+    if UPLOAD_RUNNER_PATTERN.fullmatch(runner.stem):
+        return [
+            sys.executable, str(worker), "--execute", "--upload-only",
+            "--task-no", str(task_no), "--json",
+        ]
     if not task_no and not execution_no:
         return [sys.executable, str(worker), "--watch"]
     command = [sys.executable, str(worker), "--execute"]

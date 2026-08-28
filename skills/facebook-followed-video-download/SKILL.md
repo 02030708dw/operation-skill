@@ -87,6 +87,8 @@ Map the user's words to arguments:
 
 `--initial-count` applies independently to every configured source and defines the recent-video fallback window (`--count` remains a compatibility alias). Never silently replace the user's number with a fixed value. The first execution selects that recent window. Later executions select every newest-first URL before the first archived video: two updates means two selected and 30 updates means all 30 selected. When there are no updates, the Skill selects the 10 most recent discovered videos instead.
 
+Use `--max-duration-seconds 1200` for HM ingestion. The downloader asks yt-dlp for duration metadata before downloading and records longer videos as `filtered-duration`; it must not download those files.
+
 ## Common Operations
 
 ### Check Readiness

@@ -95,6 +95,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--scroll-rounds", type=non_negative_int, default=None)
     parser.add_argument("--wait-ms", type=positive_int, default=1400)
+    parser.add_argument(
+        "--max-duration-seconds",
+        type=non_negative_int,
+        default=0,
+        help="skip videos longer than this before download; 0 disables the filter",
+    )
     parser.add_argument("--accounts", type=Path, default=DEFAULT_ACCOUNTS)
     parser.add_argument(
         "--source",
@@ -392,6 +398,8 @@ def _run_download_with_accounts(args: argparse.Namespace, accounts: Path) -> int
         str(args.wait_ms),
         "--first-run-limit",
         str(count),
+        "--max-duration-seconds",
+        str(args.max_duration_seconds),
         "--result-json",
         str(engine_result),
     ]

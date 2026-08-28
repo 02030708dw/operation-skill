@@ -67,12 +67,14 @@ The JSON body supports:
   "platformVideoId": "123456",
   "sourceName": "PH Sports Official",
   "title": "video.mp4",
+  "publishedAt": "2026-08-10T14:30:00",
   "originalUrl": "https://www.facebook.com/reel/123456",
   "canonicalUrl": "https://www.facebook.com/reel/123456",
   "localPath": "/data/facebook/video.mp4",
   "fileName": "video.mp4",
   "fileSize": 12345678,
   "fileSha256": "64-lowercase-hex-characters",
+  "durationSeconds": 95,
   "downloadStatus": "DOWNLOADED",
   "uploadStatus": "UPLOADED",
   "r2Bucket": "media",
@@ -84,9 +86,18 @@ The JSON body supports:
 }
 ```
 
-Accepted download statuses are `DISCOVERED`, `DOWNLOADING`, `DOWNLOADED`, and `DOWNLOAD_FAILED`. Accepted upload statuses are `PENDING`, `UPLOADING`, `UPLOADED`, `SKIPPED_EXISTING`, `R2_CONFLICT`, and `UPLOAD_FAILED`.
+Accepted download statuses are `DISCOVERED`, `DOWNLOADING`, `DOWNLOADED`, and `DOWNLOAD_FAILED`. Accepted upload statuses are `PENDING`, `UPLOADING`, `UPLOADED`, `SKIPPED_EXISTING`, `R2_CONFLICT`, and `UPLOAD_FAILED`. Initial capture callbacks always use `PENDING`; Cloudflare upload is forbidden until the operator approves the video.
 
 The backend deduplicates videos by `(task_id, SHA-256(canonicalUrl))`. A second callback updates the same record, which is how the upload result enriches the earlier download record.
+
+## Approved Upload Jobs
+
+Claim an operator-approved upload with `POST /api/internal/capture/uploads/claim` and `{ "workerId": "...", "taskNo": "C-..." }`. The response includes the verified local path, SHA-256, category, and `r2Prefix`. Upload only that one file, then call `POST /api/internal/capture/uploads/{jobNo}/complete` with `status` set to `UPLOADED`, `SKIPPED_EXISTING`, `R2_CONFLICT`, or `UPLOAD_FAILED` plus the R2 fields. This is the only path that may publish a captured file to Cloudflare.
+
+Keep the local file until the complete callback returns successfully. After an
+accepted `UPLOADED` or `SKIPPED_EXISTING` callback, delete that job's exact
+local file. Retain it for callback failure, `R2_CONFLICT`, or `UPLOAD_FAILED`
+so the job can be inspected or retried.
 
 ## Complete
 

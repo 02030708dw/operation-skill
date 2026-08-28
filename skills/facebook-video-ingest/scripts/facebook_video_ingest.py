@@ -131,6 +131,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="wait briefly for the targeted backend scheduler to enqueue work",
     )
+    parser.add_argument(
+        "--upload-only",
+        action="store_true",
+        help="skip capture claiming and immediately drain approved upload jobs",
+    )
     parser.add_argument("--json", action="store_true")
     return parser
 
@@ -239,6 +244,42 @@ def claim(
     )
 
 
+def claim_upload(
+    backend: str, token: str, worker_id: str, task_no: str = ""
+) -> dict[str, Any] | None:
+    payload = {"workerId": worker_id}
+    if task_no.strip():
+        payload["taskNo"] = task_no.strip().upper()
+    return api_call(
+        backend, token, "POST", "/api/internal/capture/uploads/claim", payload
+    )
+
+
+def complete_upload(
+    backend: str,
+    token: str,
+    worker_id: str,
+    job_no: str,
+    video: dict[str, Any],
+) -> None:
+    upload_status = normalized_upload_status(video.get("status"))
+    api_call(
+        backend,
+        token,
+        "POST",
+        f"/api/internal/capture/uploads/{job_no}/complete",
+        {
+            "workerId": worker_id,
+            "status": upload_status,
+            "r2Bucket": video.get("r2Bucket"),
+            "r2ObjectKey": video.get("r2ObjectKey"),
+            "r2Url": video.get("r2Url"),
+            "errorCode": status_error_code("DOWNLOADED", upload_status),
+            "errorMessage": video.get("error"),
+        },
+    )
+
+
 def heartbeat(backend: str, token: str, worker_id: str, execution_id: str, progress: int) -> None:
     api_call(
         backend,
@@ -326,6 +367,8 @@ def record_video(
         "fileName": video.get("fileName"),
         "fileSize": video.get("fileSize"),
         "fileSha256": video.get("sha256"),
+        "durationSeconds": video.get("durationSeconds"),
+        "publishedAt": video.get("publishedAt"),
         "downloadStatus": download_status,
         "uploadStatus": upload_status,
         "r2Bucket": video.get("r2Bucket"),
@@ -460,6 +503,102 @@ def reusable_download_result(path: Path) -> dict[str, Any] | None:
     return payload
 
 
+def cleanup_uploaded_local_file(
+    job: dict[str, Any], upload_video: dict[str, Any]
+) -> dict[str, Any]:
+    """Delete the exact source file only after a verified successful upload."""
+    upload_status = normalized_upload_status(str(upload_video.get("status") or ""))
+    if upload_status not in {"UPLOADED", "SKIPPED_EXISTING"}:
+        return {"status": "retained", "reason": "upload-not-successful"}
+    local_value = job.get("localPath")
+    if not local_value:
+        return {"status": "already-missing"}
+    local_path = Path(str(local_value)).expanduser().resolve()
+    if local_path.suffix.lower() not in {".mp4", ".mov", ".m4v", ".webm", ".mkv"}:
+        return {"status": "failed", "error": "local path is not a supported video"}
+    try:
+        local_path.unlink()
+        return {"status": "deleted", "fileName": local_path.name}
+    except FileNotFoundError:
+        return {"status": "already-missing", "fileName": local_path.name}
+    except OSError as exc:
+        return {"status": "failed", "fileName": local_path.name, "error": str(exc)}
+
+
+def process_upload_job(
+    args: argparse.Namespace,
+    backend: str,
+    token: str,
+    worker_id: str,
+    job: dict[str, Any],
+) -> dict[str, Any]:
+    job_no = state_segment(job.get("jobNo"))
+    upload_dir = args.state_dir.expanduser().resolve() / "approved-uploads" / job_no
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    source_manifest = upload_dir / "source.json"
+    result_manifest = upload_dir / "result.json"
+    source_manifest.write_text(
+        json.dumps(
+            {
+                "schemaVersion": "1.0",
+                "videos": [{
+                    "status": "downloaded",
+                    "source": job.get("sourceName"),
+                    "title": job.get("title"),
+                    "originalUrl": job.get("originalUrl"),
+                    "canonicalUrl": job.get("canonicalUrl"),
+                    "localPath": job.get("localPath"),
+                    "fileName": job.get("fileName"),
+                    "fileSize": job.get("fileSize"),
+                    "sha256": job.get("fileSha256"),
+                }],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ) + "\n",
+        encoding="utf-8",
+    )
+    command = [
+        sys.executable, str(R2_SCRIPT), "--manifest", str(source_manifest),
+        "--prefix", job_r2_prefix(job), "--flatten", "--execute",
+        "--execution-id", job_no, "--result-json", str(result_manifest),
+    ]
+    exit_code, output = run_command(command)
+    if not result_manifest.is_file():
+        raise PipelineError("R2 skill did not write the approved-video result manifest")
+    result = json.loads(result_manifest.read_text(encoding="utf-8"))
+    videos = result.get("videos", [])
+    if not videos:
+        raise PipelineError("R2 skill returned no approved-video result")
+    complete_upload(backend, token, worker_id, str(job["jobNo"]), videos[0])
+    result["localCleanup"] = cleanup_uploaded_local_file(job, videos[0])
+    if result["localCleanup"]["status"] == "failed":
+        print(
+            f"Local video cleanup warning: {result['localCleanup']['error']}",
+            file=sys.stderr,
+            flush=True,
+        )
+    result["exitCode"] = exit_code
+    result["output"] = output[-20_000:]
+    return result
+
+
+def drain_upload_jobs(
+    args: argparse.Namespace,
+    backend: str,
+    token: str,
+    worker_id: str,
+    task_no: str = "",
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    while True:
+        job = claim_upload(backend, token, worker_id, task_no)
+        if job is None:
+            break
+        results.append(process_upload_job(args, backend, token, worker_id, job))
+    return results
+
+
 def check(args: argparse.Namespace) -> int:
     checks = {
         "skill": SKILL_NAME,
@@ -503,6 +642,15 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         raise PipelineError("HM_WORKER_ID is missing")
     if not token:
         raise PipelineError("HM_WORKER_TOKEN is missing")
+    if args.upload_only:
+        uploads = drain_upload_jobs(args, backend, token, worker_id, args.task_no)
+        return 0, {
+            "schemaVersion": "1.0",
+            "skill": SKILL_NAME,
+            "status": "uploads-completed" if uploads else "no-work",
+            "taskNo": args.task_no.strip().upper() or None,
+            "uploads": uploads,
+        }
     deadline = time.monotonic() + args.wait_for_work_seconds
     while True:
         job = claim(backend, token, worker_id, args.task_no, args.execution_no)
@@ -511,6 +659,14 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         remaining = deadline - time.monotonic()
         threading.Event().wait(min(args.poll_seconds, max(0, remaining)))
     if job is None:
+        uploads = drain_upload_jobs(args, backend, token, worker_id, args.task_no)
+        if uploads:
+            return 0, {
+                "schemaVersion": "1.0",
+                "skill": SKILL_NAME,
+                "status": "uploads-completed",
+                "uploads": uploads,
+            }
         result = {
             "schemaVersion": "1.0",
             "skill": SKILL_NAME,
@@ -527,7 +683,6 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         return 0, result
 
     execution_id = str(job["executionId"])
-    r2_prefix = job_r2_prefix(job, args.r2_prefix)
     raw_parts: list[str] = []
     heartbeat_pump = HeartbeatPump(
         backend,
@@ -545,7 +700,6 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         )
         execution_dir.mkdir(parents=True, exist_ok=True)
         download_manifest = execution_dir / "download.json"
-        upload_manifest = execution_dir / "upload.json"
         download_result = reusable_download_result(download_manifest)
         if download_result is None:
             download_command = [
@@ -558,6 +712,8 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 "daily",
                 "--initial-count",
                 str(args.count),
+                "--max-duration-seconds",
+                "1200",
                 "--execute",
                 "--execution-id",
                 execution_id,
@@ -574,7 +730,10 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         else:
             download_exit = int(download_result.get("exitCode") or 0)
             raw_parts.append(f"Reused durable download manifest: {download_manifest}\n")
-        videos = manifest_videos(download_result)
+        videos = [
+            video for video in manifest_videos(download_result)
+            if video.get("status") != "filtered-duration"
+        ]
         for video in videos:
             record_video(
                 backend,
@@ -588,49 +747,6 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 upload_status="PENDING",
             )
 
-        heartbeat_pump.update(55)
-        heartbeat(backend, token, worker_id, execution_id, 55)
-        downloaded = [video for video in videos if video.get("status") == "downloaded"]
-        if downloaded:
-            upload_command = [
-                sys.executable,
-                str(R2_SCRIPT),
-                "--manifest",
-                str(download_manifest),
-                "--prefix",
-                r2_prefix,
-                "--flatten",
-                "--execute",
-                "--execution-id",
-                execution_id,
-                "--result-json",
-                str(upload_manifest),
-            ]
-            upload_exit, upload_output = run_command(upload_command)
-            raw_parts.append(upload_output)
-            if not upload_manifest.is_file():
-                raise PipelineError("R2 skill did not write its result manifest")
-            upload_result = json.loads(upload_manifest.read_text(encoding="utf-8"))
-            for video in upload_result.get("videos", []):
-                record_video(
-                    backend,
-                    token,
-                    worker_id,
-                    execution_id,
-                    video,
-                    download_status="DOWNLOADED",
-                    upload_status=normalized_upload_status(video.get("status")),
-                )
-        else:
-            upload_exit = 0
-            upload_result = {
-                "schemaVersion": "1.0",
-                "skill": "cloudflare-r2-video-upload",
-                "status": "completed",
-                "summary": {},
-                "videos": [],
-            }
-
         heartbeat_pump.update(90)
         heartbeat(backend, token, worker_id, execution_id, 90)
         combined = {
@@ -640,19 +756,19 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             "accountName": job.get("accountName") or job.get("sourceName"),
             "region": job.get("region"),
             "category": job.get("category"),
-            "r2Prefix": r2_prefix,
             "download": download_result,
-            "upload": upload_result,
+            "review": {
+                "status": "PENDING_REVIEW",
+                "downloaded": sum(video.get("status") == "downloaded" for video in videos),
+                "filteredOver20Minutes": sum(
+                    video.get("status") == "filtered-duration"
+                    for video in manifest_videos(download_result)
+                ),
+            },
         }
-        successes = sum(
-            video.get("status") in {"uploaded", "skipped-existing"}
-            for video in upload_result.get("videos", [])
-        )
-        failures = sum(video.get("status") != "downloaded" for video in videos) + sum(
-            video.get("status") in {"failed", "conflict"}
-            for video in upload_result.get("videos", [])
-        )
-        if failures == 0 and download_exit == 0 and upload_exit == 0:
+        successes = sum(video.get("status") == "downloaded" for video in videos)
+        failures = sum(video.get("status") != "downloaded" for video in videos)
+        if failures == 0 and download_exit == 0:
             terminal_status = "COMPLETED"
         elif successes:
             terminal_status = "PARTIAL"
@@ -674,8 +790,17 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             combined,
             "".join(raw_parts),
             None if terminal_status == "COMPLETED" else "PIPELINE_PARTIAL_OR_FAILED",
-            None if terminal_status == "COMPLETED" else "One or more download or upload items failed",
+            None if terminal_status == "COMPLETED" else "One or more download items failed",
         )
+        try:
+            combined["approvedUploads"] = drain_upload_jobs(
+                args, backend, token, worker_id, str(job.get("taskId") or args.task_no)
+            )
+        except Exception as upload_error:
+            # The capture execution is already durably completed. Leave a
+            # callback failure for the upload-job lease to retry without
+            # incorrectly re-running or downgrading the capture itself.
+            combined["approvedUploadError"] = str(upload_error)
         # PARTIAL is a completed orchestration with item-level failures already
         # recorded in HM. Keep Hermes cron healthy and reserve a non-zero exit
         # code for a Worker/pipeline execution that failed as a whole.

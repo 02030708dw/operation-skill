@@ -22,9 +22,10 @@ TASK_PATTERN = re.compile(r"^C-[A-Za-z0-9-]+$")
 EXECUTION_PATTERN = re.compile(r"^E-[A-Za-z0-9-]+$")
 SCHEDULE_KEY_PATTERN = re.compile(r"^\d{4}$")
 MANAGED_RUNNER_PATTERN = re.compile(
-    r"^hm_capture_C-[A-Za-z0-9-]+_(?:E-[A-Za-z0-9-]+|\d{4})\.py$",
+    r"^(?:hm_capture_C-[A-Za-z0-9-]+_(?:E-[A-Za-z0-9-]+|\d{4})|hm_capture_upload_C-[A-Za-z0-9-]+_V-[A-Za-z0-9-]+)\.py$",
     re.IGNORECASE,
 )
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
 
 
 def _hermes_home() -> Path:
@@ -49,19 +50,26 @@ def _materialize_runner(spec: dict[str, Any], home: Path) -> str:
     task_no = _normalized(spec.get("taskNo"), TASK_PATTERN, "task number")
     execution_value = str(spec.get("executionNo") or "").strip()
     schedule_value = str(spec.get("scheduleKey") or "").strip()
-    if bool(execution_value) == bool(schedule_value):
+    upload_value = str(spec.get("uploadVideoNo") or "").strip()
+    if sum(bool(value) for value in (execution_value, schedule_value, upload_value)) != 1:
         raise ValueError(
-            "HM capture runner requires exactly one executionNo or scheduleKey"
+            "HM capture runner requires exactly one executionNo, scheduleKey, or uploadVideoNo"
         )
     suffix = (
         _normalized(execution_value, EXECUTION_PATTERN, "execution number")
         if execution_value
         else _normalized(schedule_value, SCHEDULE_KEY_PATTERN, "schedule key")
+        if schedule_value
+        else _normalized(upload_value, re.compile(r"^V-[A-Za-z0-9-]+$"), "video number")
     )
 
     scripts_dir = (home / "scripts").resolve()
     source = (scripts_dir / BASE_RUNNER_NAME).resolve()
-    target = (scripts_dir / f"hm_capture_{task_no}_{suffix}.py").resolve()
+    runner_name = (
+        f"hm_capture_upload_{task_no}_{suffix}.py"
+        if upload_value else f"hm_capture_{task_no}_{suffix}.py"
+    )
+    target = (scripts_dir / runner_name).resolve()
     try:
         source.relative_to(scripts_dir)
         target.relative_to(scripts_dir)
@@ -130,3 +138,30 @@ def cleanup_capture_job_script(
         # Windows may still hold the running script. The completed job cleanup
         # on the next install/sync can safely retry; never fail job deletion.
         pass
+
+
+def resolve_capture_video_path(value: Any, *, home: Path | None = None) -> Path:
+    """Resolve only downloaded video files below configured HM media roots."""
+    candidate = Path(str(value or "")).expanduser().resolve()
+    if candidate.suffix.lower() not in VIDEO_EXTENSIONS or not candidate.is_file():
+        raise FileNotFoundError("HM capture video is missing")
+    hermes_home = (home or _hermes_home()).resolve()
+    roots = [
+        Path(os.getenv("HM_INGEST_STATE_DIR", hermes_home / "facebook-video-ingest" / "executions")),
+        Path(os.getenv("FACEBOOK_FOLLOWED_OUTPUT", Path.home() / "Desktop" / "Facebook")),
+        Path(os.getenv("FB_FOLLOWED_DESKTOP", Path.home() / "Desktop" / "Facebook")),
+    ]
+    for root in roots:
+        try:
+            candidate.relative_to(root.expanduser().resolve())
+            return candidate
+        except ValueError:
+            continue
+    raise PermissionError("HM capture video is outside configured media roots")
+
+
+def delete_capture_video_path(value: Any, *, home: Path | None = None) -> Path:
+    """Delete one explicitly requested video below configured HM media roots."""
+    candidate = resolve_capture_video_path(value, home=home)
+    candidate.unlink()
+    return candidate

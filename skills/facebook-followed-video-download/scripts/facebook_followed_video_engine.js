@@ -67,6 +67,7 @@ const firstRunLimit = Number(argValue(
   '--first-run-limit',
   argValue('--max-downloads', mode === 'full' ? '0' : '10')
 ));
+const maxDurationSeconds = Number(argValue('--max-duration-seconds', '0'));
 const resultJsonPath = argValue('--result-json', '');
 const browserProfileDir = argValue('--browser-profile', '');
 let cdpId = 10;
@@ -490,9 +491,46 @@ function baseVideoResult(account, url) {
     fileName: null,
     fileSize: null,
     sha256: null,
+    durationSeconds: null,
+    publishedAt: null,
     status: 'pending',
     error: null
   };
+}
+
+function ytdlpSessionArgs() {
+  if (cookiesFile && fs.existsSync(cookiesFile)) return ['--cookies', cookiesFile];
+  if (browserProfileDir) return ['--cookies-from-browser', `chrome:${browserProfileDir}`];
+  return [];
+}
+
+function probeVideoMetadata(url) {
+  if (dryRun) return {};
+  const result = spawnSync(ytdlpPath, [
+    ...ytdlpSessionArgs(),
+    '--force-ipv4', '--socket-timeout', '60', '--retries', '2',
+    '--no-warnings', '--no-playlist', '--skip-download',
+    '--dump-single-json', url
+  ], { encoding: 'utf8' });
+  try {
+    const metadata = JSON.parse(String(result.stdout || '').trim());
+    const duration = Number(metadata.duration);
+    const timestamp = Number(metadata.timestamp || metadata.release_timestamp);
+    let publishedAt = null;
+    if (/^\d{8}$/.test(String(metadata.upload_date || ''))) {
+      const value = String(metadata.upload_date);
+      publishedAt = `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}T00:00:00`;
+    } else if (Number.isFinite(timestamp) && timestamp > 0) {
+      publishedAt = new Date(timestamp * 1000).toISOString().slice(0, 19);
+    }
+    return {
+      durationSeconds: Number.isFinite(duration) && duration >= 0 ? Math.round(duration) : null,
+      publishedAt,
+      title: metadata.title || null
+    };
+  } catch {
+    return {};
+  }
 }
 
 function completedVideoResult(item, downloadedPath) {
@@ -512,6 +550,17 @@ function downloadVideo(account, url, outputDir, archivePath) {
     item.status = 'preview';
     return item;
   }
+  const metadata = probeVideoMetadata(url);
+  item.durationSeconds = metadata.durationSeconds ?? null;
+  item.publishedAt = metadata.publishedAt ?? null;
+  item.title = metadata.title ?? null;
+  if (maxDurationSeconds && item.durationSeconds !== null && item.durationSeconds > maxDurationSeconds) {
+    appendArchiveOnce(archivePath, url);
+    item.status = 'filtered-duration';
+    item.error = `duration ${item.durationSeconds}s exceeds ${maxDurationSeconds}s limit`;
+    console.log(`    跳過: 時長 ${item.durationSeconds}s 超過 ${maxDurationSeconds}s`);
+    return item;
+  }
   const cachedPath = findDownloadedFile(outputDir, item.platformVideoId, '');
   if (cachedPath) {
     appendArchiveOnce(archivePath, url);
@@ -519,10 +568,9 @@ function downloadVideo(account, url, outputDir, archivePath) {
     return completedVideoResult(item, cachedPath);
   }
   const args = [];
-  if (cookiesFile && fs.existsSync(cookiesFile)) {
-    args.push('--cookies', cookiesFile);
-  } else if (browserProfileDir) {
-    args.push('--cookies-from-browser', `chrome:${browserProfileDir}`);
+  args.push(...ytdlpSessionArgs());
+  if (maxDurationSeconds) {
+    args.push('--match-filter', `duration <= ${maxDurationSeconds}`);
   }
   args.push(
     '--force-ipv4',
@@ -547,6 +595,13 @@ function downloadVideo(account, url, outputDir, archivePath) {
     return completedVideoResult(item, downloadedPath);
   }
   const errorLine = output.split(/\r?\n/).find(line => line.includes('ERROR')) || output.split(/\r?\n/).slice(-1)[0] || '下載失敗';
+  if (/does not pass filter|duration.*(?:larger|greater|longer)/i.test(output)) {
+    appendArchiveOnce(archivePath, url);
+    item.status = 'filtered-duration';
+    item.error = `video exceeds ${maxDurationSeconds}s duration limit`;
+    console.log(`    跳過: 時長超過 ${maxDurationSeconds}s`);
+    return item;
+  }
   console.log(`    失敗: ${errorLine.slice(0, 220)}`);
   item.status = 'download-failed';
   item.error = errorLine.slice(0, 500);
@@ -636,6 +691,7 @@ async function main() {
         selected: selected.length,
         succeeded: 0,
         failed: discoveryFailed ? 1 : 0,
+        filteredDuration: 0,
         error: discoveryFailed
           ? 'Facebook public page returned no discoverable video links'
           : null,
@@ -645,7 +701,8 @@ async function main() {
         console.log(`  下載: ${videoUrl}`);
         const item = downloadVideo(account, videoUrl, outputDir, archivePath);
         sourceResult.videos.push(item);
-        if (item.status === 'downloaded' || item.status === 'preview') sourceResult.succeeded++;
+        if (item.status === 'filtered-duration') sourceResult.filteredDuration++;
+        else if (item.status === 'downloaded' || item.status === 'preview') sourceResult.succeeded++;
         else sourceResult.failed++;
       }
       if (dryRun) console.log(`  預演: ${selected.length} 個待下載，未寫入檔案`);

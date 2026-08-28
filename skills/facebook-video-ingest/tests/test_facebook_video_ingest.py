@@ -92,6 +92,28 @@ class PipelineTests(unittest.TestCase):
                     home=Path(temporary),
                 )
 
+    def test_gateway_extension_materializes_approved_upload_runner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            scripts = home / "scripts"
+            scripts.mkdir()
+            (scripts / EXTENSION.BASE_RUNNER_NAME).write_text(
+                "# trusted runner\n", encoding="utf-8"
+            )
+            prepared = EXTENSION.prepare_capture_job_body(
+                {
+                    "hm_capture_runner": {
+                        "taskNo": "C-5786859AED6E",
+                        "uploadVideoNo": "V-ABC123",
+                    }
+                },
+                home=home,
+            )
+            self.assertEqual(
+                prepared["script"],
+                "hm_capture_upload_C-5786859AED6E_V-ABC123.py",
+            )
+
     def test_installer_gateway_api_patch_is_idempotent(self):
         api_server = (
             Path.home()
@@ -110,6 +132,33 @@ class PipelineTests(unittest.TestCase):
         self.assertIn(
             "prepare_capture_job_body(await request.json())", patched
         )
+        self.assertIn(
+            '("DELETE", "/api/hm-capture/video", self._handle_delete_hm_capture_video)',
+            patched,
+        )
+
+    def test_gateway_extension_deletes_only_allowed_video_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            video = (
+                home
+                / "facebook-video-ingest"
+                / "executions"
+                / "E-001"
+                / "video.mp4"
+            )
+            video.parent.mkdir(parents=True)
+            video.write_bytes(b"video")
+
+            deleted = EXTENSION.delete_capture_video_path(video, home=home)
+
+            self.assertEqual(deleted, video.resolve())
+            self.assertFalse(video.exists())
+            outside = home / "outside.mp4"
+            outside.write_bytes(b"video")
+            with self.assertRaises(PermissionError):
+                EXTENSION.delete_capture_video_path(outside, home=home)
+            self.assertTrue(outside.exists())
 
     def test_daily_recent_video_target_defaults_to_ten(self):
         args = MODULE.build_parser().parse_args(["--check"])
@@ -257,6 +306,24 @@ class PipelineTests(unittest.TestCase):
             ],
         )
 
+    def test_approved_upload_runner_skips_capture_claim(self):
+        command = RUNNER.worker_command(
+            Path("/tmp/facebook_video_ingest.py"),
+            Path("/tmp/hm_capture_upload_C-001_V-001.py"),
+        )
+        self.assertEqual(
+            command,
+            [
+                RUNNER.sys.executable,
+                "/tmp/facebook_video_ingest.py",
+                "--execute",
+                "--upload-only",
+                "--task-no",
+                "C-001",
+                "--json",
+            ],
+        )
+
     def test_installer_detects_legacy_shared_job_and_supervised_gateway(self):
         listing = "  abc123 [active]\n    Name:      HM 视频抓取 Worker\n"
         self.assertTrue(INSTALLER.has_legacy_job(listing))
@@ -391,9 +458,9 @@ class PipelineTests(unittest.TestCase):
                 "https://hermes.mvkbmb.online,https://customer.example.com",
             )
 
-    def test_installer_pairing_code_contains_local_api_and_worker_identity(self):
+    def test_installer_pairing_code_contains_only_local_api_configuration(self):
         code = INSTALLER.pairing_code(
-            "http://127.0.0.1:8642", "a" * 32, "hermes-worker-01"
+            "http://127.0.0.1:8642", "a" * 32, "worker-01"
         )
         self.assertTrue(code.startswith(INSTALLER.PAIRING_PREFIX))
         encoded = code[len(INSTALLER.PAIRING_PREFIX) :]
@@ -406,7 +473,7 @@ class PipelineTests(unittest.TestCase):
             {
                 "apiBaseUrl": "http://127.0.0.1:8642",
                 "apiKey": "a" * 32,
-                "workerId": "hermes-worker-01",
+                "workerId": "worker-01",
             },
         )
 
@@ -442,6 +509,123 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertEqual(MODULE.normalized_upload_status("conflict"), "R2_CONFLICT")
         self.assertEqual(MODULE.normalized_upload_status("unexpected"), "UPLOAD_FAILED")
+
+    def test_successful_approved_upload_deletes_local_file_after_callback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            local_video = root / "video.mp4"
+            local_video.write_bytes(b"video")
+            args = MODULE.build_parser().parse_args(
+                ["--check", "--state-dir", str(root / "state")]
+            )
+            job = {
+                "jobNo": "U-001",
+                "localPath": str(local_video),
+                "fileName": local_video.name,
+                "fileSize": local_video.stat().st_size,
+                "fileSha256": "a" * 64,
+                "r2Prefix": "PH/Sports/202608/27",
+            }
+
+            def fake_run(command):
+                result_path = Path(command[command.index("--result-json") + 1])
+                result_path.write_text(
+                    json.dumps(
+                        {
+                            "videos": [
+                                {
+                                    "status": "uploaded",
+                                    "r2Bucket": "media",
+                                    "r2ObjectKey": "PH/Sports/202608/27/video.mp4",
+                                }
+                            ]
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return 0, "uploaded\n"
+
+            with (
+                mock.patch.object(MODULE, "run_command", side_effect=fake_run),
+                mock.patch.object(MODULE, "complete_upload") as complete_upload,
+            ):
+                result = MODULE.process_upload_job(
+                    args,
+                    "https://backend.example.com",
+                    "secret",
+                    "worker-01",
+                    job,
+                )
+
+            complete_upload.assert_called_once()
+            self.assertFalse(local_video.exists())
+            self.assertEqual(result["localCleanup"]["status"], "deleted")
+
+    def test_upload_callback_failure_keeps_local_file_for_retry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            local_video = root / "video.mp4"
+            local_video.write_bytes(b"video")
+            args = MODULE.build_parser().parse_args(
+                ["--check", "--state-dir", str(root / "state")]
+            )
+            job = {
+                "jobNo": "U-001",
+                "localPath": str(local_video),
+                "fileName": local_video.name,
+                "fileSize": local_video.stat().st_size,
+                "fileSha256": "a" * 64,
+                "r2Prefix": "PH/Sports/202608/27",
+            }
+
+            def fake_run(command):
+                result_path = Path(command[command.index("--result-json") + 1])
+                result_path.write_text(
+                    json.dumps(
+                        {
+                            "videos": [
+                                {
+                                    "status": "uploaded",
+                                    "r2ObjectKey": "PH/Sports/202608/27/video.mp4",
+                                }
+                            ]
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return 0, "uploaded\n"
+
+            with (
+                mock.patch.object(MODULE, "run_command", side_effect=fake_run),
+                mock.patch.object(
+                    MODULE,
+                    "complete_upload",
+                    side_effect=MODULE.BackendError("callback failed"),
+                ),
+                self.assertRaises(MODULE.BackendError),
+            ):
+                MODULE.process_upload_job(
+                    args,
+                    "https://backend.example.com",
+                    "secret",
+                    "worker-01",
+                    job,
+                )
+
+            self.assertTrue(local_video.exists())
+
+    def test_unsuccessful_upload_keeps_local_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            local_video = Path(temporary) / "video.mp4"
+            local_video.write_bytes(b"video")
+
+            cleanup = MODULE.cleanup_uploaded_local_file(
+                {"localPath": str(local_video)},
+                {"status": "conflict"},
+            )
+
+            self.assertEqual(cleanup["status"], "retained")
+            self.assertTrue(local_video.exists())
 
     def test_backend_r2_prefix_uses_region_category_and_execution_date(self):
         self.assertEqual(
@@ -500,7 +684,10 @@ class PipelineTests(unittest.TestCase):
             ]
         )
         args.worker_token = "secret"
-        with mock.patch.object(MODULE, "claim", return_value=None):
+        with (
+            mock.patch.object(MODULE, "claim", return_value=None),
+            mock.patch.object(MODULE, "claim_upload", return_value=None),
+        ):
             exit_code, result = MODULE.execute_one(args)
         self.assertEqual(exit_code, 0)
         self.assertEqual(result["status"], "no-work")
@@ -616,23 +803,22 @@ class PipelineTests(unittest.TestCase):
             mock.patch.object(MODULE, "run_command", side_effect=fake_run),
             mock.patch.object(MODULE, "record_video") as record,
             mock.patch.object(MODULE, "complete") as complete,
+            mock.patch.object(MODULE, "claim_upload", return_value=None),
         ):
             exit_code, result = MODULE.execute_one(args)
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(result["status"], "COMPLETED")
-        self.assertEqual(record.call_count, 2)
+        self.assertEqual(record.call_count, 1)
         self.assertEqual(complete.call_args.args[4], "COMPLETED")
-        upload_command = commands[1]
-        self.assertEqual(
-            upload_command[upload_command.index("--prefix") + 1],
-            "PH/Sports/202608/10",
-        )
-        self.assertIn("--flatten", upload_command)
         download_command = commands[0]
         self.assertEqual(
             download_command[download_command.index("--initial-count") + 1],
             "10",
+        )
+        self.assertEqual(
+            download_command[download_command.index("--max-duration-seconds") + 1],
+            "1200",
         )
 
     def test_partial_business_result_is_a_successful_cron_run(self):
@@ -700,6 +886,7 @@ class PipelineTests(unittest.TestCase):
             mock.patch.object(MODULE, "run_command", side_effect=fake_run),
             mock.patch.object(MODULE, "record_video"),
             mock.patch.object(MODULE, "complete") as complete,
+            mock.patch.object(MODULE, "claim_upload", return_value=None),
         ):
             exit_code, result = MODULE.execute_one(args)
 
