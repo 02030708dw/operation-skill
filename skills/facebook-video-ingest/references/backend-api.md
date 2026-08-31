@@ -116,14 +116,35 @@ Accepted download statuses are `DISCOVERED`, `DOWNLOADING`, `DOWNLOADED`, and `D
 
 The backend deduplicates videos by `(task_id, SHA-256(canonicalUrl))`. A second callback updates the same record, which is how the upload result enriches the earlier download record.
 
+For a multi-video capture, the Worker sends this callback immediately after
+each downloader `video-result` event instead of waiting for the whole child
+process. Callback delivery uses transient retries in parallel with continuing
+downloads. Before calling execution `complete`, the Worker reconciles the final
+download manifest: already accepted canonical URLs are skipped and any failed
+early callback is retried. If that final callback still fails, the Worker must
+not call `complete`; the execution lease and durable final manifest provide the
+safe retry path.
+
 ## Approved Upload Jobs
 
 Claim an operator-approved upload with `POST /api/internal/capture/uploads/claim` and `{ "workerId": "...", "taskNo": "C-..." }`. The response includes the verified local path, SHA-256, category, and `r2Prefix`. Upload only that one file, then call `POST /api/internal/capture/uploads/{jobNo}/complete` with `status` set to `UPLOADED`, `SKIPPED_EXISTING`, `R2_CONFLICT`, or `UPLOAD_FAILED` plus the R2 fields. This is the only path that may publish a captured file to Cloudflare.
+
+Every installed source Hermes runs a recurring no-agent `--upload-only` poller.
+This outbound poller is the delivery path when an operator reviews from another
+computer; the browser's loopback Hermes is only an optional same-machine
+acceleration. Claim continues to require the task's owning Worker ID.
 
 Keep the local file until the complete callback returns successfully. After an
 accepted `UPLOADED` or `SKIPPED_EXISTING` callback, delete that job's exact
 local file. Retain it for callback failure, `R2_CONFLICT`, or `UPLOAD_FAILED`
 so the job can be inspected or retried.
+
+Persist the R2 result and local path in the Worker's cleanup journal before
+calling complete. The backend treats an exact repeat from the same Worker as an
+idempotent success only when job status, upload status, R2 bucket/key/URL, and
+error fields all match the stored terminal result. Any changed field or Worker
+still returns conflict. After an accepted successful callback, delete the file
+and remove the journal; replay an unfinished journal on later upload polls.
 
 ## Complete
 

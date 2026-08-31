@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 
 
 SKILL_NAME = "facebook-followed-video-download"
-SKILL_VERSION = "1.5.1"
+SKILL_VERSION = "1.6.0"
 SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_DIR = SCRIPT_DIR.parent
 
@@ -448,7 +448,9 @@ def _run_download_with_accounts(args: argparse.Namespace, accounts: Path) -> int
         captured: list[str] = []
         assert process.stdout is not None
         for line in process.stdout:
-            print(line, end="")
+            # Preserve the engine's opt-in per-video JSONL events in real time
+            # when this entry point is itself piped into an orchestrator.
+            print(line, end="", flush=True)
             captured.append(line)
         exit_code = process.wait()
 

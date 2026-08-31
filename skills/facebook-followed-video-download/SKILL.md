@@ -2,7 +2,7 @@
 name: facebook-followed-video-download
 description: Find, download, or locally reuse recent permitted Facebook Page, creator, Reels, watch, or direct video URLs in per-source folders with archive-backed duplicate prevention and reports. Use when the user asks Hermes to configure followed Facebook video sources, preview recent videos, download the latest or all videos, list sources, check dependencies, or troubleshoot this downloader. Defaults to preview and downloads only with explicit execution approval.
 metadata:
-  version: "1.5.1"
+  version: "1.6.0"
   platforms:
     - windows
     - macos
@@ -156,6 +156,14 @@ python "<skill-dir>/scripts/facebook_followed_video_download.py" --source "C-012
 ```
 
 `--result-json` writes the machine-readable download manifest even when the engine fails. Each successfully downloaded video includes its canonical URL, local path, byte size, and SHA-256. Use this manifest as the input to the R2 Skill; do not rediscover the output directory.
+
+When a trusted orchestrator sets `HM_VIDEO_RESULT_EVENTS=1`, the entry point
+also flushes one structured stdout line immediately after each selected video
+finishes downloading, fails, or is filtered. Each line starts with
+`__HM_VIDEO_RESULT__:` and contains a `video-result` JSON object with the
+source, completed/total counts, and the same video fields written to the final
+manifest. This stream is an early-notification channel only; the final
+`--result-json` manifest remains authoritative and must still be reconciled.
 
 ### Initial Full Import
 

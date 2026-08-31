@@ -23,6 +23,7 @@ UPLOAD_RUNNER_PATTERN = re.compile(
     r"^hm_capture_upload_(C-[A-Za-z0-9-]+)_(V-[A-Za-z0-9-]+)$",
     re.IGNORECASE,
 )
+UPLOAD_QUEUE_RUNNER_NAME = "hm_capture_upload_worker"
 
 
 def hermes_home() -> Path:
@@ -107,6 +108,10 @@ def execution_no_from_runner(path: Path) -> str | None:
 def worker_command(worker: Path, runner: Path) -> list[str]:
     task_no = task_no_from_runner(runner)
     execution_no = execution_no_from_runner(runner)
+    if runner.stem.lower() == UPLOAD_QUEUE_RUNNER_NAME:
+        return [
+            sys.executable, str(worker), "--execute", "--upload-only", "--json",
+        ]
     if UPLOAD_RUNNER_PATTERN.fullmatch(runner.stem):
         return [
             sys.executable, str(worker), "--execute", "--upload-only",
@@ -147,6 +152,11 @@ def start_detached(command: list[str], log_path: Path) -> None:
 
 
 def worker_lock_path(home: Path, runner: Path) -> Path:
+    if (
+        runner.stem.lower() == UPLOAD_QUEUE_RUNNER_NAME
+        or UPLOAD_RUNNER_PATTERN.fullmatch(runner.stem)
+    ):
+        return home / "facebook-video-ingest" / "upload-worker.lock"
     execution_no = execution_no_from_runner(runner)
     if execution_no:
         return home / "facebook-video-ingest" / f"worker-{execution_no}.lock"

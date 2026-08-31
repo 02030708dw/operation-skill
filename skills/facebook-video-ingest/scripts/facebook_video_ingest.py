@@ -7,13 +7,14 @@ import argparse
 import importlib.util
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, Callable
 from urllib import error, request
 
 
@@ -21,6 +22,8 @@ SKILL_NAME = "facebook-video-ingest"
 WORKER_USER_AGENT = "HM-Hermes-Worker/1.0"
 TRANSIENT_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 TRANSIENT_BACKEND_ATTEMPTS = 6
+VIDEO_RESULT_EVENT_PREFIX = "__HM_VIDEO_RESULT__:"
+VIDEO_RESULT_EVENTS_ENV = "HM_VIDEO_RESULT_EVENTS"
 SKILL_DIR = Path(__file__).resolve().parent.parent
 SKILLS_DIR = SKILL_DIR.parent
 DOWNLOAD_SCRIPT = (
@@ -308,6 +311,7 @@ def complete_upload(
             "errorCode": status_error_code("DOWNLOADED", upload_status),
             "errorMessage": video.get("error"),
         },
+        retry_transient=True,
     )
 
 
@@ -429,6 +433,169 @@ def status_error_code(download_status: str, upload_status: str) -> str | None:
     return None
 
 
+def parse_download_video_event(line: str) -> dict[str, Any] | None:
+    """Parse one opt-in downloader event without treating normal logs as data."""
+    value = line.strip()
+    if not value.startswith(VIDEO_RESULT_EVENT_PREFIX):
+        return None
+    try:
+        event = json.loads(value[len(VIDEO_RESULT_EVENT_PREFIX) :])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(event, dict) or event.get("event") != "video-result":
+        return None
+    video = event.get("video")
+    if not isinstance(video, dict):
+        return None
+    normalized = dict(video)
+    if not normalized.get("source") and event.get("source"):
+        normalized["source"] = event["source"]
+    return {
+        "video": normalized,
+        "completed": event.get("completed"),
+        "total": event.get("total"),
+    }
+
+
+def video_result_identity(video: dict[str, Any]) -> str:
+    """Use the same stable URL identity that HM uses for idempotent upserts."""
+    identity = str(
+        video.get("canonicalUrl") or video.get("originalUrl") or ""
+    ).strip()
+    if not identity:
+        raise PipelineError("video result is missing canonicalUrl/originalUrl")
+    return identity
+
+
+def capture_download_status(video: dict[str, Any]) -> str | None:
+    status = str(video.get("status") or "").strip().lower()
+    if status == "filtered-duration":
+        return None
+    return "DOWNLOADED" if status == "downloaded" else "DOWNLOAD_FAILED"
+
+
+class IncrementalVideoRecorder:
+    """Deliver terminal per-video results while the downloader is still running.
+
+    A dedicated thread keeps backend retries from blocking the downloader's
+    stdout pipe. ``finish`` joins that thread and reconciles the authoritative
+    final manifest, retrying any event callback that did not reach HM.
+    """
+
+    _STOP = object()
+
+    def __init__(
+        self,
+        backend: str,
+        token: str,
+        worker_id: str,
+        execution_id: str,
+        progress_callback: Callable[[int], None] | None = None,
+    ) -> None:
+        self.backend = backend
+        self.token = token
+        self.worker_id = worker_id
+        self.execution_id = execution_id
+        self.progress_callback = progress_callback
+        self.recorded: set[str] = set()
+        self.stream_errors: dict[str, str] = {}
+        self._queue: queue.Queue[dict[str, Any] | object] = queue.Queue()
+        self._thread: threading.Thread | None = None
+        self._stopped = False
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"hm-video-results-{self.execution_id}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def handle_line(self, line: str) -> None:
+        event = parse_download_video_event(line)
+        if event is None or self._stopped:
+            return
+        video = event["video"]
+        if capture_download_status(video) is not None:
+            self._queue.put(video)
+        try:
+            completed = int(event.get("completed") or 0)
+            total = int(event.get("total") or 0)
+        except (TypeError, ValueError):
+            return
+        if self.progress_callback and completed > 0 and total > 0:
+            progress = min(85, 10 + round(75 * min(completed, total) / total))
+            self.progress_callback(progress)
+
+    def finish(self, videos: list[dict[str, Any]]) -> None:
+        """Drain streamed callbacks, then retry every missing final result."""
+        self.stop()
+        for video in videos:
+            if capture_download_status(video) is None:
+                continue
+            identity = video_result_identity(video)
+            if identity in self.recorded:
+                continue
+            self._record(video)
+
+    def stop(self) -> None:
+        if self._stopped:
+            return
+        self._stopped = True
+        if self._thread is not None:
+            self._queue.put(self._STOP)
+            self._thread.join()
+
+    def _run(self) -> None:
+        while True:
+            queued = self._queue.get()
+            try:
+                if queued is self._STOP:
+                    return
+                assert isinstance(queued, dict)
+                try:
+                    identity = video_result_identity(queued)
+                    if identity in self.recorded:
+                        continue
+                    self._record(queued)
+                except Exception as exc:
+                    # The final manifest is authoritative and retries this
+                    # exact idempotent upsert before execution completion.
+                    identity = str(
+                        queued.get("canonicalUrl")
+                        or queued.get("originalUrl")
+                        or queued.get("platformVideoId")
+                        or "unknown"
+                    )
+                    self.stream_errors[identity] = str(exc)
+                    print(
+                        f"Per-video callback warning ({identity}): {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            finally:
+                self._queue.task_done()
+
+    def _record(self, video: dict[str, Any]) -> None:
+        identity = video_result_identity(video)
+        download_status = capture_download_status(video)
+        if download_status is None:
+            return
+        record_video(
+            self.backend,
+            self.token,
+            self.worker_id,
+            self.execution_id,
+            video,
+            download_status=download_status,
+            upload_status="PENDING",
+        )
+        self.recorded.add(identity)
+        self.stream_errors.pop(identity, None)
+
+
 def complete(
     backend: str,
     token: str,
@@ -458,7 +625,12 @@ def complete(
     )
 
 
-def run_command(command: list[str]) -> tuple[int, str]:
+def run_command(
+    command: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    on_line: Callable[[str], None] | None = None,
+) -> tuple[int, str]:
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -466,12 +638,15 @@ def run_command(command: list[str]) -> tuple[int, str]:
         text=True,
         encoding="utf-8",
         errors="replace",
+        env=env,
     )
     lines: list[str] = []
     assert process.stdout is not None
     for line in process.stdout:
         print(line, end="", flush=True)
         lines.append(line)
+        if on_line is not None:
+            on_line(line)
     return process.wait(), "".join(lines)
 
 
@@ -559,6 +734,94 @@ def cleanup_uploaded_local_file(
         return {"status": "failed", "fileName": local_path.name, "error": str(exc)}
 
 
+def upload_cleanup_journal_path(state_dir: Path, job_no: str) -> Path:
+    return (
+        state_dir.expanduser().resolve()
+        / "approved-uploads"
+        / state_segment(job_no)
+        / "cleanup.json"
+    )
+
+
+def write_upload_cleanup_journal(
+    path: Path,
+    worker_id: str,
+    job: dict[str, Any],
+    upload_video: dict[str, Any],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(
+            {
+                "schemaVersion": "1.0",
+                "workerId": worker_id,
+                "job": job,
+                "uploadVideo": upload_video,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def finish_upload_and_cleanup(
+    state_dir: Path,
+    backend: str,
+    token: str,
+    worker_id: str,
+    job: dict[str, Any],
+    upload_video: dict[str, Any],
+) -> dict[str, Any]:
+    """Durably confirm the upload before deleting the source video."""
+    job_no = str(job.get("jobNo") or "")
+    journal = upload_cleanup_journal_path(state_dir, job_no)
+    write_upload_cleanup_journal(journal, worker_id, job, upload_video)
+    complete_upload(backend, token, worker_id, job_no, upload_video)
+    cleanup = cleanup_uploaded_local_file(job, upload_video)
+    if cleanup.get("status") != "failed":
+        try:
+            journal.unlink()
+        except FileNotFoundError:
+            pass
+    return cleanup
+
+
+def replay_upload_cleanup_journals(
+    state_dir: Path,
+    backend: str,
+    token: str,
+    worker_id: str,
+) -> list[dict[str, Any]]:
+    """Retry callbacks/deletes interrupted after an R2 result was persisted."""
+    root = state_dir.expanduser().resolve() / "approved-uploads"
+    if not root.is_dir():
+        return []
+    replayed: list[dict[str, Any]] = []
+    for journal in sorted(root.glob("*/cleanup.json")):
+        try:
+            payload = json.loads(journal.read_text(encoding="utf-8"))
+            if payload.get("workerId") != worker_id:
+                continue
+            job = payload["job"]
+            upload_video = payload["uploadVideo"]
+            if not isinstance(job, dict) or not isinstance(upload_video, dict):
+                raise ValueError("invalid upload cleanup journal")
+            cleanup = finish_upload_and_cleanup(
+                state_dir, backend, token, worker_id, job, upload_video
+            )
+            replayed.append({"jobNo": job.get("jobNo"), "localCleanup": cleanup})
+        except (BackendError, OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            print(
+                f"Upload cleanup retry warning ({journal.parent.name}): {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+    return replayed
+
+
 def process_upload_job(
     args: argparse.Namespace,
     backend: str,
@@ -598,14 +861,25 @@ def process_upload_job(
         "--execution-id", job_no, "--result-json", str(result_manifest),
     ]
     exit_code, output = run_command(command)
-    if not result_manifest.is_file():
-        raise PipelineError("R2 skill did not write the approved-video result manifest")
-    result = json.loads(result_manifest.read_text(encoding="utf-8"))
-    videos = result.get("videos", [])
-    if not videos:
-        raise PipelineError("R2 skill returned no approved-video result")
-    complete_upload(backend, token, worker_id, str(job["jobNo"]), videos[0])
-    result["localCleanup"] = cleanup_uploaded_local_file(job, videos[0])
+    try:
+        if not result_manifest.is_file():
+            raise PipelineError("R2 skill did not write the approved-video result manifest")
+        result = json.loads(result_manifest.read_text(encoding="utf-8"))
+        videos = result.get("videos", [])
+        if not videos:
+            raise PipelineError("R2 skill returned no approved-video result")
+        upload_video = videos[0]
+    except (OSError, PipelineError, json.JSONDecodeError, TypeError) as exc:
+        upload_video = {"status": "failed", "error": str(exc)[:500]}
+        result = {"videos": [upload_video]}
+    result["localCleanup"] = finish_upload_and_cleanup(
+        args.state_dir,
+        backend,
+        token,
+        worker_id,
+        job,
+        upload_video,
+    )
     if result["localCleanup"]["status"] == "failed":
         print(
             f"Local video cleanup warning: {result['localCleanup']['error']}",
@@ -624,12 +898,25 @@ def drain_upload_jobs(
     worker_id: str,
     task_no: str = "",
 ) -> list[dict[str, Any]]:
-    results: list[dict[str, Any]] = []
+    results = replay_upload_cleanup_journals(
+        args.state_dir, backend, token, worker_id
+    )
     while True:
         job = claim_upload(backend, token, worker_id, task_no)
         if job is None:
             break
-        results.append(process_upload_job(args, backend, token, worker_id, job))
+        try:
+            results.append(process_upload_job(args, backend, token, worker_id, job))
+        except BackendError:
+            # The durable journal is replayed on the next poll. Stop claiming
+            # new work until backend connectivity is healthy.
+            raise
+        except Exception as exc:
+            print(
+                f"Approved upload failed ({job.get('jobNo')}): {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
     return results
 
 
@@ -735,6 +1022,13 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         execution_id,
         args.heartbeat_seconds,
     )
+    video_recorder = IncrementalVideoRecorder(
+        backend,
+        token,
+        worker_id,
+        execution_id,
+        heartbeat_pump.update,
+    )
     try:
         heartbeat(backend, token, worker_id, execution_id, 5)
         heartbeat_pump.start()
@@ -746,6 +1040,7 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         download_manifest = execution_dir / "download.json"
         download_result = reusable_download_result(download_manifest)
         if download_result is None:
+            video_recorder.start()
             download_command = [
                 sys.executable,
                 str(DOWNLOAD_SCRIPT),
@@ -766,7 +1061,13 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             ]
             if args.download_output:
                 download_command.extend(["--output", str(args.download_output.expanduser().resolve())])
-            download_exit, download_output = run_command(download_command)
+            download_env = os.environ.copy()
+            download_env[VIDEO_RESULT_EVENTS_ENV] = "1"
+            download_exit, download_output = run_command(
+                download_command,
+                env=download_env,
+                on_line=video_recorder.handle_line,
+            )
             raw_parts.append(download_output)
             if not download_manifest.is_file():
                 raise PipelineError("download skill did not write its result manifest")
@@ -778,18 +1079,7 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             video for video in manifest_videos(download_result)
             if video.get("status") != "filtered-duration"
         ]
-        for video in videos:
-            record_video(
-                backend,
-                token,
-                worker_id,
-                execution_id,
-                video,
-                download_status=(
-                    "DOWNLOADED" if video.get("status") == "downloaded" else "DOWNLOAD_FAILED"
-                ),
-                upload_status="PENDING",
-            )
+        video_recorder.finish(videos)
 
         heartbeat_pump.update(90)
         heartbeat(backend, token, worker_id, execution_id, 90)
@@ -850,6 +1140,7 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         # code for a Worker/pipeline execution that failed as a whole.
         return (0 if terminal_status in {"COMPLETED", "PARTIAL"} else 1), combined
     except Exception as exc:
+        video_recorder.stop()
         heartbeat_pump.stop()
         failed = {
             "schemaVersion": "1.0",

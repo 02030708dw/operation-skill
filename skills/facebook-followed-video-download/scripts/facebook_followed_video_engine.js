@@ -21,7 +21,8 @@ const DEFAULT_COOKIES = process.env.FACEBOOK_FOLLOWED_COOKIES || process.env.FB_
 const DEFAULT_DESKTOP = process.env.FACEBOOK_FOLLOWED_OUTPUT || process.env.FB_FOLLOWED_DESKTOP || path.join(HOME, 'Desktop', 'Facebook');
 const DEFAULT_YTDLP = process.env.FACEBOOK_FOLLOWED_YTDLP || process.env.FB_FOLLOWED_YTDLP || process.env.YTDLP || 'yt-dlp';
 const CDP_PORT = Number(process.env.FACEBOOK_FOLLOWED_CDP_PORT || process.env.FB_CDP_PORT || String(9300 + Math.floor(Math.random() * 500)));
-const SKILL_VERSION = '1.5.1';
+const SKILL_VERSION = '1.6.0';
+const VIDEO_RESULT_EVENT_PREFIX = '__HM_VIDEO_RESULT__:';
 
 function detectChrome() {
   const configured = process.env.FACEBOOK_FOLLOWED_CHROME || process.env.FB_FOLLOWED_CHROME;
@@ -70,6 +71,7 @@ const firstRunLimit = Number(argValue(
 const maxDurationSeconds = Number(argValue('--max-duration-seconds', '0'));
 const resultJsonPath = argValue('--result-json', '');
 const browserProfileDir = argValue('--browser-profile', '');
+const emitVideoResultEvents = process.env.HM_VIDEO_RESULT_EVENTS === '1';
 let cdpId = 10;
 
 function nextCdpId() {
@@ -79,6 +81,17 @@ function nextCdpId() {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function videoResultEventLine(source, video, completed, total) {
+  return `${VIDEO_RESULT_EVENT_PREFIX}${JSON.stringify({
+    schemaVersion: '1.0',
+    event: 'video-result',
+    source,
+    completed,
+    total,
+    video,
+  })}`;
 }
 
 function sanitizeFolderName(value) {
@@ -701,6 +714,14 @@ async function main() {
         console.log(`  下載: ${videoUrl}`);
         const item = downloadVideo(account, videoUrl, outputDir, archivePath);
         sourceResult.videos.push(item);
+        if (emitVideoResultEvents) {
+          console.log(videoResultEventLine(
+            account.folder,
+            item,
+            sourceResult.videos.length,
+            selected.length,
+          ));
+        }
         if (item.status === 'filtered-duration') sourceResult.filteredDuration++;
         else if (item.status === 'downloaded' || item.status === 'preview') sourceResult.succeeded++;
         else sourceResult.failed++;
@@ -759,4 +780,10 @@ async function runMain() {
 
 if (require.main === module) runMain();
 
-module.exports = { selectDailyVideoUrls, selectVideoUrls, videoKey };
+module.exports = {
+  VIDEO_RESULT_EVENT_PREFIX,
+  selectDailyVideoUrls,
+  selectVideoUrls,
+  videoKey,
+  videoResultEventLine,
+};

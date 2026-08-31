@@ -1,6 +1,6 @@
 ---
 name: facebook-video-ingest
-description: Run customer-side, on-demand Hermes Workers for backend-managed Facebook capture executions, filter videos over 20 minutes before download, hold downloaded videos for operator review, expose a restricted backend-proxied review stream, upload only approved files to Cloudflare R2, and report results to HM. Use when Hermes must install its local API, pair with the HM admin browser, create or run local Cron jobs, execute a targeted HM ingest job, or troubleshoot the local video pipeline while HM runs on another server.
+description: Run customer-side Hermes Workers for backend-managed Facebook capture executions, filter videos over 20 minutes before download, hold downloaded videos for operator review, automatically upload approved files to Cloudflare R2, and report results to HM. Use when Hermes must install its local API, pair with the HM admin browser, create or run local Cron jobs, execute a targeted HM ingest job, or troubleshoot the local video pipeline while HM runs on another server.
 ---
 
 # Facebook Video Ingest
@@ -15,7 +15,9 @@ Run the HM review-gated pipeline as one idempotent Worker: backend execution cla
   `/api/hm-capture/video` routes through a dedicated derived media token. Use
   this only on a trusted LAN/VPN and restrict the host firewall to the HM
   backend. All other Hermes routes still require `API_SERVER_KEY`.
-- Create the capture Worker only when a local Cron fires. Do not keep a continuous HM polling Worker running in the normal production mode.
+- Create capture Workers only when their task Cron fires. Keep the installer's
+  no-agent approved-upload poller enabled so reviews submitted from any computer
+  are processed by the Hermes machine that owns the local source file.
 - Download only public content or content the user is authorized to save. Never bypass privacy, login, DRM, payment, or rate-limit controls.
 - Read Worker and R2 secrets only from environment variables. Never print them or place them in command arguments.
 - Retain local files while review or upload can still be retried. Delete a rejected
@@ -64,6 +66,16 @@ python "<skill-dir>/scripts/facebook_video_ingest.py" <arguments>
 The entry point composes the sibling `facebook-followed-video-download` and `cloudflare-r2-video-upload` Skills. Install all three complete directories, including scripts and dependencies.
 
 The backend Worker passes `--initial-count 10` and `--max-duration-seconds 1200` to the downloader. Videos longer than 20 minutes must be filtered from metadata before download and must not be recorded as captured videos. The first execution for a source requests at most 10 recent videos. Later executions use the downloader archive as the previous-run boundary and select every newer video without a count limit: two updates selects two and 30 updates selects all 30. When there are no updates, the downloader falls back to the 10 most recent discovered videos. If Facebook exposes no public video URLs at all, treat the execution as failed rather than reporting a false successful no-update result.
+
+During an active batch, opt in to the downloader's structured per-video stdout
+events and send each terminal download result to HM as soon as that file is
+ready. Process these callbacks on a separate delivery thread so a slow backend
+does not stop later downloads. The final download manifest remains
+authoritative: reconcile it before completing the execution, skip callbacks
+already accepted by HM, and retry any streamed callback that failed. Because HM
+upserts by the canonical video URL, uncertain or repeated callbacks remain
+idempotent. If final reconciliation still cannot reach HM, leave the execution
+running for its lease retry rather than reporting completion.
 
 The Hermes Cron runner resolves only `<hermes-home>/skills/facebook-video-ingest/scripts/facebook_video_ingest.py`. It must fail clearly if that installed Skill is missing; never fall back to a categorized copy or a recursive match.
 
@@ -120,6 +132,15 @@ The legacy receiver writes operational output to
 Its backend client sends an explicit `HM-Hermes-Worker` user agent so Cloudflare
 does not reject Python's default `urllib` fingerprint with error 1010.
 
+To diagnose only the approved-upload queue without claiming capture work, use:
+
+```text
+python "<skill-dir>/scripts/facebook_video_ingest.py" --watch --upload-only
+```
+
+The installer normally provides equivalent reliable polling through a recurring
+no-agent Cron, so do not also leave this diagnostic process running.
+
 ### Install The Customer-Side Hermes Bridge
 
 On the customer computer, run the installer once:
@@ -129,7 +150,7 @@ python "<skill-dir>/scripts/install_hermes_worker.py"
 ```
 
 The installer is idempotent. It installs dependencies and the deterministic
-runner, keeps browser pairing at `127.0.0.1:8642`, binds the authenticated
+capture/upload runners, keeps browser pairing at `127.0.0.1:8642`, binds the authenticated
 Gateway to the local network, derives a Worker-specific media token from
 `HM_WORKER_TOKEN`, and registers `HM_CAPTURE_MEDIA_BASE_URL` with HM. It
 auto-detects the private IPv4; when a computer has multiple network adapters,
@@ -138,6 +159,11 @@ configured HM admin origins, starts or restarts Hermes Gateway, and prints an
 `HMHERMES1.` pairing code. The full API key stays only in that browser's local
 storage and is never sent to HM; the backend can use only the restricted media
 token it derives independently.
+
+The installer also maintains one `HM 审核上传队列 Worker` no-agent Cron that
+polls every minute. It runs `--execute --upload-only`, never claims capture
+executions, and is the correctness path for cross-computer review. A browser on
+the source computer may still start a one-shot upload as a latency optimization.
 
 The installer removes the old `HM 后台任务接收 Worker`, `HM 视频抓取 Worker`,
 and stale `HM 立即抓取 C-*` jobs, and stops the old continuous `--watch`
@@ -166,13 +192,23 @@ completion.
 2. Claim only through the HM internal Worker API. For a scheduled local Cron, include its backend task number. For immediate execution, include both the backend task and execution numbers. Never invent an execution ID, source URL, or result.
 3. Use the globally unique account name supplied by HM as the local source name. Use the backend-provided `r2Prefix` unchanged; it has the form `PH/Sports/yyyyMM/dd` and is derived from the task region, category, and execution date.
 4. Record downloaded files as `PENDING_REVIEW`. Never upload a newly captured file before an operator approves it. Upload only jobs claimed from `/api/internal/capture/uploads/claim`.
-5. The HM browser starts a one-shot `--upload-only --task-no <task-no>` runner immediately after approval. A normal scheduled or manual runner also drains approved uploads for its task, so a transient browser-to-Hermes failure is recovered on the next run.
+5. The recurring source-Hermes upload Cron drains approved jobs at least once a
+   minute. The HM browser may additionally start a one-shot `--upload-only
+   --task-no <task-no>` runner only when its paired Worker ID matches the video's
+   owning Worker. Never rely on the reviewing computer's `127.0.0.1` Hermes for
+   cross-computer delivery.
 6. Keep a periodic heartbeat active while child processes run. The backend may return an expired execution to the queue after its configured lease timeout.
+   Advance its in-memory progress as per-video terminal events arrive; the
+   heartbeat thread must remain active through final callback reconciliation.
 7. Keep `<state-dir>/<executionId>/download.json` until operational retention removes the whole completed execution directory. A lease retry reuses this manifest only while every downloaded file still exists at its recorded byte size; the R2 step also verifies its recorded SHA-256 before upload.
 8. Treat same-key/same-size R2 objects as `SKIPPED_EXISTING`, different-size objects as `R2_CONFLICT`, and verified new objects as `UPLOADED`.
 9. After HM accepts a successful approved-upload callback, delete that job's
    exact local video path. Do not delete it before the callback, and retain it
-   for `R2_CONFLICT`, `UPLOAD_FAILED`, or callback failure.
+   for `R2_CONFLICT`, `UPLOAD_FAILED`, or callback failure. Persist the terminal
+   R2 result in the job cleanup journal before the callback; each upload poll
+   must replay unfinished callbacks and local deletes. Repeating an identical
+   terminal callback is safe, but a different Worker or result must remain a
+   conflict.
 10. Complete every claimed execution as `COMPLETED`, `PARTIAL`, or `FAILED`. If a backend callback fails, leave the execution running for lease retry and do not claim that HM recorded completion.
 11. Do not impose a short overall timeout. Monitor the same active process rather than starting a duplicate.
 

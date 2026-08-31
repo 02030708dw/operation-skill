@@ -5,15 +5,39 @@ const path = require('node:path');
 const test = require('node:test');
 
 const {
+  VIDEO_RESULT_EVENT_PREFIX,
   selectDailyVideoUrls,
   selectVideoUrls,
   videoKey,
+  videoResultEventLine,
 } = require('../scripts/facebook_followed_video_engine.js');
 const { parseRunLog } = require('../scripts/facebook_followed_video_report.js');
 
 function reel(id) {
   return `https://www.facebook.com/reel/${id}`;
 }
+
+test('per-video event line is structured and includes batch progress', () => {
+  const video = {
+    status: 'downloaded',
+    canonicalUrl: reel(123),
+    localPath: '/tmp/video.mp4',
+  };
+
+  const line = videoResultEventLine('creator-one', video, 3, 30);
+  assert.ok(line.startsWith(VIDEO_RESULT_EVENT_PREFIX));
+  assert.deepEqual(
+    JSON.parse(line.slice(VIDEO_RESULT_EVENT_PREFIX.length)),
+    {
+      schemaVersion: '1.0',
+      event: 'video-result',
+      source: 'creator-one',
+      completed: 3,
+      total: 30,
+      video,
+    },
+  );
+});
 
 test('first daily run selects only the latest ten videos', () => {
   const newestFirst = Array.from({ length: 14 }, (_, index) => reel(200 - index));

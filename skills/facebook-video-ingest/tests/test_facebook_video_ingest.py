@@ -309,9 +309,10 @@ class PipelineTests(unittest.TestCase):
         )
 
     def test_approved_upload_runner_skips_capture_claim(self):
+        runner = Path("/tmp/hm_capture_upload_C-001_V-001.py")
         command = RUNNER.worker_command(
             Path("/tmp/facebook_video_ingest.py"),
-            Path("/tmp/hm_capture_upload_C-001_V-001.py"),
+            runner,
         )
         self.assertEqual(
             command,
@@ -325,6 +326,66 @@ class PipelineTests(unittest.TestCase):
                 "--json",
             ],
         )
+        self.assertEqual(
+            RUNNER.worker_lock_path(Path("/tmp/hermes"), runner),
+            Path("/tmp/hermes/facebook-video-ingest/upload-worker.lock"),
+        )
+
+    def test_recurring_upload_queue_runner_only_drains_approved_uploads(self):
+        home = Path("/tmp/hermes")
+        runner = Path("/tmp/hm_capture_upload_worker.py")
+        self.assertEqual(
+            RUNNER.worker_command(
+                Path("/tmp/facebook_video_ingest.py"), runner
+            ),
+            [
+                RUNNER.sys.executable,
+                "/tmp/facebook_video_ingest.py",
+                "--execute",
+                "--upload-only",
+                "--json",
+            ],
+        )
+        self.assertEqual(
+            RUNNER.worker_lock_path(home, runner),
+            home / "facebook-video-ingest" / "upload-worker.lock",
+        )
+
+    def test_installer_installs_recurring_upload_runner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            INSTALLER.install_runner(home)
+            self.assertEqual(
+                (home / "scripts" / INSTALLER.UPLOAD_RUNNER_NAME).read_bytes(),
+                RUNNER_PATH.read_bytes(),
+            )
+
+    def test_installer_creates_upload_queue_worker_job(self):
+        calls = []
+
+        def fake_api(base, key, method, path, payload=None):
+            calls.append((method, path, payload))
+            if method == "GET":
+                return {"jobs": []}
+            return {
+                "job": {
+                    "id": "upload-worker",
+                    "name": INSTALLER.UPLOAD_WORKER_JOB_NAME,
+                    "schedule_display": INSTALLER.UPLOAD_WORKER_SCHEDULE,
+                    "enabled": True,
+                    "script": INSTALLER.UPLOAD_RUNNER_NAME,
+                    "no_agent": True,
+                }
+            }
+
+        with mock.patch.object(INSTALLER, "local_api_json", side_effect=fake_api):
+            job = INSTALLER.ensure_upload_worker_job(
+                "http://127.0.0.1:8642", "secret"
+            )
+
+        self.assertEqual(job["script"], INSTALLER.UPLOAD_RUNNER_NAME)
+        self.assertEqual(calls[-1][0:2], ("POST", "/api/jobs"))
+        self.assertEqual(calls[-1][2]["schedule"], "* * * * *")
 
     def test_installer_detects_legacy_shared_job_and_supervised_gateway(self):
         listing = "  abc123 [active]\n    Name:      HM 视频抓取 Worker\n"
@@ -528,6 +589,129 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertEqual(videos[0]["source"], "creator-one")
 
+    def test_downloader_video_event_is_parsed_without_accepting_normal_logs(self):
+        video = {
+            "status": "downloaded",
+            "canonicalUrl": "https://www.facebook.com/reel/123",
+        }
+        line = MODULE.VIDEO_RESULT_EVENT_PREFIX + json.dumps(
+            {
+                "schemaVersion": "1.0",
+                "event": "video-result",
+                "source": "creator-one",
+                "completed": 2,
+                "total": 30,
+                "video": video,
+            }
+        )
+
+        parsed = MODULE.parse_download_video_event(line)
+
+        self.assertEqual(parsed["video"]["source"], "creator-one")
+        self.assertEqual(parsed["completed"], 2)
+        self.assertIsNone(MODULE.parse_download_video_event("normal log line"))
+        self.assertIsNone(
+            MODULE.parse_download_video_event(
+                MODULE.VIDEO_RESULT_EVENT_PREFIX + "not-json"
+            )
+        )
+
+    def test_stream_callback_failure_is_retried_from_final_manifest(self):
+        video = {
+            "status": "downloaded",
+            "originalUrl": "https://www.facebook.com/reel/123",
+            "canonicalUrl": "https://www.facebook.com/reel/123",
+            "localPath": "/tmp/video.mp4",
+        }
+        line = MODULE.VIDEO_RESULT_EVENT_PREFIX + json.dumps(
+            {
+                "event": "video-result",
+                "source": "creator-one",
+                "completed": 1,
+                "total": 2,
+                "video": video,
+            }
+        )
+        progress = []
+        recorder = MODULE.IncrementalVideoRecorder(
+            "https://backend.example.com",
+            "secret",
+            "worker-01",
+            "E-001",
+            progress.append,
+        )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "record_video",
+                side_effect=[MODULE.BackendError("temporary"), None],
+            ) as record_video,
+            redirect_stderr(io.StringIO()),
+        ):
+            recorder.start()
+            recorder.handle_line(line)
+            recorder.finish([video])
+
+        self.assertEqual(record_video.call_count, 2)
+        self.assertIn(video["canonicalUrl"], recorder.recorded)
+        self.assertEqual(recorder.stream_errors, {})
+        self.assertEqual(progress, [48])
+
+    def test_final_per_video_callback_failure_remains_fatal_for_lease_retry(self):
+        video = {
+            "status": "downloaded",
+            "originalUrl": "https://www.facebook.com/reel/123",
+            "canonicalUrl": "https://www.facebook.com/reel/123",
+        }
+        recorder = MODULE.IncrementalVideoRecorder(
+            "https://backend.example.com",
+            "secret",
+            "worker-01",
+            "E-001",
+        )
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "record_video",
+                side_effect=MODULE.BackendError("backend unavailable"),
+            ) as record_video,
+            self.assertRaises(MODULE.BackendError),
+        ):
+            recorder.finish([video])
+
+        record_video.assert_called_once()
+
+    def test_filtered_duration_event_advances_progress_without_recording_video(self):
+        line = MODULE.VIDEO_RESULT_EVENT_PREFIX + json.dumps(
+            {
+                "event": "video-result",
+                "completed": 1,
+                "total": 1,
+                "video": {
+                    "status": "filtered-duration",
+                    "canonicalUrl": "https://www.facebook.com/reel/long",
+                },
+            }
+        )
+        progress = []
+        recorder = MODULE.IncrementalVideoRecorder(
+            "https://backend.example.com",
+            "secret",
+            "worker-01",
+            "E-001",
+            progress.append,
+        )
+
+        with mock.patch.object(MODULE, "record_video") as record_video:
+            recorder.start()
+            recorder.handle_line(line)
+            recorder.finish([])
+
+        record_video.assert_not_called()
+        self.assertEqual(progress, [85])
+
     def test_upload_status_mapping_is_explicit(self):
         self.assertEqual(MODULE.normalized_upload_status("uploaded"), "UPLOADED")
         self.assertEqual(
@@ -640,6 +824,39 @@ class PipelineTests(unittest.TestCase):
                 )
 
             self.assertTrue(local_video.exists())
+            journal = MODULE.upload_cleanup_journal_path(
+                args.state_dir, job["jobNo"]
+            )
+            self.assertTrue(journal.is_file())
+
+            with mock.patch.object(MODULE, "complete_upload") as complete_upload:
+                replayed = MODULE.replay_upload_cleanup_journals(
+                    args.state_dir,
+                    "https://backend.example.com",
+                    "secret",
+                    "worker-01",
+                )
+
+            complete_upload.assert_called_once()
+            self.assertEqual(replayed[0]["localCleanup"]["status"], "deleted")
+            self.assertFalse(local_video.exists())
+            self.assertFalse(journal.exists())
+
+    def test_upload_complete_callback_enables_transient_retry(self):
+        with mock.patch.object(MODULE, "api_call") as api_call:
+            MODULE.complete_upload(
+                "https://backend.example.com",
+                "secret",
+                "worker-01",
+                "U-001",
+                {
+                    "status": "uploaded",
+                    "r2Bucket": "media",
+                    "r2ObjectKey": "PH/Sports/202608/27/video.mp4",
+                },
+            )
+
+        self.assertTrue(api_call.call_args.kwargs["retry_transient"])
 
     def test_unsuccessful_upload_keeps_local_file(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -824,11 +1041,25 @@ class PipelineTests(unittest.TestCase):
         }
 
         commands = []
+        download_run_kwargs = {}
 
-        def fake_run(command):
+        def fake_run(command, **kwargs):
             commands.append(command)
             result_path = Path(command[command.index("--result-json") + 1])
             if "facebook_followed_video_download.py" in command[1]:
+                download_run_kwargs.update(kwargs)
+                kwargs["on_line"](
+                    MODULE.VIDEO_RESULT_EVENT_PREFIX
+                    + json.dumps(
+                        {
+                            "event": "video-result",
+                            "source": "C-001",
+                            "completed": 1,
+                            "total": 1,
+                            "video": download_video,
+                        }
+                    )
+                )
                 payload = {
                     "status": "completed",
                     "sources": [{"name": "C-001", "videos": [download_video]}],
@@ -878,6 +1109,86 @@ class PipelineTests(unittest.TestCase):
             download_command[download_command.index("--max-duration-seconds") + 1],
             "1200",
         )
+        self.assertEqual(
+            download_run_kwargs["env"][MODULE.VIDEO_RESULT_EVENTS_ENV],
+            "1",
+        )
+
+    def test_unreconciled_stream_callback_leaves_execution_for_lease_retry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            args = MODULE.build_parser().parse_args(
+                [
+                    "--execute",
+                    "--backend",
+                    "https://backend.example.com",
+                    "--worker-id",
+                    "worker-01",
+                    "--state-dir",
+                    temporary,
+                ]
+            )
+            args.worker_token = "secret"
+            video = {
+                "source": "creator-one",
+                "platformVideoId": "123",
+                "originalUrl": "https://www.facebook.com/reel/123",
+                "canonicalUrl": "https://www.facebook.com/reel/123",
+                "localPath": "/tmp/video.mp4",
+                "fileName": "video.mp4",
+                "status": "downloaded",
+            }
+
+            def fake_run(command, **kwargs):
+                kwargs["on_line"](
+                    MODULE.VIDEO_RESULT_EVENT_PREFIX
+                    + json.dumps(
+                        {
+                            "event": "video-result",
+                            "completed": 1,
+                            "total": 1,
+                            "video": video,
+                        }
+                    )
+                )
+                result_path = Path(command[command.index("--result-json") + 1])
+                result_path.write_text(
+                    json.dumps(
+                        {
+                            "status": "completed",
+                            "sources": [
+                                {"name": "creator-one", "videos": [video]}
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return 0, "ok\n"
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "claim",
+                    return_value={
+                        "executionId": "E-STREAM-FAIL",
+                        "sourceName": "creator-one",
+                        "sourceUrl": "https://www.facebook.com/example/reels/",
+                    },
+                ),
+                mock.patch.object(MODULE, "heartbeat"),
+                mock.patch.object(MODULE, "run_command", side_effect=fake_run),
+                mock.patch.object(
+                    MODULE,
+                    "record_video",
+                    side_effect=MODULE.BackendError("backend unavailable"),
+                ),
+                mock.patch.object(MODULE, "complete") as complete,
+                redirect_stderr(io.StringIO()),
+            ):
+                exit_code, result = MODULE.execute_one(args)
+
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(result["retry"], "lease")
+            complete.assert_not_called()
 
     def test_partial_business_result_is_a_successful_cron_run(self):
         state = tempfile.TemporaryDirectory()
@@ -910,7 +1221,7 @@ class PipelineTests(unittest.TestCase):
             "error": "invalid video",
         }
 
-        def fake_run(command):
+        def fake_run(command, **kwargs):
             result_path = Path(command[command.index("--result-json") + 1])
             if "facebook_followed_video_download.py" in command[1]:
                 payload = {

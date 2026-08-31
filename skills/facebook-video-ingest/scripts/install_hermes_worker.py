@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Configure customer-side Hermes for browser-triggered, on-demand HM Workers."""
+"""Configure on-demand capture and reliable approved-upload Hermes Workers."""
 
 from __future__ import annotations
 
@@ -26,6 +26,9 @@ from urllib.parse import urlparse
 LEGACY_JOB_NAME = "HM 视频抓取 Worker"
 WORKER_JOB_NAME = "HM 后台任务接收 Worker"
 RUNNER_NAME = "hm_facebook_video_ingest_worker.py"
+UPLOAD_WORKER_JOB_NAME = "HM 审核上传队列 Worker"
+UPLOAD_RUNNER_NAME = "hm_capture_upload_worker.py"
+UPLOAD_WORKER_SCHEDULE = "* * * * *"
 GATEWAY_EXTENSION_SOURCE = "hm_capture_gateway_extension.py"
 GATEWAY_EXTENSION_TARGET = "hm_capture_extension.py"
 DEFAULT_API_HOST = "127.0.0.1"
@@ -44,7 +47,7 @@ SUBPROCESS_ERRORS = "replace"
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
-        description="Install or inspect the HM on-demand Hermes Worker bridge"
+        description="Install or inspect the HM capture and upload Worker bridge"
     )
     result.add_argument("--check", action="store_true")
     result.add_argument("--show-pairing-code", action="store_true")
@@ -142,18 +145,19 @@ def obsolete_job_names(list_output: str) -> list[str]:
 
 
 def install_runner(home: Path) -> Path:
-    """Keep the deterministic runner installed for migrated no-agent jobs."""
+    """Install deterministic capture and approved-upload Cron runners."""
     source = Path(__file__).resolve().with_name("hermes_cron_runner.py")
     if not source.is_file():
         raise RuntimeError(f"cron runner is missing: {source}")
     target_dir = home / "scripts"
     target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / RUNNER_NAME
     source_bytes = source.read_bytes()
-    if not target.is_file() or target.read_bytes() != source_bytes:
-        target.write_bytes(source_bytes)
-    target.chmod(0o700)
-    return target.resolve()
+    for name in (RUNNER_NAME, UPLOAD_RUNNER_NAME):
+        target = target_dir / name
+        if not target.is_file() or target.read_bytes() != source_bytes:
+            target.write_bytes(source_bytes)
+        target.chmod(0o700)
+    return (target_dir / RUNNER_NAME).resolve()
 
 
 def _replace_once(source: str, old: str, new: str, label: str) -> str:
@@ -721,6 +725,90 @@ def api_is_ready(api_base_url: str, api_key: str, timeout_seconds: float = 15) -
     return False
 
 
+def local_api_json(
+    api_base_url: str,
+    api_key: str,
+    method: str,
+    path: str,
+    payload: object = None,
+) -> dict:
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    outgoing = request.Request(
+        f"{api_base_url}{path}",
+        data=data,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "HM-Hermes-Installer/1.0",
+        },
+        method=method,
+    )
+    try:
+        with request.urlopen(outgoing, timeout=10) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:500]
+        raise RuntimeError(
+            f"Hermes local API returned HTTP {exc.code}: {detail}"
+        ) from exc
+    except (error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Hermes local API request failed: {exc}") from exc
+    if not isinstance(result, dict):
+        raise RuntimeError("Hermes local API returned an invalid response")
+    return result
+
+
+def upload_worker_job_ready(job: object) -> bool:
+    return (
+        isinstance(job, dict)
+        and job.get("name") == UPLOAD_WORKER_JOB_NAME
+        and job.get("script") == UPLOAD_RUNNER_NAME
+        and bool(job.get("no_agent"))
+        and bool(job.get("enabled"))
+        and job.get("schedule_display") == UPLOAD_WORKER_SCHEDULE
+    )
+
+
+def ensure_upload_worker_job(api_base_url: str, api_key: str) -> dict:
+    """Keep one recurring no-agent poller on the source Hermes machine."""
+    listed = local_api_json(
+        api_base_url, api_key, "GET", "/api/jobs?include_disabled=true"
+    )
+    matches = [
+        job for job in listed.get("jobs", [])
+        if isinstance(job, dict) and job.get("name") == UPLOAD_WORKER_JOB_NAME
+    ]
+    ready = [job for job in matches if upload_worker_job_ready(job)]
+    if len(ready) == 1 and len(matches) == 1:
+        return ready[0]
+    for job in matches:
+        job_id = str(job.get("id") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", job_id):
+            raise RuntimeError("Hermes upload Worker job has an invalid id")
+        local_api_json(api_base_url, api_key, "DELETE", f"/api/jobs/{job_id}")
+    created = local_api_json(
+        api_base_url,
+        api_key,
+        "POST",
+        "/api/jobs",
+        {
+            "name": UPLOAD_WORKER_JOB_NAME,
+            "schedule": UPLOAD_WORKER_SCHEDULE,
+            "prompt": "Poll and process approved HM video uploads.",
+            "deliver": "local",
+            "skills": [],
+            "script": UPLOAD_RUNNER_NAME,
+            "no_agent": True,
+            "enabled": True,
+        },
+    )
+    job = created.get("job")
+    if not upload_worker_job_ready(job):
+        raise RuntimeError("Hermes upload Worker job was not created correctly")
+    return job
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     hermes = hermes_command()
@@ -743,6 +831,13 @@ def main(argv: list[str] | None = None) -> int:
         call([hermes, "gateway", "status"], allow_failure=True)
         if len(api_key) < 16 or not api_is_ready(api_base_url, api_key, 3):
             raise RuntimeError("Hermes local API is not configured or not reachable")
+        jobs = local_api_json(
+            api_base_url, api_key, "GET", "/api/jobs?include_disabled=true"
+        ).get("jobs", [])
+        if not any(upload_worker_job_ready(job) for job in jobs):
+            raise RuntimeError(
+                "Hermes approved-upload Worker is missing; run the installer again"
+            )
         media_base_url = env_values.get("HM_CAPTURE_MEDIA_BASE_URL", "").strip()
         expected_media_token = derive_media_token(worker_token, worker_id)
         if (not media_base_url or
@@ -772,10 +867,11 @@ def main(argv: list[str] | None = None) -> int:
     stopped = stop_legacy_watchers(home)
     if not api_is_ready(api_base_url, api_key):
         raise RuntimeError(f"Hermes local API did not become ready at {api_base_url}")
+    ensure_upload_worker_job(api_base_url, api_key)
     register_media_endpoint(backend, worker_token, worker_id, media_base_url)
     print(f"Hermes local API ready: {api_base_url}")
     print(f"HM backend media endpoint registered: {media_base_url}")
-    print("On-demand mode enabled; no continuous HM capture Worker is running.")
+    print("On-demand capture enabled; approved uploads are polled every minute.")
     if stopped:
         print(f"Stopped {stopped} legacy continuous Worker process(es).")
     if not args.no_pairing_code:
