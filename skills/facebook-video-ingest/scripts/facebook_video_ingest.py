@@ -1124,6 +1124,10 @@ def queue_work_status(
     return "no-work"
 
 
+def capture_review_status(job: dict[str, Any]) -> str:
+    return "AUTO_APPROVED" if bool(job.get("autoReviewEnabled")) else "PENDING_REVIEW"
+
+
 def safely_drain_local_delete_jobs(
     args: argparse.Namespace,
     backend: str,
@@ -1332,7 +1336,7 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             "category": job.get("category"),
             "download": download_result,
             "review": {
-                "status": "PENDING_REVIEW",
+                "status": capture_review_status(job),
                 "downloaded": sum(video.get("status") == "downloaded" for video in videos),
                 "filteredOver20Minutes": sum(
                     video.get("status") == "filtered-duration"

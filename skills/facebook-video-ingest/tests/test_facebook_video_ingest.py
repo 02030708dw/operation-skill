@@ -1186,6 +1186,13 @@ class PipelineTests(unittest.TestCase):
             "PH/Sports/202608/10",
         )
 
+    def test_capture_review_status_reflects_backend_task_switch(self):
+        self.assertEqual(
+            MODULE.capture_review_status({"autoReviewEnabled": True}),
+            "AUTO_APPROVED",
+        )
+        self.assertEqual(MODULE.capture_review_status({}), "PENDING_REVIEW")
+
     def test_worker_token_has_no_command_line_argument(self):
         with mock.patch.dict(os.environ, {"HM_WORKER_TOKEN": "secret"}):
             parser = MODULE.build_parser()

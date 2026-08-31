@@ -61,7 +61,8 @@ HM only returns the matching execution.
   "sourceUrl": "https://www.facebook.com/example/reels/",
   "category": "Sports",
   "r2Prefix": "PH/Sports/202608/10",
-  "saveOriginal": true
+  "saveOriginal": true,
+  "autoReviewEnabled": false
 }
 ```
 
@@ -114,7 +115,7 @@ The JSON body supports:
 }
 ```
 
-Accepted download statuses are `DISCOVERED`, `DOWNLOADING`, `DOWNLOADED`, and `DOWNLOAD_FAILED`. Accepted upload statuses are `PENDING`, `UPLOADING`, `UPLOADED`, `SKIPPED_EXISTING`, `R2_CONFLICT`, and `UPLOAD_FAILED`. Initial capture callbacks always use `PENDING`; Cloudflare upload is forbidden until the operator approves the video.
+Accepted download statuses are `DISCOVERED`, `DOWNLOADING`, `DOWNLOADED`, and `DOWNLOAD_FAILED`. Accepted upload statuses are `PENDING`, `UPLOADING`, `UPLOADED`, `SKIPPED_EXISTING`, `R2_CONFLICT`, and `UPLOAD_FAILED`. Initial capture callbacks always use `PENDING`. HM keeps a newly downloaded record pending when task-level automatic review is disabled; when it is enabled, HM automatically marks that new record approved and enqueues its upload. Existing pending records are not bulk-approved when the switch changes. Hermes must still wait for `/uploads/claim` and never upload from the claim flag alone.
 
 The backend deduplicates videos by `(task_id, SHA-256(canonicalUrl))`. A second callback updates the same record, which is how the upload result enriches the earlier download record.
 
@@ -129,7 +130,7 @@ safe retry path.
 
 ## Approved Upload Jobs
 
-Claim an operator-approved upload with `POST /api/internal/capture/uploads/claim` and `{ "workerId": "...", "taskNo": "C-..." }`. The response includes the verified local path, SHA-256, category, and `r2Prefix`. Upload only that one file, then call `POST /api/internal/capture/uploads/{jobNo}/complete` with `status` set to `UPLOADED`, `SKIPPED_EXISTING`, `R2_CONFLICT`, or `UPLOAD_FAILED` plus the R2 fields. This is the only path that may publish a captured file to Cloudflare.
+Claim a backend-approved upload with `POST /api/internal/capture/uploads/claim` and `{ "workerId": "...", "taskNo": "C-..." }`. A job may have been approved manually or by the task's automatic-review setting; the Worker processes both identically. The response includes the verified local path, SHA-256, category, and `r2Prefix`. Upload only that one file, then call `POST /api/internal/capture/uploads/{jobNo}/complete` with `status` set to `UPLOADED`, `SKIPPED_EXISTING`, `R2_CONFLICT`, or `UPLOAD_FAILED` plus the R2 fields. This is the only path that may publish a captured file to Cloudflare.
 
 Every installed source Hermes runs a recurring no-agent `--upload-only` poller.
 Despite the legacy flag name, it drains rejected local deletions before approved

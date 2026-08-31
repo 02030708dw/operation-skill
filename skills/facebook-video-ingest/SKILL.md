@@ -1,11 +1,11 @@
 ---
 name: facebook-video-ingest
-description: Run customer-side Hermes Workers for backend-managed Facebook capture executions, filter videos over 20 minutes before download, hold downloaded videos for operator review, upload approved files to Cloudflare R2, consume rejected-file deletion jobs on the source computer, and report results to HM. Use when Hermes must install its local API, pair with the HM admin browser, create or run local Cron jobs, execute a targeted HM ingest job, or troubleshoot the local video pipeline while HM runs on another server.
+description: Run customer-side Hermes Workers for backend-managed Facebook capture executions, filter videos over 20 minutes before download, hold videos for operator review or honor task-level backend auto-review, upload approved files to Cloudflare R2, consume rejected-file deletion jobs on the source computer, and report results to HM. Use when Hermes must install its local API, pair with the HM admin browser, create or run local Cron jobs, execute a targeted HM ingest job, or troubleshoot the local video pipeline while HM runs on another server.
 ---
 
 # Facebook Video Ingest
 
-Run the HM review-gated pipeline as one idempotent Worker: backend execution claim -> duration check -> local download -> backend pending-review record. Separately claim operator-approved upload jobs and rejected-file deletion jobs on the source Hermes, then report each result to HM. Resolve `<skill-dir>` from this `SKILL.md` and invoke only its Python entry point.
+Run the HM review-gated pipeline as one idempotent Worker: backend execution claim -> duration check -> local download -> backend review decision. By default HM records the file as pending review; when that task's backend auto-review switch is enabled, HM may approve a newly downloaded file and enqueue it automatically. Separately claim backend-approved upload jobs and rejected-file deletion jobs on the source Hermes, then report each result to HM. Resolve `<skill-dir>` from this `SKILL.md` and invoke only its Python entry point.
 
 ## Boundaries
 
@@ -30,6 +30,9 @@ Run the HM review-gated pipeline as one idempotent Worker: backend execution cla
   `SKIPPED_EXISTING` and HM accepts the upload callback. Keep the file on
   conflict, upload failure, or callback failure.
 - Let the downloader and uploader enforce duplicate rules. Do not manually rewrite their archives or overwrite an R2 conflict.
+- Never infer automatic approval locally. Hermes reports the download result and
+  uploads only jobs returned by HM; the task-level `autoReviewEnabled` flag is
+  informational and HM remains the only authority that changes review state.
 
 ## Required Configuration
 
@@ -198,7 +201,12 @@ completion.
    printing either Worker or media credentials.
 2. Claim only through the HM internal Worker API. For a scheduled local Cron, include its backend task number. For immediate execution, include both the backend task and execution numbers. Never invent an execution ID, source URL, or result.
 3. Use the globally unique account name supplied by HM as the local source name. Use the backend-provided `r2Prefix` unchanged; it has the form `PH/Sports/yyyyMM/dd` and is derived from the task region, category, and execution date.
-4. Record downloaded files as `PENDING_REVIEW`. Never upload a newly captured file before an operator approves it. Upload only jobs claimed from `/api/internal/capture/uploads/claim`.
+4. Record every download result through HM and upload only jobs claimed from
+   `/api/internal/capture/uploads/claim`. With automatic review disabled, the
+   backend keeps a new download in `PENDING_REVIEW` until an operator approves
+   it. With task-level automatic review enabled, HM may approve that new record
+   and enqueue it without an operator action. Hermes must never manufacture an
+   approval or upload an unclaimed local file.
 5. The recurring source-Hermes upload Cron drains approved jobs at least once a
    minute. The HM browser may additionally start a one-shot `--upload-only
    --task-no <task-no>` runner only when its paired Worker ID matches the video's
@@ -232,7 +240,7 @@ Read [references/backend-api.md](references/backend-api.md) before changing the 
 
 ## Result Interpretation
 
-- `COMPLETED`: every selected/reused video downloaded successfully and is waiting for review, or the source exposed no videos.
+- `COMPLETED`: every selected/reused video downloaded successfully and is waiting for review or was automatically queued by HM, or the source exposed no videos.
 - `PARTIAL`: at least one selected video downloaded and entered review, while at least one other selected video failed to download.
 - `FAILED`: no item completed and the download, upload, or orchestration failed.
 - `no-work`: no queued Facebook execution, approved upload, or local-delete job was available; the continuous Worker waits and polls again.
