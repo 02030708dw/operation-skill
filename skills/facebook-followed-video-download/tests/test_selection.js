@@ -10,6 +10,7 @@ const {
   selectVideoUrls,
   videoKey,
   videoResultEventLine,
+  publishedAtFromMetadata,
 } = require('../scripts/facebook_followed_video_engine.js');
 const { parseRunLog } = require('../scripts/facebook_followed_video_report.js');
 
@@ -36,6 +37,51 @@ test('per-video event line is structured and includes batch progress', () => {
       total: 30,
       video,
     },
+  );
+});
+
+test('exact timestamp takes precedence over upload date', () => {
+  const timestamp = Date.UTC(2026, 7, 29, 14, 35, 42) / 1000;
+
+  assert.deepEqual(
+    publishedAtFromMetadata({ timestamp, upload_date: '20260829' }),
+    {
+      publishedAt: '2026-08-29T14:35:42',
+      publishedAtPrecision: 'SECOND',
+    },
+  );
+});
+
+test('release timestamp supplies seconds when timestamp is invalid', () => {
+  const releaseTimestamp = Date.UTC(2026, 7, 29, 9, 8, 7) / 1000;
+
+  assert.deepEqual(
+    publishedAtFromMetadata({
+      timestamp: 'not-a-timestamp',
+      release_timestamp: String(releaseTimestamp),
+      upload_date: '20260829',
+    }),
+    {
+      publishedAt: '2026-08-29T09:08:07',
+      publishedAtPrecision: 'SECOND',
+    },
+  );
+});
+
+test('upload date is a date-precision fallback only', () => {
+  assert.deepEqual(
+    publishedAtFromMetadata({ upload_date: '20260829' }),
+    {
+      publishedAt: '2026-08-29T00:00:00',
+      publishedAtPrecision: 'DATE',
+    },
+  );
+});
+
+test('invalid publish metadata returns no publish time', () => {
+  assert.deepEqual(
+    publishedAtFromMetadata({ timestamp: Infinity, upload_date: '20260230' }),
+    { publishedAt: null, publishedAtPrecision: null },
   );
 });
 

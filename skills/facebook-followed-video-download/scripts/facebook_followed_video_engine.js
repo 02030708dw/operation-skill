@@ -21,7 +21,7 @@ const DEFAULT_COOKIES = process.env.FACEBOOK_FOLLOWED_COOKIES || process.env.FB_
 const DEFAULT_DESKTOP = process.env.FACEBOOK_FOLLOWED_OUTPUT || process.env.FB_FOLLOWED_DESKTOP || path.join(HOME, 'Desktop', 'Facebook');
 const DEFAULT_YTDLP = process.env.FACEBOOK_FOLLOWED_YTDLP || process.env.FB_FOLLOWED_YTDLP || process.env.YTDLP || 'yt-dlp';
 const CDP_PORT = Number(process.env.FACEBOOK_FOLLOWED_CDP_PORT || process.env.FB_CDP_PORT || String(9300 + Math.floor(Math.random() * 500)));
-const SKILL_VERSION = '1.6.0';
+const SKILL_VERSION = '1.6.1';
 const VIDEO_RESULT_EVENT_PREFIX = '__HM_VIDEO_RESULT__:';
 
 function detectChrome() {
@@ -506,6 +506,7 @@ function baseVideoResult(account, url) {
     sha256: null,
     durationSeconds: null,
     publishedAt: null,
+    publishedAtPrecision: null,
     status: 'pending',
     error: null
   };
@@ -515,6 +516,40 @@ function ytdlpSessionArgs() {
   if (cookiesFile && fs.existsSync(cookiesFile)) return ['--cookies', cookiesFile];
   if (browserProfileDir) return ['--cookies-from-browser', `chrome:${browserProfileDir}`];
   return [];
+}
+
+function publishedAtFromMetadata(metadata = {}) {
+  for (const rawTimestamp of [metadata.timestamp, metadata.release_timestamp]) {
+    if (rawTimestamp === null || rawTimestamp === undefined || rawTimestamp === '') continue;
+    const timestamp = Number(rawTimestamp);
+    if (!Number.isFinite(timestamp) || timestamp <= 0) continue;
+    const value = new Date(timestamp * 1000);
+    if (!Number.isFinite(value.getTime())) continue;
+    return {
+      publishedAt: value.toISOString().slice(0, 19),
+      publishedAtPrecision: 'SECOND'
+    };
+  }
+
+  const uploadDate = String(metadata.upload_date || '');
+  if (/^\d{8}$/.test(uploadDate)) {
+    const year = Number(uploadDate.slice(0, 4));
+    const month = Number(uploadDate.slice(4, 6));
+    const day = Number(uploadDate.slice(6, 8));
+    const value = new Date(Date.UTC(year, month - 1, day));
+    if (
+      value.getUTCFullYear() === year
+      && value.getUTCMonth() === month - 1
+      && value.getUTCDate() === day
+    ) {
+      return {
+        publishedAt: `${uploadDate.slice(0, 4)}-${uploadDate.slice(4, 6)}-${uploadDate.slice(6, 8)}T00:00:00`,
+        publishedAtPrecision: 'DATE'
+      };
+    }
+  }
+
+  return { publishedAt: null, publishedAtPrecision: null };
 }
 
 function probeVideoMetadata(url) {
@@ -528,17 +563,10 @@ function probeVideoMetadata(url) {
   try {
     const metadata = JSON.parse(String(result.stdout || '').trim());
     const duration = Number(metadata.duration);
-    const timestamp = Number(metadata.timestamp || metadata.release_timestamp);
-    let publishedAt = null;
-    if (/^\d{8}$/.test(String(metadata.upload_date || ''))) {
-      const value = String(metadata.upload_date);
-      publishedAt = `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}T00:00:00`;
-    } else if (Number.isFinite(timestamp) && timestamp > 0) {
-      publishedAt = new Date(timestamp * 1000).toISOString().slice(0, 19);
-    }
+    const publishTime = publishedAtFromMetadata(metadata);
     return {
       durationSeconds: Number.isFinite(duration) && duration >= 0 ? Math.round(duration) : null,
-      publishedAt,
+      ...publishTime,
       title: metadata.title || null
     };
   } catch {
@@ -566,6 +594,7 @@ function downloadVideo(account, url, outputDir, archivePath) {
   const metadata = probeVideoMetadata(url);
   item.durationSeconds = metadata.durationSeconds ?? null;
   item.publishedAt = metadata.publishedAt ?? null;
+  item.publishedAtPrecision = metadata.publishedAtPrecision ?? null;
   item.title = metadata.title ?? null;
   if (maxDurationSeconds && item.durationSeconds !== null && item.durationSeconds > maxDurationSeconds) {
     appendArchiveOnce(archivePath, url);
@@ -786,4 +815,5 @@ module.exports = {
   selectVideoUrls,
   videoKey,
   videoResultEventLine,
+  publishedAtFromMetadata,
 };

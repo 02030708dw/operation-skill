@@ -2,7 +2,7 @@
 name: facebook-followed-video-download
 description: Find, download, or locally reuse recent permitted Facebook Page, creator, Reels, watch, or direct video URLs in per-source folders with archive-backed duplicate prevention and reports. Use when the user asks Hermes to configure followed Facebook video sources, preview recent videos, download the latest or all videos, list sources, check dependencies, or troubleshoot this downloader. Defaults to preview and downloads only with explicit execution approval.
 metadata:
-  version: "1.6.0"
+  version: "1.6.1"
   platforms:
     - windows
     - macos
@@ -155,7 +155,7 @@ Use `--source` when an orchestrator supplies one source for this execution. This
 python "<skill-dir>/scripts/facebook_followed_video_download.py" --source "C-0123456789AB" "https://www.facebook.com/example/reels/" --mode daily --initial-count 10 --execute --execution-id "E-0123456789ABCDEF" --result-json "<result.json>"
 ```
 
-`--result-json` writes the machine-readable download manifest even when the engine fails. Each successfully downloaded video includes its canonical URL, local path, byte size, and SHA-256. Use this manifest as the input to the R2 Skill; do not rediscover the output directory.
+`--result-json` writes the machine-readable download manifest even when the engine fails. Each successfully downloaded video includes its canonical URL, local path, byte size, SHA-256, and Facebook publish time when yt-dlp exposes it. `publishedAtPrecision` is `SECOND` when `timestamp` or `release_timestamp` provides an exact time, and `DATE` when only `upload_date` is available; a `DATE` value uses `T00:00:00` as a placeholder and must not be presented as an exact midnight publish time. Use this manifest as the input to the R2 Skill; do not rediscover the output directory.
 
 When a trusted orchestrator sets `HM_VIDEO_RESULT_EVENTS=1`, the entry point
 also flushes one structured stdout line immediately after each selected video
