@@ -24,6 +24,8 @@ TRANSIENT_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 TRANSIENT_BACKEND_ATTEMPTS = 6
 VIDEO_RESULT_EVENT_PREFIX = "__HM_VIDEO_RESULT__:"
 VIDEO_RESULT_EVENTS_ENV = "HM_VIDEO_RESULT_EVENTS"
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
+MAX_LOCAL_DELETE_JOBS_PER_POLL = 100
 SKILL_DIR = Path(__file__).resolve().parent.parent
 SKILLS_DIR = SKILL_DIR.parent
 DOWNLOAD_SCRIPT = (
@@ -58,6 +60,17 @@ class PipelineError(RuntimeError):
 
 class BackendError(PipelineError):
     pass
+
+
+def environment_path(name: str, fallback: Path) -> Path:
+    """Read a path setting without treating an empty value as the current directory."""
+    configured = os.getenv(name, "").strip()
+    return Path(configured).expanduser() if configured else fallback
+
+
+def absolute_path_without_resolving_links(path: Path) -> Path:
+    """Normalize an absolute path while preserving symlink components for checks."""
+    return Path(os.path.abspath(os.fspath(path.expanduser())))
 
 
 def load_env_file(path: Path) -> None:
@@ -119,7 +132,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--state-dir",
         type=Path,
-        default=Path(os.getenv("HM_INGEST_STATE_DIR", str(DEFAULT_STATE_DIR))),
+        default=environment_path("HM_INGEST_STATE_DIR", DEFAULT_STATE_DIR),
     )
     parser.add_argument(
         "--heartbeat-seconds",
@@ -144,7 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--upload-only",
         action="store_true",
-        help="skip capture claiming and immediately drain approved upload jobs",
+        help="skip capture claiming and drain approved upload and local-delete jobs",
     )
     parser.add_argument("--json", action="store_true")
     return parser
@@ -310,6 +323,44 @@ def complete_upload(
             "r2Url": video.get("r2Url"),
             "errorCode": status_error_code("DOWNLOADED", upload_status),
             "errorMessage": video.get("error"),
+        },
+        retry_transient=True,
+    )
+
+
+def claim_local_delete(
+    backend: str, token: str, worker_id: str
+) -> dict[str, Any] | None:
+    return api_call(
+        backend,
+        token,
+        "POST",
+        "/api/internal/capture/local-deletes/claim",
+        {"workerId": worker_id},
+    )
+
+
+def complete_local_delete(
+    backend: str,
+    token: str,
+    worker_id: str,
+    job_no: str,
+    status: str,
+    error_code: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    if status not in {"DELETED", "NOT_FOUND", "DELETE_FAILED"}:
+        raise PipelineError(f"unsupported local-delete status: {status}")
+    api_call(
+        backend,
+        token,
+        "POST",
+        f"/api/internal/capture/local-deletes/{job_no}/complete",
+        {
+            "workerId": worker_id,
+            "status": status,
+            "errorCode": error_code,
+            "errorMessage": error_message,
         },
         retry_transient=True,
     )
@@ -920,6 +971,174 @@ def drain_upload_jobs(
     return results
 
 
+def local_delete_roots(state_dir: Path) -> list[Path]:
+    """Return the same local media roots accepted by the Hermes Gateway."""
+    desktop_facebook = Path.home() / "Desktop" / "Facebook"
+    configured = [
+        state_dir,
+        environment_path("HM_INGEST_STATE_DIR", DEFAULT_STATE_DIR),
+        environment_path("FACEBOOK_FOLLOWED_OUTPUT", desktop_facebook),
+        environment_path("FB_FOLLOWED_DESKTOP", desktop_facebook),
+    ]
+    roots: list[Path] = []
+    for value in configured:
+        root = absolute_path_without_resolving_links(value)
+        if root not in roots:
+            roots.append(root)
+    return roots
+
+
+def resolve_local_delete_path(value: object, state_dir: Path) -> Path:
+    """Resolve a backend-queued path without allowing deletion outside media roots."""
+    raw_value = str(value or "").strip()
+    if not raw_value:
+        raise ValueError("local path is missing")
+    candidate = absolute_path_without_resolving_links(Path(raw_value))
+    if candidate.suffix.lower() not in VIDEO_EXTENSIONS:
+        raise ValueError("local path is not a supported video")
+    for root in local_delete_roots(state_dir):
+        candidate_base = root
+        try:
+            relative = candidate.relative_to(candidate_base)
+        except ValueError:
+            candidate_base = root.resolve()
+            try:
+                relative = candidate.relative_to(candidate_base)
+            except ValueError:
+                continue
+        current = candidate_base
+        for segment in relative.parts:
+            current /= segment
+            if current.is_symlink():
+                raise PermissionError(
+                    "local video path contains a symbolic link"
+                )
+        try:
+            candidate.resolve(strict=False).relative_to(root.resolve())
+        except ValueError as exc:
+            raise PermissionError(
+                "local video resolves outside configured media roots"
+            ) from exc
+        return candidate
+    raise PermissionError("local video is outside configured media roots")
+
+
+def process_local_delete_job(
+    args: argparse.Namespace,
+    backend: str,
+    token: str,
+    worker_id: str,
+    job: dict[str, Any],
+) -> dict[str, Any]:
+    """Delete one rejected source file locally and report a terminal outcome."""
+    job_no = str(job.get("jobNo") or "").strip()
+    if state_segment(job_no) != job_no:
+        raise PipelineError("backend local-delete jobNo is invalid")
+
+    status = "DELETE_FAILED"
+    error_code: str | None = None
+    error_message: str | None = None
+    file_name: str | None = None
+    try:
+        job_worker_id = str(job.get("workerId") or "").strip()
+        if job_worker_id and job_worker_id != worker_id:
+            raise PermissionError("local-delete job belongs to another Worker")
+        target = resolve_local_delete_path(job.get("localPath"), args.state_dir)
+        file_name = target.name
+        try:
+            target.unlink()
+            status = "DELETED"
+        except FileNotFoundError:
+            status = "NOT_FOUND"
+    except PermissionError as exc:
+        error_code = "LOCAL_PATH_FORBIDDEN"
+        error_message = str(exc)[:500]
+    except (OSError, RuntimeError, ValueError) as exc:
+        error_code = "LOCAL_DELETE_FAILED"
+        error_message = str(exc)[:500]
+
+    complete_local_delete(
+        backend,
+        token,
+        worker_id,
+        job_no,
+        status,
+        error_code,
+        error_message,
+    )
+    return {
+        "jobNo": job_no,
+        "videoNo": job.get("videoNo"),
+        "taskNo": job.get("taskNo"),
+        "status": status,
+        "fileName": file_name,
+        "errorCode": error_code,
+        "errorMessage": error_message,
+    }
+
+
+def drain_local_delete_jobs(
+    args: argparse.Namespace,
+    backend: str,
+    token: str,
+    worker_id: str,
+) -> list[dict[str, Any]]:
+    """Drain a bounded batch so a repeatedly failing job cannot spin forever."""
+    results: list[dict[str, Any]] = []
+    for _ in range(MAX_LOCAL_DELETE_JOBS_PER_POLL):
+        job = claim_local_delete(backend, token, worker_id)
+        if job is None:
+            break
+        try:
+            result = process_local_delete_job(
+                args, backend, token, worker_id, job
+            )
+        except BackendError:
+            raise
+        except Exception as exc:
+            print(
+                f"Local-delete job failed ({job.get('jobNo')}): {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            break
+        results.append(result)
+        if result["status"] == "DELETE_FAILED":
+            break
+    return results
+
+
+def queue_work_status(
+    uploads: list[dict[str, Any]],
+    local_deletes: list[dict[str, Any]],
+    local_delete_error: str | None = None,
+) -> str:
+    if local_delete_error:
+        return "queue-work-partial" if uploads or local_deletes else "queue-work-warning"
+    if uploads and local_deletes:
+        return "queue-work-completed"
+    if uploads:
+        return "uploads-completed"
+    if local_deletes:
+        return "local-deletes-completed"
+    return "no-work"
+
+
+def safely_drain_local_delete_jobs(
+    args: argparse.Namespace,
+    backend: str,
+    token: str,
+    worker_id: str,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Keep an unavailable delete API from blocking the established upload queue."""
+    try:
+        return drain_local_delete_jobs(args, backend, token, worker_id), None
+    except BackendError as exc:
+        message = str(exc)[:1000]
+        print(f"Local-delete queue warning: {message}", file=sys.stderr, flush=True)
+        return [], message
+
+
 def check(args: argparse.Namespace) -> int:
     checks = {
         "skill": SKILL_NAME,
@@ -974,14 +1193,23 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         # upload processing. The next invocation refreshes registration again.
         print(f"Media endpoint registration warning: {exc}", file=sys.stderr)
     if args.upload_only:
+        local_deletes, local_delete_error = safely_drain_local_delete_jobs(
+            args, backend, token, worker_id
+        )
         uploads = drain_upload_jobs(args, backend, token, worker_id, args.task_no)
-        return 0, {
+        result = {
             "schemaVersion": "1.0",
             "skill": SKILL_NAME,
-            "status": "uploads-completed" if uploads else "no-work",
+            "status": queue_work_status(
+                uploads, local_deletes, local_delete_error
+            ),
             "taskNo": args.task_no.strip().upper() or None,
             "uploads": uploads,
+            "localDeletes": local_deletes,
         }
+        if local_delete_error:
+            result["localDeleteError"] = local_delete_error
+        return 0, result
     deadline = time.monotonic() + args.wait_for_work_seconds
     while True:
         job = claim(backend, token, worker_id, args.task_no, args.execution_no)
@@ -990,20 +1218,32 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         remaining = deadline - time.monotonic()
         threading.Event().wait(min(args.poll_seconds, max(0, remaining)))
     if job is None:
+        local_deletes, local_delete_error = safely_drain_local_delete_jobs(
+            args, backend, token, worker_id
+        )
         uploads = drain_upload_jobs(args, backend, token, worker_id, args.task_no)
-        if uploads:
-            return 0, {
+        status = queue_work_status(uploads, local_deletes, local_delete_error)
+        if status != "no-work":
+            result = {
                 "schemaVersion": "1.0",
                 "skill": SKILL_NAME,
-                "status": "uploads-completed",
+                "status": status,
+                "taskNo": args.task_no.strip().upper() or None,
+                "executionNo": args.execution_no.strip().upper() or None,
                 "uploads": uploads,
+                "localDeletes": local_deletes,
             }
+            if local_delete_error:
+                result["localDeleteError"] = local_delete_error
+            return 0, result
         result = {
             "schemaVersion": "1.0",
             "skill": SKILL_NAME,
             "status": "no-work",
             "taskNo": args.task_no.strip().upper() or None,
             "executionNo": args.execution_no.strip().upper() or None,
+            "uploads": uploads,
+            "localDeletes": local_deletes,
         }
         if args.execution_no.strip():
             target = f" for execution {args.execution_no.strip().upper()}"
@@ -1127,6 +1367,14 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             None if terminal_status == "COMPLETED" else "One or more download items failed",
         )
         try:
+            combined["localDeletes"] = drain_local_delete_jobs(
+                args, backend, token, worker_id
+            )
+        except Exception as local_delete_error:
+            # Capture completion is already durable. The recurring queue poller
+            # can reclaim this delete job after its backend lease expires.
+            combined["localDeleteError"] = str(local_delete_error)
+        try:
             combined["approvedUploads"] = drain_upload_jobs(
                 args, backend, token, worker_id, str(job.get("taskId") or args.task_no)
             )
@@ -1195,7 +1443,7 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 if args.json:
                     print(json.dumps(result, ensure_ascii=False, indent=2))
-                if result.get("status") == "no-work":
+                if result.get("status") in {"no-work", "queue-work-warning"}:
                     threading.Event().wait(args.poll_seconds)
                 elif exit_code:
                     print("Job failed; result was recorded. Continuing to poll.", file=sys.stderr)

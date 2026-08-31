@@ -22,15 +22,17 @@ X-HM-Worker-Token: <secret>
 The backend accepts only explicit-port HTTP URLs whose host is a private IPv4
 or `127.0.0.1`. It stores no Hermes API key. Both sides independently derive a
 Worker-specific HMAC media token from `HM_WORKER_TOKEN` and `workerId`. Hermes
-accepts that token only on GET/DELETE `/api/hm-capture/video`; every other
+accepts that token on the GET `/api/hm-capture/video` preview route; every other
 Gateway route continues to require `API_SERVER_KEY`.
 
 Authenticated HM operators request
 `GET /api/capture/videos/{videoNo}/preview`; HM checks ownership, resolves the
 task's `hermes_worker_id`, and streams the file from that registered Worker.
 After an operator has saved a rejection, HM calls
-`DELETE /api/capture/videos/{videoNo}/local-file` and forwards the deletion to
-the same Worker. A Worker 404 is treated as idempotent deletion success.
+`DELETE /api/capture/videos/{videoNo}/local-file`. That operator endpoint queues
+a deletion for the video's owning Worker and returns immediately; it does not
+connect back to Hermes. The source Hermes claims and executes the deletion via
+the outbound Worker API described below.
 
 ## Claim
 
@@ -130,9 +132,11 @@ safe retry path.
 Claim an operator-approved upload with `POST /api/internal/capture/uploads/claim` and `{ "workerId": "...", "taskNo": "C-..." }`. The response includes the verified local path, SHA-256, category, and `r2Prefix`. Upload only that one file, then call `POST /api/internal/capture/uploads/{jobNo}/complete` with `status` set to `UPLOADED`, `SKIPPED_EXISTING`, `R2_CONFLICT`, or `UPLOAD_FAILED` plus the R2 fields. This is the only path that may publish a captured file to Cloudflare.
 
 Every installed source Hermes runs a recurring no-agent `--upload-only` poller.
-This outbound poller is the delivery path when an operator reviews from another
-computer; the browser's loopback Hermes is only an optional same-machine
-acceleration. Claim continues to require the task's owning Worker ID.
+Despite the legacy flag name, it drains rejected local deletions before approved
+uploads so rejected files release disk space promptly. This outbound poller is the delivery path when an operator reviews
+from another computer; the browser's loopback Hermes is only an optional
+same-machine acceleration. Claims continue to require the task's owning Worker
+ID.
 
 Keep the local file until the complete callback returns successfully. After an
 accepted `UPLOADED` or `SKIPPED_EXISTING` callback, delete that job's exact
@@ -145,6 +149,70 @@ idempotent success only when job status, upload status, R2 bucket/key/URL, and
 error fields all match the stored terminal result. Any changed field or Worker
 still returns conflict. After an accepted successful callback, delete the file
 and remove the journal; replay an unfinished journal on later upload polls.
+
+## Rejected Local-Delete Jobs
+
+The operator endpoint `DELETE /api/capture/videos/{videoNo}/local-file` is
+available only for a rejected video. HM records a local-delete job for the
+video's owning Worker and clears the video's active local-path marker so the UI
+does not offer the same action again. Deletion itself is asynchronous and is
+performed only by the source Hermes computer.
+
+The recurring source-Hermes `--execute --upload-only` poller claims deletion
+work with:
+
+```http
+POST /api/internal/capture/local-deletes/claim
+Content-Type: application/json
+X-HM-Worker-Token: <secret>
+
+{"workerId":"hermes-worker-01"}
+```
+
+`data` is `null` when that Worker has no queued deletion. A claimed job contains:
+
+```json
+{
+  "jobNo": "D-0123456789ABCDEF",
+  "videoNo": "V-0123456789ABCDEF",
+  "taskNo": "C-0123456789AB",
+  "workerId": "hermes-worker-01",
+  "localPath": "/data/facebook/video.mp4"
+}
+```
+
+Before unlinking, resolve the exact path and require a supported video extension
+under `HM_INGEST_STATE_DIR`, `FACEBOOK_FOLLOWED_OUTPUT`,
+`FB_FOLLOWED_DESKTOP`, or the default `~/Desktop/Facebook` root. Symlinks that
+resolve outside those roots are forbidden, as are the final symlink and any
+symlink component below an allowed root even when its target remains inside the
+root. Empty path environment variables fall back to the documented defaults;
+they must never make the current working directory an allowed root. Report an
+already-missing file as `NOT_FOUND`; never treat an unsafe path as missing.
+
+Complete the claimed job with:
+
+```http
+POST /api/internal/capture/local-deletes/D-0123456789ABCDEF/complete
+Content-Type: application/json
+X-HM-Worker-Token: <secret>
+
+{
+  "workerId": "hermes-worker-01",
+  "status": "DELETED",
+  "errorCode": null,
+  "errorMessage": null
+}
+```
+
+Allowed statuses are `DELETED`, `NOT_FOUND`, and `DELETE_FAILED`. Use
+`DELETE_FAILED` with bounded error fields for a forbidden path, Worker mismatch,
+or filesystem failure. The Worker drains a bounded number of jobs per poll and
+stops the current drain after `DELETE_FAILED`, preventing an immediately
+requeued failure from looping forever. A callback interrupted after unlink is
+safe: the next claim reports `NOT_FOUND`. A claim or completion error is exposed
+as `localDeleteError`, but the same poll still drains approved uploads so a
+rolling backend deployment or one conflicted callback cannot block publishing.
 
 ## Complete
 

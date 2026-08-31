@@ -858,6 +858,312 @@ class PipelineTests(unittest.TestCase):
 
         self.assertTrue(api_call.call_args.kwargs["retry_transient"])
 
+    def test_local_delete_claim_and_complete_use_worker_queue_contract(self):
+        with mock.patch.object(
+            MODULE,
+            "api_call",
+            return_value={"jobNo": "D-001", "videoNo": "V-001"},
+        ) as api_call:
+            claimed = MODULE.claim_local_delete(
+                "https://backend.example.com", "secret", "worker-01"
+            )
+            MODULE.complete_local_delete(
+                "https://backend.example.com",
+                "secret",
+                "worker-01",
+                "D-001",
+                "DELETED",
+            )
+
+        self.assertEqual(claimed["jobNo"], "D-001")
+        self.assertEqual(
+            api_call.call_args_list[0].args[3],
+            "/api/internal/capture/local-deletes/claim",
+        )
+        self.assertEqual(api_call.call_args_list[0].args[4], {"workerId": "worker-01"})
+        self.assertEqual(
+            api_call.call_args_list[1].args[3],
+            "/api/internal/capture/local-deletes/D-001/complete",
+        )
+        self.assertEqual(
+            api_call.call_args_list[1].args[4],
+            {
+                "workerId": "worker-01",
+                "status": "DELETED",
+                "errorCode": None,
+                "errorMessage": None,
+            },
+        )
+        self.assertTrue(api_call.call_args_list[1].kwargs["retry_transient"])
+
+    def test_local_delete_job_deletes_only_from_allowed_media_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_dir = root / "state"
+            video = state_dir / "E-001" / "video.mp4"
+            video.parent.mkdir(parents=True)
+            video.write_bytes(b"video")
+            args = MODULE.build_parser().parse_args(
+                ["--check", "--state-dir", str(state_dir)]
+            )
+            job = {
+                "jobNo": "D-001",
+                "videoNo": "V-001",
+                "taskNo": "C-001",
+                "workerId": "worker-01",
+                "localPath": str(video),
+            }
+
+            with mock.patch.object(MODULE, "complete_local_delete") as complete:
+                result = MODULE.process_local_delete_job(
+                    args,
+                    "https://backend.example.com",
+                    "secret",
+                    "worker-01",
+                    job,
+                )
+
+            self.assertEqual(result["status"], "DELETED")
+            self.assertFalse(video.exists())
+            self.assertEqual(complete.call_args.args[4], "DELETED")
+
+            outside = root / "outside.mp4"
+            outside.write_bytes(b"video")
+            job["jobNo"] = "D-002"
+            job["localPath"] = str(outside)
+            with mock.patch.object(MODULE, "complete_local_delete") as complete:
+                result = MODULE.process_local_delete_job(
+                    args,
+                    "https://backend.example.com",
+                    "secret",
+                    "worker-01",
+                    job,
+                )
+
+            self.assertEqual(result["status"], "DELETE_FAILED")
+            self.assertEqual(result["errorCode"], "LOCAL_PATH_FORBIDDEN")
+            self.assertTrue(outside.exists())
+            self.assertEqual(complete.call_args.args[4], "DELETE_FAILED")
+
+    @unittest.skipIf(os.name == "nt", "symlink creation may require elevated privileges")
+    def test_local_delete_rejects_final_and_parent_symlinks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "state"
+            state_dir.mkdir()
+            target = state_dir / "target.mp4"
+            target.write_bytes(b"target")
+            final_link = state_dir / "linked.mp4"
+            final_link.symlink_to(target)
+            args = MODULE.build_parser().parse_args(
+                ["--check", "--state-dir", str(state_dir)]
+            )
+
+            with mock.patch.object(MODULE, "complete_local_delete"):
+                result = MODULE.process_local_delete_job(
+                    args,
+                    "https://backend.example.com",
+                    "secret",
+                    "worker-01",
+                    {
+                        "jobNo": "D-LINK-1",
+                        "workerId": "worker-01",
+                        "localPath": str(final_link),
+                    },
+                )
+
+            self.assertEqual(result["status"], "DELETE_FAILED")
+            self.assertEqual(result["errorCode"], "LOCAL_PATH_FORBIDDEN")
+            self.assertTrue(final_link.is_symlink())
+            self.assertTrue(target.exists())
+
+            real_directory = state_dir / "real"
+            real_directory.mkdir()
+            nested_target = real_directory / "nested.mp4"
+            nested_target.write_bytes(b"nested")
+            parent_link = state_dir / "linked-directory"
+            parent_link.symlink_to(real_directory, target_is_directory=True)
+            with mock.patch.object(MODULE, "complete_local_delete"):
+                result = MODULE.process_local_delete_job(
+                    args,
+                    "https://backend.example.com",
+                    "secret",
+                    "worker-01",
+                    {
+                        "jobNo": "D-LINK-2",
+                        "workerId": "worker-01",
+                        "localPath": str(parent_link / "nested.mp4"),
+                    },
+                )
+
+            self.assertEqual(result["status"], "DELETE_FAILED")
+            self.assertTrue(parent_link.is_symlink())
+            self.assertTrue(nested_target.exists())
+
+    def test_empty_media_path_environment_uses_safe_defaults(self):
+        empty_paths = {
+            "HM_INGEST_STATE_DIR": "  ",
+            "FACEBOOK_FOLLOWED_OUTPUT": "",
+            "FB_FOLLOWED_DESKTOP": "\t",
+        }
+        with mock.patch.dict(os.environ, empty_paths, clear=False):
+            args = MODULE.build_parser().parse_args(["--check"])
+            roots = MODULE.local_delete_roots(args.state_dir)
+
+        self.assertEqual(args.state_dir, MODULE.DEFAULT_STATE_DIR)
+        self.assertIn(MODULE.DEFAULT_STATE_DIR.expanduser().absolute(), roots)
+        self.assertNotIn(Path.cwd().resolve(), roots)
+
+    def test_local_delete_missing_file_reports_not_found(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state_dir = Path(temporary) / "state"
+            args = MODULE.build_parser().parse_args(
+                ["--check", "--state-dir", str(state_dir)]
+            )
+            with mock.patch.object(MODULE, "complete_local_delete") as complete:
+                result = MODULE.process_local_delete_job(
+                    args,
+                    "https://backend.example.com",
+                    "secret",
+                    "worker-01",
+                    {
+                        "jobNo": "D-003",
+                        "videoNo": "V-003",
+                        "workerId": "worker-01",
+                        "localPath": str(state_dir / "missing.mp4"),
+                    },
+                )
+
+            self.assertEqual(result["status"], "NOT_FOUND")
+            self.assertEqual(complete.call_args.args[4], "NOT_FOUND")
+
+    def test_local_delete_drain_stops_after_one_failed_job(self):
+        args = MODULE.build_parser().parse_args(["--check"])
+        failed = {"jobNo": "D-004", "status": "DELETE_FAILED"}
+        with (
+            mock.patch.object(
+                MODULE,
+                "claim_local_delete",
+                return_value={"jobNo": "D-004"},
+            ) as claim,
+            mock.patch.object(
+                MODULE, "process_local_delete_job", return_value=failed
+            ),
+        ):
+            results = MODULE.drain_local_delete_jobs(
+                args,
+                "https://backend.example.com",
+                "secret",
+                "worker-01",
+            )
+
+        self.assertEqual(results, [failed])
+        claim.assert_called_once()
+
+    def test_upload_only_reports_local_delete_work(self):
+        args = MODULE.build_parser().parse_args(
+            [
+                "--execute",
+                "--upload-only",
+                "--backend",
+                "https://backend.example.com",
+                "--worker-id",
+                "worker-01",
+            ]
+        )
+        args.worker_token = "secret"
+        deleted = [{"jobNo": "D-005", "status": "DELETED"}]
+        drain_order = []
+
+        def drain_local_deletes(*unused_args):
+            drain_order.append("local-delete")
+            return deleted
+
+        def drain_uploads(*unused_args):
+            drain_order.append("upload")
+            return []
+
+        with (
+            mock.patch.object(MODULE, "register_media_endpoint"),
+            mock.patch.object(
+                MODULE, "drain_local_delete_jobs", side_effect=drain_local_deletes
+            ),
+            mock.patch.object(
+                MODULE, "drain_upload_jobs", side_effect=drain_uploads
+            ),
+        ):
+            exit_code, result = MODULE.execute_one(args)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(drain_order, ["local-delete", "upload"])
+        self.assertEqual(result["status"], "local-deletes-completed")
+        self.assertEqual(result["localDeletes"], deleted)
+
+    def test_upload_only_delete_api_error_does_not_block_uploads(self):
+        args = MODULE.build_parser().parse_args(
+            [
+                "--execute",
+                "--upload-only",
+                "--backend",
+                "https://backend.example.com",
+                "--worker-id",
+                "worker-01",
+            ]
+        )
+        args.worker_token = "secret"
+        uploaded = [{"jobNo": "U-001", "status": "UPLOADED"}]
+        with (
+            mock.patch.object(MODULE, "register_media_endpoint"),
+            mock.patch.object(
+                MODULE,
+                "drain_local_delete_jobs",
+                side_effect=MODULE.BackendError("backend returned HTTP 404"),
+            ),
+            mock.patch.object(
+                MODULE, "drain_upload_jobs", return_value=uploaded
+            ) as drain_uploads,
+            redirect_stderr(io.StringIO()),
+        ):
+            exit_code, result = MODULE.execute_one(args)
+
+        self.assertEqual(exit_code, 0)
+        drain_uploads.assert_called_once()
+        self.assertEqual(result["uploads"], uploaded)
+        self.assertEqual(result["status"], "queue-work-partial")
+        self.assertIn("HTTP 404", result["localDeleteError"])
+
+    def test_no_capture_delete_callback_conflict_does_not_block_uploads(self):
+        args = MODULE.build_parser().parse_args(
+            [
+                "--execute",
+                "--backend",
+                "https://backend.example.com",
+                "--worker-id",
+                "worker-01",
+            ]
+        )
+        args.worker_token = "secret"
+        uploaded = [{"jobNo": "U-002", "status": "UPLOADED"}]
+        with (
+            mock.patch.object(MODULE, "register_media_endpoint"),
+            mock.patch.object(MODULE, "claim", return_value=None),
+            mock.patch.object(
+                MODULE,
+                "drain_local_delete_jobs",
+                side_effect=MODULE.BackendError("backend returned HTTP 409"),
+            ),
+            mock.patch.object(
+                MODULE, "drain_upload_jobs", return_value=uploaded
+            ) as drain_uploads,
+            redirect_stderr(io.StringIO()),
+        ):
+            exit_code, result = MODULE.execute_one(args)
+
+        self.assertEqual(exit_code, 0)
+        drain_uploads.assert_called_once()
+        self.assertEqual(result["uploads"], uploaded)
+        self.assertEqual(result["status"], "queue-work-partial")
+        self.assertIn("HTTP 409", result["localDeleteError"])
+
     def test_unsuccessful_upload_keeps_local_file(self):
         with tempfile.TemporaryDirectory() as temporary:
             local_video = Path(temporary) / "video.mp4"
@@ -962,10 +1268,12 @@ class PipelineTests(unittest.TestCase):
         with (
             mock.patch.object(MODULE, "claim", return_value=None),
             mock.patch.object(MODULE, "claim_upload", return_value=None),
+            mock.patch.object(MODULE, "claim_local_delete", return_value=None),
         ):
             exit_code, result = MODULE.execute_one(args)
         self.assertEqual(exit_code, 0)
         self.assertEqual(result["status"], "no-work")
+        self.assertEqual(result["localDeletes"], [])
 
     def test_targeted_claim_sends_backend_task_number(self):
         captured = {}
@@ -1093,6 +1401,7 @@ class PipelineTests(unittest.TestCase):
             mock.patch.object(MODULE, "record_video") as record,
             mock.patch.object(MODULE, "complete") as complete,
             mock.patch.object(MODULE, "claim_upload", return_value=None),
+            mock.patch.object(MODULE, "claim_local_delete", return_value=None),
         ):
             exit_code, result = MODULE.execute_one(args)
 
@@ -1256,6 +1565,7 @@ class PipelineTests(unittest.TestCase):
             mock.patch.object(MODULE, "record_video"),
             mock.patch.object(MODULE, "complete") as complete,
             mock.patch.object(MODULE, "claim_upload", return_value=None),
+            mock.patch.object(MODULE, "claim_local_delete", return_value=None),
         ):
             exit_code, result = MODULE.execute_one(args)
 

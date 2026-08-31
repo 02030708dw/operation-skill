@@ -1,28 +1,32 @@
 ---
 name: facebook-video-ingest
-description: Run customer-side Hermes Workers for backend-managed Facebook capture executions, filter videos over 20 minutes before download, hold downloaded videos for operator review, automatically upload approved files to Cloudflare R2, and report results to HM. Use when Hermes must install its local API, pair with the HM admin browser, create or run local Cron jobs, execute a targeted HM ingest job, or troubleshoot the local video pipeline while HM runs on another server.
+description: Run customer-side Hermes Workers for backend-managed Facebook capture executions, filter videos over 20 minutes before download, hold downloaded videos for operator review, upload approved files to Cloudflare R2, consume rejected-file deletion jobs on the source computer, and report results to HM. Use when Hermes must install its local API, pair with the HM admin browser, create or run local Cron jobs, execute a targeted HM ingest job, or troubleshoot the local video pipeline while HM runs on another server.
 ---
 
 # Facebook Video Ingest
 
-Run the HM review-gated pipeline as one idempotent Worker: backend execution claim -> duration check -> local download -> backend pending-review record. Separately claim operator-approved upload jobs, upload verified files to Cloudflare R2, and report the result. Resolve `<skill-dir>` from this `SKILL.md` and invoke only its Python entry point.
+Run the HM review-gated pipeline as one idempotent Worker: backend execution claim -> duration check -> local download -> backend pending-review record. Separately claim operator-approved upload jobs and rejected-file deletion jobs on the source Hermes, then report each result to HM. Resolve `<skill-dir>` from this `SKILL.md` and invoke only its Python entry point.
 
 ## Boundaries
 
 - Treat HM as the task schedule and execution source. The production backend queues work but never calls a server-local Hermes CLI.
 - Keep browser pairing on `127.0.0.1`. The installer may bind Hermes Gateway to
-  `0.0.0.0:8642` only to let the HM backend reach the exact GET/DELETE
-  `/api/hm-capture/video` routes through a dedicated derived media token. Use
-  this only on a trusted LAN/VPN and restrict the host firewall to the HM
-  backend. All other Hermes routes still require `API_SERVER_KEY`.
+  `0.0.0.0:8642` only to let the HM backend reach the exact GET
+  `/api/hm-capture/video` preview route through a dedicated derived media token.
+  Manual local deletion does not use an inbound backend-to-Hermes DELETE call;
+  the source Hermes claims it from HM. Use the Gateway listener only on a
+  trusted LAN/VPN and restrict the host firewall to the HM backend. All other
+  Hermes routes still require `API_SERVER_KEY`.
 - Create capture Workers only when their task Cron fires. Keep the installer's
-  no-agent approved-upload poller enabled so reviews submitted from any computer
-  are processed by the Hermes machine that owns the local source file.
+  no-agent review-queue poller enabled so uploads and local deletions requested
+  from any computer are processed by the Hermes machine that owns the source
+  file.
 - Download only public content or content the user is authorized to save. Never bypass privacy, login, DRM, payment, or rate-limit controls.
 - Read Worker and R2 secrets only from environment variables. Never print them or place them in command arguments.
-- Retain local files while review or upload can still be retried. Delete a rejected
-  file through the authenticated backend-to-Worker media proxy after the rejection is saved.
-  Delete an approved file only after R2 reports `UPLOADED` or
+- Retain local files while review or upload can still be retried. Delete a
+  rejected file only after the source Hermes claims HM's local-delete queue job;
+  validate the path against the configured ingest roots and report `DELETED`,
+  `NOT_FOUND`, or `DELETE_FAILED`. Delete an approved file only after R2 reports `UPLOADED` or
   `SKIPPED_EXISTING` and HM accepts the upload callback. Keep the file on
   conflict, upload failure, or callback failure.
 - Let the downloader and uploader enforce duplicate rules. Do not manually rewrite their archives or overwrite an R2 conflict.
@@ -132,7 +136,8 @@ The legacy receiver writes operational output to
 Its backend client sends an explicit `HM-Hermes-Worker` user agent so Cloudflare
 does not reject Python's default `urllib` fingerprint with error 1010.
 
-To diagnose only the approved-upload queue without claiming capture work, use:
+To diagnose the approved-upload and rejected-file deletion queues without
+claiming capture work, use:
 
 ```text
 python "<skill-dir>/scripts/facebook_video_ingest.py" --watch --upload-only
@@ -161,9 +166,11 @@ storage and is never sent to HM; the backend can use only the restricted media
 token it derives independently.
 
 The installer also maintains one `HM 审核上传队列 Worker` no-agent Cron that
-polls every minute. It runs `--execute --upload-only`, never claims capture
-executions, and is the correctness path for cross-computer review. A browser on
-the source computer may still start a one-shot upload as a latency optimization.
+polls every minute. Despite its legacy name, `--execute --upload-only` drains
+local-delete jobs before approved uploads to free disk space promptly, never
+claims capture executions,
+and is the correctness path for cross-computer review. A browser on the source
+computer may still start a one-shot upload as a latency optimization.
 
 The installer removes the old `HM 后台任务接收 Worker`, `HM 视频抓取 Worker`,
 and stale `HM 立即抓取 C-*` jobs, and stops the old continuous `--watch`
@@ -209,8 +216,17 @@ completion.
    must replay unfinished callbacks and local deletes. Repeating an identical
    terminal callback is safe, but a different Worker or result must remain a
    conflict.
-10. Complete every claimed execution as `COMPLETED`, `PARTIAL`, or `FAILED`. If a backend callback fails, leave the execution running for lease retry and do not claim that HM recorded completion.
-11. Do not impose a short overall timeout. Monitor the same active process rather than starting a duplicate.
+10. Claim rejected-file deletion only from
+    `/api/internal/capture/local-deletes/claim`. Accept only video paths beneath
+    `HM_INGEST_STATE_DIR` or the configured `Desktop/Facebook` roots, and reject
+    a symbolic link in the final file or any descendant path component. Report
+    a missing allowed file as `NOT_FOUND`; report an unsafe path or unlink
+    failure as `DELETE_FAILED`. Stop the current drain after a failed deletion
+    so a backend retry policy cannot make one Cron invocation loop forever. A
+    missing or incompatible local-delete API must be reported in
+    `localDeleteError` without preventing approved uploads in the same poll.
+11. Complete every claimed execution as `COMPLETED`, `PARTIAL`, or `FAILED`. If a backend callback fails, leave the execution running for lease retry and do not claim that HM recorded completion.
+12. Do not impose a short overall timeout. Monitor the same active process rather than starting a duplicate.
 
 Read [references/backend-api.md](references/backend-api.md) before changing the backend contract or diagnosing claim, heartbeat, callback, or lease behavior.
 
@@ -219,6 +235,6 @@ Read [references/backend-api.md](references/backend-api.md) before changing the 
 - `COMPLETED`: every selected/reused video downloaded successfully and is waiting for review, or the source exposed no videos.
 - `PARTIAL`: at least one selected video downloaded and entered review, while at least one other selected video failed to download.
 - `FAILED`: no item completed and the download, upload, or orchestration failed.
-- `no-work`: no queued Facebook execution was available; the continuous Worker waits and polls again.
+- `no-work`: no queued Facebook execution, approved upload, or local-delete job was available; the continuous Worker waits and polls again.
 
 Use the HM task detail API for per-video fields and the execution-history API for progress, terminal status, error, and combined result JSON.
