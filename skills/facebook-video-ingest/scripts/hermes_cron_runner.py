@@ -7,12 +7,14 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import IO
 
 
+RUNNER_REVISION = "r2"
 TASK_RUNNER_PATTERN = re.compile(
-    r"^hm_capture_(C-[A-Za-z0-9-]+)_(?:\d{4}|immediate)$",
+    r"^hm_capture_(C-[A-Za-z0-9-]+)_(?:\d{4}|immediate)(?:_r\d+)?$",
     re.IGNORECASE,
 )
 EXECUTION_RUNNER_PATTERN = re.compile(
@@ -24,6 +26,7 @@ UPLOAD_RUNNER_PATTERN = re.compile(
     re.IGNORECASE,
 )
 UPLOAD_QUEUE_RUNNER_NAME = "hm_capture_upload_worker"
+CAPTURE_QUEUE_RUNNER_NAME = "hm_capture_queue_worker"
 
 
 def hermes_home() -> Path:
@@ -112,6 +115,8 @@ def worker_command(worker: Path, runner: Path) -> list[str]:
         return [
             sys.executable, str(worker), "--execute", "--upload-only", "--json",
         ]
+    if runner.stem.lower() == CAPTURE_QUEUE_RUNNER_NAME:
+        return [sys.executable, str(worker), "--execute", "--json"]
     if UPLOAD_RUNNER_PATTERN.fullmatch(runner.stem):
         return [
             sys.executable, str(worker), "--execute", "--upload-only",
@@ -121,9 +126,8 @@ def worker_command(worker: Path, runner: Path) -> list[str]:
         return [sys.executable, str(worker), "--watch"]
     command = [sys.executable, str(worker), "--execute"]
     if task_no:
-        wait_seconds = "90" if execution_no else "30"
         command.extend(
-            ["--task-no", task_no, "--wait-for-work-seconds", wait_seconds]
+            ["--task-no", task_no, "--wait-for-work-seconds", "90"]
         )
     if execution_no:
         command.extend(["--execution-no", execution_no])
@@ -157,6 +161,8 @@ def worker_lock_path(home: Path, runner: Path) -> Path:
         or UPLOAD_RUNNER_PATTERN.fullmatch(runner.stem)
     ):
         return home / "facebook-video-ingest" / "upload-worker.lock"
+    if runner.stem.lower() == CAPTURE_QUEUE_RUNNER_NAME:
+        return home / "facebook-video-ingest" / "capture-queue-worker.lock"
     execution_no = execution_no_from_runner(runner)
     if execution_no:
         return home / "facebook-video-ingest" / f"worker-{execution_no}.lock"
@@ -181,6 +187,10 @@ def main() -> int:
                 home / "facebook-video-ingest" / "receiver.log",
             )
             return 0
+        if runner.stem.lower() == CAPTURE_QUEUE_RUNNER_NAME:
+            # Let task-number-specific Cron jobs claim their exact execution
+            # first; this fallback only catches work left behind in the queue.
+            threading.Event().wait(15)
         completed = subprocess.run(
             command,
             text=True,

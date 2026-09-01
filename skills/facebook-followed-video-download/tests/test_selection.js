@@ -1,16 +1,26 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
 const {
+  ERROR_CODES,
   VIDEO_RESULT_EVENT_PREFIX,
+  classifyDiscoveryFailure,
+  discoveryExpression,
+  discoverWithRecovery,
+  isSupportedVideoUrl,
+  normalizeVideoUrl,
+  pageCandidates,
+  readDevToolsActivePort,
   selectDailyVideoUrls,
   selectVideoUrls,
   videoKey,
   videoResultEventLine,
   publishedAtFromMetadata,
+  waitForChrome,
 } = require('../scripts/facebook_followed_video_engine.js');
 const { parseRunLog } = require('../scripts/facebook_followed_video_report.js');
 
@@ -36,6 +46,154 @@ test('per-video event line is structured and includes batch progress', () => {
       completed: 3,
       total: 30,
       video,
+    },
+  );
+});
+
+test('normalizes current public Facebook video URL formats', () => {
+  assert.equal(
+    normalizeVideoUrl('https://www.facebook.com/example/videos/12345/?ref=share'),
+    'https://www.facebook.com/watch/?v=12345',
+  );
+  assert.equal(
+    normalizeVideoUrl('https://www.facebook.com/share/r/AbCdEf/?mibextid=x'),
+    'https://www.facebook.com/share/r/AbCdEf/',
+  );
+  assert.equal(
+    normalizeVideoUrl('https://fb.watch/ZyX987/?ref=foo'),
+    'https://fb.watch/ZyX987/',
+  );
+  for (const url of [
+    'https://www.facebook.com/reel/12345',
+    'https://www.facebook.com/watch/?v=12345',
+    'https://www.facebook.com/share/v/AbCdEf/',
+    'https://fb.watch/ZyX987/',
+  ]) assert.equal(isSupportedVideoUrl(url), true);
+});
+
+test('direct video and share URLs are scanned as a single candidate', () => {
+  const share = 'https://www.facebook.com/share/r/AbCdEf/';
+  assert.deepEqual(pageCandidates(share), ['https://www.facebook.com/share/r/AbCdEf']);
+  const watch = 'https://fb.watch/ZyX987/';
+  assert.deepEqual(pageCandidates(watch), ['https://fb.watch/ZyX987']);
+});
+
+test('discovery errors prioritize access and repeated CDP timeout', () => {
+  assert.equal(
+    classifyDiscoveryFailure([
+      { code: ERROR_CODES.CDP_TIMEOUT, message: 'timeout' },
+      { code: ERROR_CODES.ACCESS_REQUIRED, message: 'login' },
+    ], false).code,
+    ERROR_CODES.ACCESS_REQUIRED,
+  );
+  assert.equal(
+    classifyDiscoveryFailure([
+      { code: ERROR_CODES.CDP_TIMEOUT, message: 'timeout' },
+    ], false).code,
+    ERROR_CODES.CDP_TIMEOUT,
+  );
+  assert.equal(
+    classifyDiscoveryFailure([], true).code,
+    ERROR_CODES.LAYOUT_UNSUPPORTED,
+  );
+  assert.equal(
+    classifyDiscoveryFailure([], false).code,
+    ERROR_CODES.DISCOVERY_EMPTY,
+  );
+});
+
+test('bounded browser extraction expression compiles without whole-page HTML', () => {
+  const expression = discoveryExpression();
+  assert.doesNotThrow(() => new Function(`return ${expression};`));
+  assert.equal(expression.includes('document.documentElement.innerHTML'), false);
+  assert.equal(expression.includes('scriptBudget = 2000000'), true);
+});
+
+test('reads Chrome dynamic DevToolsActivePort and waits for its endpoint', async () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'fb-cdp-port-'));
+  const server = http.createServer((request, response) => {
+    response.setHeader('Content-Type', 'application/json');
+    response.end(JSON.stringify({ Browser: 'Chrome/test' }));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  try {
+    fs.writeFileSync(
+      path.join(temporary, 'DevToolsActivePort'),
+      `${port}\n/devtools/browser/test\n`,
+      'utf8',
+    );
+    assert.equal(readDevToolsActivePort(temporary), port);
+    assert.equal(await waitForChrome({ exitCode: null }, temporary, []), port);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test('classifies Chrome early exit with bounded startup detail', async () => {
+  await assert.rejects(
+    waitForChrome({ exitCode: 1 }, os.tmpdir(), ['profile lock\n']),
+    error => {
+      assert.equal(error.code, ERROR_CODES.CHROME_START);
+      assert.equal(error.message.includes('profile lock'), true);
+      return true;
+    },
+  );
+});
+
+test('rebuilds the CDP page session once after Runtime.evaluate timeout', async () => {
+  let attempts = 0;
+  let oldClosed = false;
+  let cookiesInjected = false;
+  const browser = {
+    port: 12345,
+    ws: { close: () => { oldClosed = true; } },
+  };
+  const recovered = await discoverWithRecovery(
+    browser,
+    'https://www.facebook.com/example/reels/',
+    new Set(),
+    10,
+    {
+      discoverOnPage: async () => {
+        attempts++;
+        if (attempts === 1) {
+          const error = new Error('timeout');
+          error.code = ERROR_CODES.CDP_TIMEOUT;
+          throw error;
+        }
+        return { urls: [reel(123)], layoutUnsupported: false };
+      },
+      connectTab: async (port, forceNew) => {
+        assert.equal(port, 12345);
+        assert.equal(forceNew, true);
+        return { close() {} };
+      },
+      injectCookies: async () => { cookiesInjected = true; },
+    },
+  );
+  assert.equal(attempts, 2);
+  assert.equal(oldClosed, true);
+  assert.equal(cookiesInjected, true);
+  assert.deepEqual(recovered.urls, [reel(123)]);
+});
+
+test('returns stable CDP_RUNTIME_TIMEOUT after recovery also times out', async () => {
+  const browser = { port: 12345, ws: { close() {} } };
+  await assert.rejects(
+    discoverWithRecovery(browser, 'https://www.facebook.com/example/', new Set(), 0, {
+      discoverOnPage: async () => {
+        const error = new Error('timeout');
+        error.code = ERROR_CODES.CDP_TIMEOUT;
+        throw error;
+      },
+      connectTab: async () => ({ close() {} }),
+      injectCookies: async () => {},
+    }),
+    error => {
+      assert.equal(error.code, ERROR_CODES.CDP_TIMEOUT);
+      return true;
     },
   );
 });

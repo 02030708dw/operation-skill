@@ -29,6 +29,9 @@ RUNNER_NAME = "hm_facebook_video_ingest_worker.py"
 UPLOAD_WORKER_JOB_NAME = "HM 审核上传队列 Worker"
 UPLOAD_RUNNER_NAME = "hm_capture_upload_worker.py"
 UPLOAD_WORKER_SCHEDULE = "* * * * *"
+CAPTURE_QUEUE_WORKER_JOB_NAME = "HM 视频抓取队列兜底 Worker"
+CAPTURE_QUEUE_RUNNER_NAME = "hm_capture_queue_worker.py"
+CAPTURE_QUEUE_WORKER_SCHEDULE = "* * * * *"
 GATEWAY_EXTENSION_SOURCE = "hm_capture_gateway_extension.py"
 GATEWAY_EXTENSION_TARGET = "hm_capture_extension.py"
 DEFAULT_API_HOST = "127.0.0.1"
@@ -152,7 +155,7 @@ def install_runner(home: Path) -> Path:
     target_dir = home / "scripts"
     target_dir.mkdir(parents=True, exist_ok=True)
     source_bytes = source.read_bytes()
-    for name in (RUNNER_NAME, UPLOAD_RUNNER_NAME):
+    for name in (RUNNER_NAME, UPLOAD_RUNNER_NAME, CAPTURE_QUEUE_RUNNER_NAME):
         target = target_dir / name
         if not target.is_file() or target.read_bytes() != source_bytes:
             target.write_bytes(source_bytes)
@@ -809,6 +812,56 @@ def ensure_upload_worker_job(api_base_url: str, api_key: str) -> dict:
     return job
 
 
+def capture_queue_worker_job_ready(job: object) -> bool:
+    return (
+        isinstance(job, dict)
+        and job.get("name") == CAPTURE_QUEUE_WORKER_JOB_NAME
+        and job.get("script") == CAPTURE_QUEUE_RUNNER_NAME
+        and bool(job.get("no_agent"))
+        and bool(job.get("enabled"))
+        and job.get("schedule_display") == CAPTURE_QUEUE_WORKER_SCHEDULE
+    )
+
+
+def ensure_capture_queue_worker_job(api_base_url: str, api_key: str) -> dict:
+    """Keep one idempotent one-job-at-a-time fallback capture poller."""
+    listed = local_api_json(
+        api_base_url, api_key, "GET", "/api/jobs?include_disabled=true"
+    )
+    matches = [
+        job for job in listed.get("jobs", [])
+        if isinstance(job, dict) and job.get("name") == CAPTURE_QUEUE_WORKER_JOB_NAME
+    ]
+    ready = [job for job in matches if capture_queue_worker_job_ready(job)]
+    if len(ready) == 1 and len(matches) == 1:
+        return ready[0]
+    for job in matches:
+        job_id = str(job.get("id") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", job_id):
+            raise RuntimeError("Hermes capture queue Worker job has an invalid id")
+        local_api_json(api_base_url, api_key, "DELETE", f"/api/jobs/{job_id}")
+    created = local_api_json(
+        api_base_url,
+        api_key,
+        "POST",
+        "/api/jobs",
+        {
+            "name": CAPTURE_QUEUE_WORKER_JOB_NAME,
+            "schedule": CAPTURE_QUEUE_WORKER_SCHEDULE,
+            "prompt": "Claim and process at most one missed HM video capture execution.",
+            "deliver": "local",
+            "skills": [],
+            "script": CAPTURE_QUEUE_RUNNER_NAME,
+            "no_agent": True,
+            "enabled": True,
+        },
+    )
+    job = created.get("job")
+    if not capture_queue_worker_job_ready(job):
+        raise RuntimeError("Hermes capture queue Worker job was not created correctly")
+    return job
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     hermes = hermes_command()
@@ -837,6 +890,10 @@ def main(argv: list[str] | None = None) -> int:
         if not any(upload_worker_job_ready(job) for job in jobs):
             raise RuntimeError(
                 "Hermes approved-upload Worker is missing; run the installer again"
+            )
+        if not any(capture_queue_worker_job_ready(job) for job in jobs):
+            raise RuntimeError(
+                "Hermes capture fallback Worker is missing; run the installer again"
             )
         media_base_url = env_values.get("HM_CAPTURE_MEDIA_BASE_URL", "").strip()
         expected_media_token = derive_media_token(worker_token, worker_id)
@@ -868,10 +925,11 @@ def main(argv: list[str] | None = None) -> int:
     if not api_is_ready(api_base_url, api_key):
         raise RuntimeError(f"Hermes local API did not become ready at {api_base_url}")
     ensure_upload_worker_job(api_base_url, api_key)
+    ensure_capture_queue_worker_job(api_base_url, api_key)
     register_media_endpoint(backend, worker_token, worker_id, media_base_url)
     print(f"Hermes local API ready: {api_base_url}")
     print(f"HM backend media endpoint registered: {media_base_url}")
-    print("On-demand capture enabled; approved uploads are polled every minute.")
+    print("On-demand capture enabled; capture fallback and approved uploads are polled every minute.")
     if stopped:
         print(f"Stopped {stopped} legacy continuous Worker process(es).")
     if not args.no_pairing_code:

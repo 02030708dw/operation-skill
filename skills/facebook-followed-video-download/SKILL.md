@@ -2,7 +2,7 @@
 name: facebook-followed-video-download
 description: Find, download, or locally reuse recent permitted Facebook Page, creator, Reels, watch, or direct video URLs in per-source folders with archive-backed duplicate prevention and reports. Use when the user asks Hermes to configure followed Facebook video sources, preview recent videos, download the latest or all videos, list sources, check dependencies, or troubleshoot this downloader. Defaults to preview and downloads only with explicit execution approval.
 metadata:
-  version: "1.6.2"
+  version: "1.7.0"
   platforms:
     - windows
     - macos
@@ -100,6 +100,15 @@ python "<skill-dir>/scripts/facebook_followed_video_download.py" --check
 
 Report the source count and whether preview and execution are ready. `yt-dlp` is required only for actual downloads. If the `ws` module is missing, run `npm install` inside `<skill-dir>/scripts`, then check again.
 
+For a source-independent execution preflight, including Node.js 12.22+, both
+runtime JavaScript syntax checks, `ws`, Chrome, and `yt-dlp`, run:
+
+```text
+python "<skill-dir>/scripts/facebook_followed_video_download.py" --runtime-check
+```
+
+`runtimeReady: true` is required before a backend Worker claims work.
+
 ### Authorize An Isolated Facebook Login
 
 Only after the user explicitly authorizes browser login, run:
@@ -165,6 +174,8 @@ finishes downloading, fails, or is filtered. Each line starts with
 source, completed/total counts, and the same video fields written to the final
 manifest. This stream is an early-notification channel only; the final
 `--result-json` manifest remains authoritative and must still be reconciled.
+The protocol lines are deliberately excluded from human run logs and HM
+`rawOutput`.
 
 ### Initial Full Import
 
@@ -198,7 +209,11 @@ Do not delete or rewrite these files during routine use. A dry run never appends
 - `ready_for_preview: false`: inspect `node`, `ws_module`, the accounts file, and its source count.
 - `ready_for_execute: false`: install or configure `yt-dlp`.
 - Chrome not found: pass `--chrome "<executable-path>"` or set `FACEBOOK_FOLLOWED_CHROME`.
-- `Chrome CDP did not start` during overlapping schedules: version 1.6.2 serializes runs automatically. Stagger busy sources as well to reduce queue time.
+- `CHROME_CDP_START_FAILED`: Chrome exited early or its dynamic CDP endpoint did not become ready after one cleanup/retry. Check stale Chrome processes, profile locks, available memory, and the bounded startup detail.
+- `CDP_RUNTIME_TIMEOUT`: Facebook did not answer the bounded page extraction after the page session was rebuilt and retried once. Check page responsiveness, network, and machine load.
+- `FACEBOOK_ACCESS_REQUIRED`: Facebook returned a login, verification, checkpoint, or access page. Handle it only through the explicitly authorized isolated profile; never bypass the control.
+- `FACEBOOK_LAYOUT_UNSUPPORTED`: video elements are visible but the current public layout exposes none of the supported links.
+- `FACEBOOK_DISCOVERY_EMPTY`: the reachable public page exposed no supported video link. This differs from a successful no-update run.
 - Direct Reel URLs work but Page scanning finds nothing: treat this as a discovery limitation; do not claim the Page contains no videos.
 - Zero discovered URLs is a discovery failure, not a successful no-update result. The recent-video fallback requires at least one publicly discoverable URL.
 - Access/login errors: stop unless the user has an authorized, non-bypassing access method.

@@ -20,9 +20,22 @@ const DEFAULT_ACCOUNTS = path.join(HERMES_HOME, 'facebook-followed-video-downloa
 const DEFAULT_COOKIES = process.env.FACEBOOK_FOLLOWED_COOKIES || process.env.FB_FOLLOWED_COOKIES || '';
 const DEFAULT_DESKTOP = process.env.FACEBOOK_FOLLOWED_OUTPUT || process.env.FB_FOLLOWED_DESKTOP || path.join(HOME, 'Desktop', 'Facebook');
 const DEFAULT_YTDLP = process.env.FACEBOOK_FOLLOWED_YTDLP || process.env.FB_FOLLOWED_YTDLP || process.env.YTDLP || 'yt-dlp';
-const CDP_PORT = Number(process.env.FACEBOOK_FOLLOWED_CDP_PORT || process.env.FB_CDP_PORT || String(9300 + Math.floor(Math.random() * 500)));
-const SKILL_VERSION = '1.6.2';
+const CONFIGURED_CDP_PORT = Number(process.env.FACEBOOK_FOLLOWED_CDP_PORT || process.env.FB_CDP_PORT || '0');
+const SKILL_VERSION = '1.7.0';
 const VIDEO_RESULT_EVENT_PREFIX = '__HM_VIDEO_RESULT__:';
+const ERROR_CODES = {
+  CHROME_START: 'CHROME_CDP_START_FAILED',
+  CDP_TIMEOUT: 'CDP_RUNTIME_TIMEOUT',
+  ACCESS_REQUIRED: 'FACEBOOK_ACCESS_REQUIRED',
+  DISCOVERY_EMPTY: 'FACEBOOK_DISCOVERY_EMPTY',
+  LAYOUT_UNSUPPORTED: 'FACEBOOK_LAYOUT_UNSUPPORTED'
+};
+
+function codedError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
 
 function detectChrome() {
   const configured = process.env.FACEBOOK_FOLLOWED_CHROME || process.env.FB_FOLLOWED_CHROME;
@@ -125,7 +138,7 @@ function stripQuery(url) {
 }
 
 function normalizeVideoUrl(url) {
-  const decoded = url.replace(/\\\//g, '/').replace(/&amp;/g, '&');
+  const decoded = String(url || '').replace(/\\\//g, '/').replace(/&amp;/g, '&');
   const reel = decoded.match(/facebook\.com\/reel\/(\d+)/);
   if (reel) return `https://www.facebook.com/reel/${reel[1]}`;
   const watch = decoded.match(/facebook\.com\/watch\/\?v=(\d+)/);
@@ -134,6 +147,10 @@ function normalizeVideoUrl(url) {
   if (videoPhp) return `https://www.facebook.com/video.php?v=${videoPhp[1]}`;
   const videos = decoded.match(/facebook\.com\/[^"' <]+\/videos\/(\d+)/);
   if (videos) return `https://www.facebook.com/watch/?v=${videos[1]}`;
+  const share = decoded.match(/facebook\.com\/share\/(r|v)\/([^?&#/]+)/i);
+  if (share) return `https://www.facebook.com/share/${share[1].toLowerCase()}/${share[2]}/`;
+  const shortWatch = decoded.match(/(?:www\.)?fb\.watch\/([^?&#/]+)/i);
+  if (shortWatch) return `https://fb.watch/${shortWatch[1]}/`;
   return stripQuery(decoded);
 }
 
@@ -147,9 +164,17 @@ function videoKey(url) {
   if (videoPhp) return videoPhp[1];
   const videos = decoded.match(/facebook\.com\/[^"' <]+\/videos\/(\d+)/);
   if (videos) return videos[1];
+  const share = decoded.match(/facebook\.com\/share\/(?:r|v)\/([^?&#/]+)/i);
+  if (share) return `share:${share[1]}`;
+  const shortWatch = decoded.match(/(?:www\.)?fb\.watch\/([^?&#/]+)/i);
+  if (shortWatch) return `fb.watch:${shortWatch[1]}`;
   const ytdlpArchive = decoded.match(/^facebook\s+(\d+)$/);
   if (ytdlpArchive) return ytdlpArchive[1];
   return decoded;
+}
+
+function isSupportedVideoUrl(url) {
+  return /(?:facebook\.com\/(?:reel\/\d+|watch\/\?v=\d+|video\.php\?v=\d+|[^"' <]+\/videos\/\d+|share\/(?:r|v)\/[^?&#/]+)|fb\.watch\/[^?&#/]+)/i.test(String(url || ''));
 }
 
 function normalizeAccountUrl(url) {
@@ -159,10 +184,7 @@ function normalizeAccountUrl(url) {
 
 function pageCandidates(accountUrl) {
   const base = normalizeAccountUrl(accountUrl);
-  if (/\/reel\/\d+/.test(base) || /\/watch\/\?v=\d+/.test(base) || /\/video\.php\?v=\d+/.test(base)) {
-    return [base];
-  }
-  if (/facebook\.com\/share\//.test(base)) {
+  if (isSupportedVideoUrl(base)) {
     return [base];
   }
   if (/\/reels(?:_tab)?$/.test(base) || /[?&]sk=reels_tab\b/.test(base)) {
@@ -198,9 +220,9 @@ function readAccounts(filePath) {
   });
 }
 
-function httpGet(pathname) {
+function httpGet(port, pathname) {
   return new Promise((resolve, reject) => {
-    http.get(`http://127.0.0.1:${CDP_PORT}${pathname}`, res => {
+    http.get(`http://127.0.0.1:${port}${pathname}`, res => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
@@ -214,50 +236,124 @@ function httpGet(pathname) {
   });
 }
 
-async function waitForChrome() {
-  for (let i = 0; i < 30; i++) {
-    try {
-      await httpGet('/json/version');
-      return;
-    } catch {
-      await sleep(500);
-    }
+function boundedChromeDiagnostic(chunks) {
+  return chunks.join('').replace(/[\r\n]+/g, ' ').trim().slice(-1600);
+}
+
+function readDevToolsActivePort(profile) {
+  const activePortFile = path.join(profile, 'DevToolsActivePort');
+  if (!fs.existsSync(activePortFile)) return 0;
+  try {
+    const value = fs.readFileSync(activePortFile, 'utf8').split(/\r?\n/)[0].trim();
+    const parsed = Number(value);
+    return Number.isInteger(parsed) && parsed > 0 && parsed < 65536 ? parsed : 0;
+  } catch {
+    return 0;
   }
-  throw new Error('Chrome CDP did not start');
+}
+
+async function waitForChrome(chrome, profile, stderrChunks) {
+  let port = CONFIGURED_CDP_PORT > 0 ? CONFIGURED_CDP_PORT : 0;
+  for (let i = 0; i < 60; i++) {
+    if (chrome.exitCode !== null) {
+      const detail = boundedChromeDiagnostic(stderrChunks);
+      throw codedError(
+        ERROR_CODES.CHROME_START,
+        `Chrome exited before CDP became ready${detail ? `: ${detail}` : ''}`
+      );
+    }
+    if (!port) port = readDevToolsActivePort(profile);
+    try {
+      if (port) {
+        await httpGet(port, '/json/version');
+        return port;
+      }
+    } catch {
+      // Chrome may write DevToolsActivePort before the endpoint starts listening.
+    }
+    await sleep(500);
+  }
+  const detail = boundedChromeDiagnostic(stderrChunks);
+  throw codedError(
+    ERROR_CODES.CHROME_START,
+    `Chrome CDP did not start within 30 seconds${detail ? `: ${detail}` : ''}`
+  );
 }
 
 async function cdpCall(ws, msg, timeoutMs = 20000) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
+    let timer;
+    const cleanup = () => {
+      clearTimeout(timer);
       ws.removeListener('message', handler);
-      reject(new Error(`CDP timeout: ${msg.method}`));
-    }, timeoutMs);
+      ws.removeListener('close', closed);
+      ws.removeListener('error', closed);
+    };
+    const closed = () => {
+      cleanup();
+      reject(new Error(`CDP connection closed: ${msg.method}`));
+    };
     const handler = data => {
-      const parsed = JSON.parse(data);
+      let parsed;
+      try {
+        parsed = JSON.parse(data);
+      } catch {
+        return;
+      }
       if (parsed.id === msg.id) {
-        clearTimeout(timer);
-        ws.removeListener('message', handler);
-        resolve(parsed);
+        cleanup();
+        if (parsed.error) reject(new Error(parsed.error.message || `CDP failed: ${msg.method}`));
+        else resolve(parsed);
       }
     };
+    timer = setTimeout(() => {
+      cleanup();
+      reject(codedError(
+        msg.method === 'Runtime.evaluate' ? ERROR_CODES.CDP_TIMEOUT : 'CDP_TIMEOUT',
+        `CDP timeout: ${msg.method}`
+      ));
+    }, timeoutMs);
     ws.on('message', handler);
+    ws.once('close', closed);
+    ws.once('error', closed);
     ws.send(JSON.stringify(msg));
   });
 }
 
-async function connectTab() {
-  let tabs = await httpGet('/json');
-  let tab = tabs.find(candidate => candidate.type === 'page' && candidate.webSocketDebuggerUrl);
+async function connectTab(port, forceNew = false) {
+  let tabs = await httpGet(port, '/json');
+  let tab;
+  if (forceNew) {
+    const created = await httpGet(port, '/json/new?about:blank').catch(() => null);
+    if (created && created.type === 'page' && created.webSocketDebuggerUrl) {
+      tab = created;
+    }
+    tabs = await httpGet(port, '/json');
+  }
   if (!tab) {
-    await httpGet('/json/new?about:blank');
-    tabs = await httpGet('/json');
+    const candidates = tabs.filter(candidate => candidate.type === 'page' && candidate.webSocketDebuggerUrl);
+    tab = forceNew ? candidates[candidates.length - 1] : candidates[0];
+  }
+  if (!tab) {
+    await httpGet(port, '/json/new?about:blank');
+    tabs = await httpGet(port, '/json');
     tab = tabs.find(candidate => candidate.type === 'page' && candidate.webSocketDebuggerUrl);
   }
   if (!tab) {
     throw new Error('No controllable Chrome page target found');
   }
   const ws = new WebSocket(tab.webSocketDebuggerUrl);
-  await new Promise(resolve => ws.on('open', resolve));
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('CDP WebSocket open timeout')), 10000);
+    ws.once('open', () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    ws.once('error', error => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
   await cdpCall(ws, { id: 1, method: 'Page.enable' });
   await cdpCall(ws, { id: 2, method: 'Network.enable' });
   return ws;
@@ -297,26 +393,67 @@ async function injectCookies(ws) {
   return count;
 }
 
+function discoveryExpression() {
+  return `
+    (() => {
+      const found = new Set();
+      const add = value => {
+        const href = String(value || '').replace(/\\\\\//g, '/');
+        if (
+          href.includes('/reel/') || href.includes('/watch/?v=')
+          || href.includes('/videos/') || href.includes('/video.php?v=')
+          || href.includes('/share/r/') || href.includes('/share/v/')
+          || href.includes('fb.watch/')
+        ) found.add(href);
+      };
+      for (const anchor of Array.from(document.querySelectorAll('a[href]'))) add(anchor.href);
+      for (const selector of ['link[rel="canonical"]', 'meta[property="og:url"]']) {
+        const element = document.querySelector(selector);
+        if (element) add(element.href || element.content);
+      }
+      add(location.href);
+      const patterns = [
+        /https?:\\/\\/(?:www\\.)?facebook\\.com\\/(?:reel\\/\\d+|watch\\/\\?v=\\d+|[^"' <]+\\/videos\\/\\d+|video\\.php\\?v=\\d+|share\\/(?:r|v)\\/[^"' <\\/?&#]+)/gi,
+        /https?:\\/\\/fb\\.watch\\/[^"' <\\/?&#]+/gi,
+        /\\/reel\\/\\d+/g,
+        /\\/watch\\/\\?v=\\d+/g,
+        /\\/video\\.php\\?v=\\d+/g,
+        /\\/share\\/(?:r|v)\\/[^"' <\\/?&#]+/g
+      ];
+      let scriptBudget = 2000000;
+      for (const script of Array.from(document.querySelectorAll('script')).slice(0, 60)) {
+        if (scriptBudget <= 0) break;
+        const rawText = String(script.textContent || '').slice(0, Math.min(100000, scriptBudget));
+        const text = rawText.replace(/\\\\\//g, '/');
+        scriptBudget -= rawText.length;
+        for (const pattern of patterns) {
+          pattern.lastIndex = 0;
+          let match;
+          let matches = 0;
+          while ((match = pattern.exec(text)) && matches++ < 200) {
+            add(match[0].startsWith('/') ? location.origin + match[0] : match[0]);
+          }
+        }
+      }
+      return JSON.stringify({
+        urls: Array.from(found).slice(0, 2000),
+        finalUrl: location.href,
+        title: String(document.title || '').slice(0, 500),
+        bodyText: String(document.body ? document.body.innerText : '').slice(0, 6000),
+        videoElements: document.querySelectorAll('video').length
+      });
+    })()
+      `;
+}
+
 async function discoverOnPage(ws, url, stopKeys = new Set(), minimumItems = 0) {
   console.log(`  掃描: ${url}`);
-  const extractExpression = `
-                (() => {
-                  const found = new Set();
-                  for (const a of Array.from(document.querySelectorAll('a[href]'))) {
-                    const href = a.href || '';
-                    if (href.includes('/reel/') || href.includes('/watch/?v=') || href.includes('/videos/') || href.includes('/video.php?v=')) found.add(href);
-                  }
-                  const html = document.documentElement.innerHTML;
-                  for (const match of html.matchAll(/\\/reel\\/\\d+/g)) found.add(location.origin + match[0]);
-                  for (const match of html.matchAll(/\\/watch\\/\\?v=\\d+/g)) found.add(location.origin + match[0]);
-                  for (const match of html.matchAll(/\\/video\\.php\\?v=\\d+/g)) found.add(location.origin + match[0]);
-                  return JSON.stringify(Array.from(found));
-                })()
-      `;
+  const extractExpression = discoveryExpression();
   const collected = new Set();
   let lastCount = 0;
   let stagnantRounds = 0;
   let reachedKnownVideo = false;
+  let layoutUnsupported = false;
   async function collectVisibleLinks() {
     const result = await cdpCall(ws, {
       id: nextCdpId(),
@@ -330,11 +467,25 @@ async function discoverOnPage(ws, url, stopKeys = new Set(), minimumItems = 0) {
       const details = result.result.exceptionDetails;
       throw new Error((details.exception && details.exception.description) || details.text || 'Runtime.evaluate failed');
     }
-    const raw = JSON.parse(
-      (result.result && result.result.result && result.result.result.value) || '[]'
+    const snapshot = JSON.parse(
+      (result.result && result.result.result && result.result.result.value) || '{}'
     );
-    for (const rawVideoUrl of raw) {
+    const accessText = `${snapshot.finalUrl || ''} ${snapshot.title || ''} ${snapshot.bodyText || ''}`;
+    if (
+      /facebook\.com\/(?:login|checkpoint|challenge|recover|two_factor)/i.test(accessText)
+      || /(?:log in to continue|login to continue|confirm your identity|security check|temporarily blocked|請登入|登录以继续|確認你的身分|验证你的身份)/i.test(accessText)
+    ) {
+      throw codedError(
+        ERROR_CODES.ACCESS_REQUIRED,
+        'Facebook requires login, verification, or an access check for this page'
+      );
+    }
+    if (Number(snapshot.videoElements || 0) > 0 && !(snapshot.urls || []).length) {
+      layoutUnsupported = true;
+    }
+    for (const rawVideoUrl of snapshot.urls || []) {
       const videoUrl = normalizeVideoUrl(rawVideoUrl);
+      if (!isSupportedVideoUrl(videoUrl)) continue;
       collected.add(videoUrl);
       if (stopKeys.has(videoKey(videoUrl))) reachedKnownVideo = true;
     }
@@ -366,7 +517,39 @@ async function discoverOnPage(ws, url, stopKeys = new Set(), minimumItems = 0) {
     await sleep(waitMs);
     await collectVisibleLinks();
   }
-  return Array.from(collected).filter(videoUrl => /facebook\.com\/(reel\/\d+|watch\/\?v=\d+|video\.php\?v=\d+)/.test(videoUrl));
+  return {
+    urls: Array.from(collected).filter(isSupportedVideoUrl),
+    layoutUnsupported
+  };
+}
+
+async function discoverWithRecovery(
+  browser,
+  url,
+  stopKeys,
+  minimumItems,
+  adapters = { discoverOnPage, connectTab, injectCookies }
+) {
+  try {
+    return await adapters.discoverOnPage(browser.ws, url, stopKeys, minimumItems);
+  } catch (err) {
+    if (err.code !== ERROR_CODES.CDP_TIMEOUT) throw err;
+    console.log('    CDP 執行逾時，重建頁面工作階段後重試一次');
+    try { browser.ws.close(); } catch {}
+    browser.ws = await adapters.connectTab(browser.port, true);
+    await adapters.injectCookies(browser.ws);
+    try {
+      return await adapters.discoverOnPage(browser.ws, url, stopKeys, minimumItems);
+    } catch (retryError) {
+      if (retryError.code === ERROR_CODES.CDP_TIMEOUT) {
+        throw codedError(
+          ERROR_CODES.CDP_TIMEOUT,
+          'Facebook page Runtime.evaluate timed out after rebuilding the CDP session'
+        );
+      }
+      throw retryError;
+    }
+  }
 }
 
 function readArchive(archivePath) {
@@ -592,10 +775,10 @@ function downloadVideo(account, url, outputDir, archivePath) {
     return item;
   }
   const metadata = probeVideoMetadata(url);
-  item.durationSeconds = metadata.durationSeconds ?? null;
-  item.publishedAt = metadata.publishedAt ?? null;
-  item.publishedAtPrecision = metadata.publishedAtPrecision ?? null;
-  item.title = metadata.title ?? null;
+  item.durationSeconds = metadata.durationSeconds === undefined ? null : metadata.durationSeconds;
+  item.publishedAt = metadata.publishedAt === undefined ? null : metadata.publishedAt;
+  item.publishedAtPrecision = metadata.publishedAtPrecision === undefined ? null : metadata.publishedAtPrecision;
+  item.title = metadata.title === undefined ? null : metadata.title;
   if (maxDurationSeconds && item.durationSeconds !== null && item.durationSeconds > maxDurationSeconds) {
     appendArchiveOnce(archivePath, url);
     item.status = 'filtered-duration';
@@ -650,6 +833,88 @@ function downloadVideo(account, url, outputDir, archivePath) {
   return item;
 }
 
+async function stopChrome(chrome) {
+  if (!chrome) return;
+  try {
+    if (process.platform === 'win32') {
+      spawnSync('taskkill', ['/pid', String(chrome.pid), '/T', '/F'], {
+        stdio: 'ignore', windowsHide: true
+      });
+    } else {
+      process.kill(-chrome.pid, 'SIGTERM');
+    }
+  } catch {
+    try { chrome.kill(); } catch {}
+  }
+  await sleep(300);
+}
+
+function removeTree(directory) {
+  if (!fs.existsSync(directory)) return;
+  fs.rmdirSync(directory, { recursive: true, maxRetries: 3, retryDelay: 100 });
+}
+
+async function startBrowser(profile) {
+  const activePortFile = path.join(profile, 'DevToolsActivePort');
+  let lastError;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try { fs.unlinkSync(activePortFile); } catch {}
+    const stderrChunks = [];
+    let stderrSize = 0;
+    const chrome = spawn(chromePath, [
+      `--remote-debugging-port=${CONFIGURED_CDP_PORT > 0 ? CONFIGURED_CDP_PORT : 0}`,
+      `--user-data-dir=${profile}`,
+      attempt === 1 ? '--headless=new' : '--headless',
+      '--disable-gpu',
+      '--no-first-run',
+      '--no-default-browser-check',
+      'about:blank'
+    ], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      detached: process.platform !== 'win32',
+      windowsHide: true
+    });
+    if (chrome.stderr) {
+      chrome.stderr.on('data', chunk => {
+        if (stderrSize >= 6400) return;
+        const value = String(chunk).slice(0, 6400 - stderrSize);
+        stderrChunks.push(value);
+        stderrSize += value.length;
+      });
+    }
+    try {
+      const port = await waitForChrome(chrome, profile, stderrChunks);
+      const ws = await connectTab(port);
+      return { chrome, port, ws };
+    } catch (err) {
+      lastError = err.code
+        ? err
+        : codedError(ERROR_CODES.CHROME_START, String(err.message || err));
+      await stopChrome(chrome);
+      if (attempt === 1) console.log('Chrome CDP 啟動失敗，清理本次程序後重試一次');
+    }
+  }
+  throw lastError || codedError(ERROR_CODES.CHROME_START, 'Chrome CDP did not start');
+}
+
+function classifyDiscoveryFailure(scanErrors, layoutUnsupported) {
+  const priorities = [ERROR_CODES.ACCESS_REQUIRED, ERROR_CODES.CDP_TIMEOUT];
+  for (const code of priorities) {
+    const match = scanErrors.find(item => item.code === code);
+    if (match) return match;
+  }
+  if (layoutUnsupported) {
+    return {
+      code: ERROR_CODES.LAYOUT_UNSUPPORTED,
+      message: 'Facebook page contains video elements but its current layout is not supported'
+    };
+  }
+  return {
+    code: ERROR_CODES.DISCOVERY_EMPTY,
+    message: 'Facebook public page returned no discoverable video links'
+  };
+}
+
 async function main() {
   if (!fs.existsSync(accountsFile)) throw new Error(`Missing accounts file: ${accountsFile}`);
   assertRunnable(chromePath, 'Chrome');
@@ -671,22 +936,12 @@ async function main() {
     sources: []
   };
   fs.mkdirSync(profile, { recursive: true, mode: 0o700 });
-  const chrome = spawn(chromePath, [
-    `--remote-debugging-port=${CDP_PORT}`,
-    `--user-data-dir=${profile}`,
-    '--headless=new',
-    '--disable-gpu',
-    '--no-first-run',
-    '--no-default-browser-check',
-    'about:blank'
-  ], { stdio: 'ignore', detached: process.platform !== 'win32' });
-
-  let ws;
+  let browser;
   try {
-    await waitForChrome();
-    ws = await connectTab();
-    const cookieCount = await injectCookies(ws);
+    browser = await startBrowser(profile);
+    const cookieCount = await injectCookies(browser.ws);
     console.log(`Facebook cookies: ${cookieCount}`);
+    console.log(`Facebook CDP port: ${browser.port}`);
     console.log(`Facebook browser session: ${temporaryProfile ? 'ephemeral-public' : 'user-authorized-isolated-profile'}`);
     console.log(`模式: ${mode === 'full' ? '首次全量' : '每日增量'}`);
 
@@ -697,21 +952,26 @@ async function main() {
       const existingKeys = readArchiveKeys(archivePath, path.join(outputDir, '.yt-dlp-archive.txt'));
       const discovered = new Set();
       const discoveredPages = [];
+      const scanErrors = [];
+      let layoutUnsupported = false;
       const firstDailyRun = mode === 'daily' && existingKeys.size === 0;
 
       console.log(`\n=== ${account.folder} ===`);
       for (const page of pageCandidates(account.url)) {
         try {
-          const urls = await discoverOnPage(
-            ws,
+          const discovery = await discoverWithRecovery(
+            browser,
             page,
             firstDailyRun ? new Set() : existingKeys,
             firstDailyRun ? firstRunLimit : 0
           );
-          discoveredPages.push(urls);
-          urls.forEach(videoUrl => discovered.add(videoUrl));
+          discoveredPages.push(discovery.urls);
+          discovery.urls.forEach(videoUrl => discovered.add(videoUrl));
+          layoutUnsupported = layoutUnsupported || discovery.layoutUnsupported;
         } catch (err) {
-          console.log(`  掃描失敗: ${err.message}`);
+          const code = err.code || 'FACEBOOK_SCAN_FAILED';
+          scanErrors.push({ code, message: String(err.message || err) });
+          console.log(`  掃描失敗 [${code}]: ${err.message}`);
         }
       }
 
@@ -720,9 +980,11 @@ async function main() {
         : selectVideoUrls(Array.from(discovered), existingKeys, mode, firstRunLimit);
       console.log(`  找到影片: ${discovered.size}，本次選取: ${selected.length}`);
 
-      const discoveryFailed = discovered.size === 0;
-      if (discoveryFailed) {
-        console.log('  發現失敗: Facebook 公開頁面沒有返回可解析的影片連結');
+      const discoveryFailure = discovered.size === 0
+        ? classifyDiscoveryFailure(scanErrors, layoutUnsupported)
+        : null;
+      if (discoveryFailure) {
+        console.log(`  發現失敗 [${discoveryFailure.code}]: ${discoveryFailure.message}`);
       }
 
       const sourceResult = {
@@ -732,11 +994,10 @@ async function main() {
         discovered: discovered.size,
         selected: selected.length,
         succeeded: 0,
-        failed: discoveryFailed ? 1 : 0,
+        failed: discoveryFailure ? 1 : 0,
         filteredDuration: 0,
-        error: discoveryFailed
-          ? 'Facebook public page returned no discoverable video links'
-          : null,
+        errorCode: discoveryFailure ? discoveryFailure.code : null,
+        error: discoveryFailure ? discoveryFailure.message : null,
         videos: []
       };
       for (const videoUrl of selected) {
@@ -769,13 +1030,12 @@ async function main() {
     }
     return runResult;
   } finally {
-    if (ws) ws.close();
-    try {
-      if (process.platform === 'win32') chrome.kill();
-      else process.kill(-chrome.pid);
-    } catch {}
+    if (browser && browser.ws) {
+      try { browser.ws.close(); } catch {}
+    }
+    if (browser) await stopChrome(browser.chrome);
     if (temporaryProfile) {
-      try { fs.rmSync(profile, { recursive: true, force: true }); } catch {}
+      try { removeTree(profile); } catch {}
     }
   }
 }
@@ -785,7 +1045,7 @@ async function runMain() {
     const result = await main();
     if (result.status === 'failed') process.exitCode = 1;
   } catch (err) {
-    console.error(`錯誤: ${err.message}`);
+    console.error(`錯誤: [${err.code || 'PIPELINE_ERROR'}] ${err.message}`);
     if (resultJsonPath) {
       const failed = {
         schemaVersion: '1.0',
@@ -796,6 +1056,7 @@ async function runMain() {
         startedAt: null,
         completedAt: new Date().toISOString(),
         sources: [],
+        errorCode: err.code || null,
         error: String(err.message || err)
       };
       try {
@@ -810,10 +1071,19 @@ async function runMain() {
 if (require.main === module) runMain();
 
 module.exports = {
+  ERROR_CODES,
   VIDEO_RESULT_EVENT_PREFIX,
+  classifyDiscoveryFailure,
+  discoveryExpression,
+  discoverWithRecovery,
+  isSupportedVideoUrl,
+  normalizeVideoUrl,
+  pageCandidates,
+  readDevToolsActivePort,
   selectDailyVideoUrls,
   selectVideoUrls,
   videoKey,
   videoResultEventLine,
+  waitForChrome,
   publishedAtFromMetadata,
 };

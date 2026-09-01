@@ -18,6 +18,10 @@ Legacy `FB_FOLLOWED_*` variables remain accepted where practical so an older ins
 
 ## Dependencies
 
+Use Node.js 12.22.0 or newer. The entry point checks the actual Node version and
+runs `node --check` against every runtime JavaScript file before reporting the
+download runtime ready.
+
 Install the local Node dependency once from the Skill's scripts folder:
 
 ```text
@@ -26,7 +30,7 @@ npm install
 
 Install `yt-dlp` through the user's normal package manager and make it available on `PATH`, or pass its executable path with `--yt-dlp`.
 
-The engine auto-detects common Google Chrome and Chromium locations on Windows, macOS, and Linux. Use `--chrome` only when auto-detection fails.
+The engine auto-detects common Google Chrome and Chromium locations on Windows, macOS, and Linux. Use `--chrome` only when auto-detection fails. By default Chrome chooses a free CDP port and the engine reads its own `DevToolsActivePort`; use `FACEBOOK_FOLLOWED_CDP_PORT` only for a controlled diagnostic override.
 
 ## Reports
 

@@ -21,8 +21,9 @@ BASE_RUNNER_NAME = "hm_facebook_video_ingest_worker.py"
 TASK_PATTERN = re.compile(r"^C-[A-Za-z0-9-]+$")
 EXECUTION_PATTERN = re.compile(r"^E-[A-Za-z0-9-]+$")
 SCHEDULE_KEY_PATTERN = re.compile(r"^\d{4}$")
+RUNNER_REVISION_PATTERN = re.compile(r"^r\d+$", re.IGNORECASE)
 MANAGED_RUNNER_PATTERN = re.compile(
-    r"^(?:hm_capture_C-[A-Za-z0-9-]+_(?:E-[A-Za-z0-9-]+|\d{4})|hm_capture_upload_C-[A-Za-z0-9-]+_V-[A-Za-z0-9-]+)\.py$",
+    r"^(?:hm_capture_C-[A-Za-z0-9-]+_(?:E-[A-Za-z0-9-]+|\d{4})(?:_r\d+)?|hm_capture_upload_C-[A-Za-z0-9-]+_V-[A-Za-z0-9-]+)\.py$",
     re.IGNORECASE,
 )
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
@@ -51,6 +52,7 @@ def _materialize_runner(spec: dict[str, Any], home: Path) -> str:
     execution_value = str(spec.get("executionNo") or "").strip()
     schedule_value = str(spec.get("scheduleKey") or "").strip()
     upload_value = str(spec.get("uploadVideoNo") or "").strip()
+    revision_value = str(spec.get("runnerRevision") or "").strip().lower()
     if sum(bool(value) for value in (execution_value, schedule_value, upload_value)) != 1:
         raise ValueError(
             "HM capture runner requires exactly one executionNo, scheduleKey, or uploadVideoNo"
@@ -62,12 +64,19 @@ def _materialize_runner(spec: dict[str, Any], home: Path) -> str:
         if schedule_value
         else _normalized(upload_value, re.compile(r"^V-[A-Za-z0-9-]+$"), "video number")
     )
+    revision_suffix = ""
+    if revision_value:
+        revision_suffix = "_" + _normalized(
+            revision_value, RUNNER_REVISION_PATTERN, "runner revision"
+        ).lower()
+    if upload_value and revision_suffix:
+        raise ValueError("HM upload runners do not accept a runner revision")
 
     scripts_dir = (home / "scripts").resolve()
     source = (scripts_dir / BASE_RUNNER_NAME).resolve()
     runner_name = (
         f"hm_capture_upload_{task_no}_{suffix}.py"
-        if upload_value else f"hm_capture_{task_no}_{suffix}.py"
+        if upload_value else f"hm_capture_{task_no}_{suffix}{revision_suffix}.py"
     )
     target = (scripts_dir / runner_name).resolve()
     try:

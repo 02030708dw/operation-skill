@@ -19,6 +19,7 @@ from urllib import error, request
 
 
 SKILL_NAME = "facebook-video-ingest"
+SKILL_VERSION = "1.2.0"
 WORKER_USER_AGENT = "HM-Hermes-Worker/1.0"
 TRANSIENT_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 TRANSIENT_BACKEND_ATTEMPTS = 6
@@ -55,7 +56,9 @@ DEFAULT_STATE_DIR = infer_hermes_home() / SKILL_NAME / "executions"
 
 
 class PipelineError(RuntimeError):
-    pass
+    def __init__(self, message: str, error_code: str = "PIPELINE_ERROR") -> None:
+        super().__init__(message)
+        self.error_code = error_code
 
 
 class BackendError(PipelineError):
@@ -694,11 +697,56 @@ def run_command(
     lines: list[str] = []
     assert process.stdout is not None
     for line in process.stdout:
-        print(line, end="", flush=True)
-        lines.append(line)
         if on_line is not None:
             on_line(line)
+        if line.startswith(VIDEO_RESULT_EVENT_PREFIX):
+            continue
+        print(line, end="", flush=True)
+        lines.append(line)
+    process.stdout.close()
     return process.wait(), "".join(lines)
+
+
+def download_runtime_check() -> dict[str, Any]:
+    if not DOWNLOAD_SCRIPT.is_file():
+        raise PipelineError(
+            f"download Skill entry point is missing: {DOWNLOAD_SCRIPT}",
+            "DOWNLOAD_RUNTIME_NOT_READY",
+        )
+    completed = subprocess.run(
+        [sys.executable, str(DOWNLOAD_SCRIPT), "--runtime-check"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        timeout=45,
+    )
+    try:
+        status = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        detail = (completed.stderr or completed.stdout or "no output").strip()[-1000:]
+        raise PipelineError(
+            f"download Skill runtime check returned invalid output: {detail}",
+            "DOWNLOAD_RUNTIME_NOT_READY",
+        ) from exc
+    if completed.returncode != 0 or not status.get("runtimeReady"):
+        missing = [
+            name
+            for name, ready in (
+                ("Node.js 12.22+", status.get("nodeSupported")),
+                ("download engine syntax", status.get("engineSyntaxOk")),
+                ("Node ws module", status.get("wsModule")),
+                ("Chrome", status.get("chromeRunnable")),
+                ("yt-dlp", status.get("ytDlpRunnable")),
+            )
+            if not ready
+        ]
+        raise PipelineError(
+            "download Skill runtime is not ready: " + ", ".join(missing or ["unknown failure"]),
+            "DOWNLOAD_RUNTIME_NOT_READY",
+        )
+    return status
 
 
 def manifest_videos(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -709,6 +757,17 @@ def manifest_videos(payload: dict[str, Any]) -> list[dict[str, Any]]:
             item.setdefault("source", source.get("name"))
             videos.append(item)
     return videos
+
+
+def manifest_error_code(payload: dict[str, Any]) -> str | None:
+    top_level = str(payload.get("errorCode") or "").strip()
+    if top_level:
+        return top_level[:100]
+    for source in payload.get("sources", []):
+        source_code = str(source.get("errorCode") or "").strip()
+        if source_code:
+            return source_code[:100]
+    return None
 
 
 def normalized_upload_status(value: object) -> str:
@@ -1144,8 +1203,15 @@ def safely_drain_local_delete_jobs(
 
 
 def check(args: argparse.Namespace) -> int:
+    runtime: dict[str, Any] | None = None
+    runtime_error: str | None = None
+    try:
+        runtime = download_runtime_check()
+    except (OSError, subprocess.SubprocessError, PipelineError) as exc:
+        runtime_error = str(exc)
     checks = {
         "skill": SKILL_NAME,
+        "skillVersion": SKILL_VERSION,
         "backendConfigured": bool(args.backend),
         "workerIdConfigured": bool(args.worker_id),
         "workerTokenConfigured": bool(args.worker_token),
@@ -1161,6 +1227,9 @@ def check(args: argparse.Namespace) -> int:
             and os.getenv("CLOUDFLARE_R2_SECRET_ACCESS_KEY")
         ),
         "boto3Available": importlib.util.find_spec("boto3") is not None,
+        "downloadRuntime": runtime,
+        "downloadRuntimeReady": bool(runtime and runtime.get("runtimeReady")),
+        "downloadRuntimeError": runtime_error,
     }
     checks["ready"] = all(
         checks[key]
@@ -1170,6 +1239,7 @@ def check(args: argparse.Namespace) -> int:
             "workerTokenConfigured",
             "mediaBaseUrlConfigured",
             "downloadScriptExists",
+            "downloadRuntimeReady",
             "r2ScriptExists",
             "r2BucketConfigured",
             "r2CredentialsConfigured",
@@ -1214,6 +1284,9 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         if local_delete_error:
             result["localDeleteError"] = local_delete_error
         return 0, result
+    # Refuse to claim durable backend work when an interrupted Skill update or
+    # an unsupported Node runtime would make execution fail after assignment.
+    download_runtime_check()
     deadline = time.monotonic() + args.wait_for_work_seconds
     while True:
         job = claim(backend, token, worker_id, args.task_no, args.execution_no)
@@ -1330,6 +1403,7 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         combined = {
             "schemaVersion": "1.0",
             "skill": SKILL_NAME,
+            "skillVersion": SKILL_VERSION,
             "executionId": execution_id,
             "accountName": job.get("accountName") or job.get("sourceName"),
             "region": job.get("region"),
@@ -1359,6 +1433,7 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         )
         (execution_dir / "worker.log").write_text("".join(raw_parts), encoding="utf-8")
         heartbeat_pump.stop()
+        download_error_code = manifest_error_code(download_result)
         complete(
             backend,
             token,
@@ -1367,7 +1442,9 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             terminal_status,
             combined,
             "".join(raw_parts),
-            None if terminal_status == "COMPLETED" else "PIPELINE_PARTIAL_OR_FAILED",
+            None
+            if terminal_status == "COMPLETED"
+            else (download_error_code or "PIPELINE_PARTIAL_OR_FAILED"),
             None if terminal_status == "COMPLETED" else "One or more download items failed",
         )
         try:
@@ -1397,6 +1474,7 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         failed = {
             "schemaVersion": "1.0",
             "skill": SKILL_NAME,
+            "skillVersion": SKILL_VERSION,
             "executionId": execution_id,
             "status": "FAILED",
             "error": str(exc),
@@ -1414,7 +1492,7 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 "FAILED",
                 failed,
                 "".join(raw_parts),
-                "PIPELINE_ERROR",
+                getattr(exc, "error_code", "PIPELINE_ERROR"),
                 str(exc)[:500],
             )
         except Exception as callback_error:

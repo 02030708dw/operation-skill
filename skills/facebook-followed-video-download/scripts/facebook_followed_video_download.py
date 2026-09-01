@@ -19,7 +19,9 @@ from urllib.parse import urlparse
 
 
 SKILL_NAME = "facebook-followed-video-download"
-SKILL_VERSION = "1.6.2"
+SKILL_VERSION = "1.7.0"
+MINIMUM_NODE_VERSION = (12, 22, 0)
+VIDEO_RESULT_EVENT_PREFIX = "__HM_VIDEO_RESULT__:"
 SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_DIR = SCRIPT_DIR.parent
 
@@ -157,6 +159,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument("--check", action="store_true", help="check configuration and dependencies")
+    actions.add_argument(
+        "--runtime-check",
+        action="store_true",
+        help="check Node, engine syntax, ws, Chrome, and yt-dlp without loading sources",
+    )
     actions.add_argument("--list-sources", action="store_true", help="show configured sources")
     actions.add_argument("--init", action="store_true", help="create an empty example accounts file")
     actions.add_argument(
@@ -304,10 +311,68 @@ def is_facebook_url(value: str) -> bool:
     return host == "facebook.com" or host.endswith(".facebook.com") or host == "fb.watch"
 
 
-def dependency_status(args: argparse.Namespace) -> dict[str, object]:
+def _node_version(node: str | None) -> tuple[str | None, tuple[int, int, int] | None]:
+    if not node:
+        return None, None
+    probe = subprocess.run(
+        [node, "--version"], capture_output=True, text=True, check=False
+    )
+    raw = (probe.stdout or probe.stderr or "").strip()
+    match = re.search(r"v?(\d+)\.(\d+)\.(\d+)", raw)
+    if probe.returncode != 0 or not match:
+        return raw or None, None
+    return raw, tuple(int(part) for part in match.groups())
+
+
+def _node_syntax_ok(node: str | None) -> tuple[bool, list[str]]:
+    scripts = [
+        SCRIPT_DIR / "facebook_followed_video_engine.js",
+        SCRIPT_DIR / "facebook_followed_video_report.js",
+    ]
+    failures: list[str] = []
+    if not node:
+        return False, ["Node.js executable was not found"]
+    for script in scripts:
+        probe = subprocess.run(
+            [node, "--check", str(script)],
+            cwd=SCRIPT_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if probe.returncode != 0:
+            detail = (probe.stderr or probe.stdout or "syntax check failed").strip()
+            failures.append(f"{script.name}: {detail[-1000:]}")
+    return not failures, failures
+
+
+def _command_version_ok(command: str | None) -> bool:
+    if not command:
+        return False
+    try:
+        probe = subprocess.run(
+            [command, "--version"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0
+
+
+def runtime_status(args: argparse.Namespace) -> dict[str, object]:
     node = command_path("node")
     ytdlp = command_path(args.ytdlp or os.environ.get("FACEBOOK_FOLLOWED_YTDLP") or "yt-dlp")
     chrome = detect_chrome(args.chrome or os.environ.get("FACEBOOK_FOLLOWED_CHROME"))
+    node_version, parsed_node_version = _node_version(node)
+    node_supported = bool(
+        parsed_node_version and parsed_node_version >= MINIMUM_NODE_VERSION
+    )
+    engine_syntax_ok, syntax_errors = _node_syntax_ok(node)
+    chrome_runnable = _command_version_ok(chrome)
+    ytdlp_runnable = _command_version_ok(ytdlp)
     ws_ok = False
     if node:
         probe = subprocess.run(
@@ -318,6 +383,33 @@ def dependency_status(args: argparse.Namespace) -> dict[str, object]:
             check=False,
         )
         ws_ok = probe.returncode == 0
+    runtime_ready = bool(
+        node_supported
+        and engine_syntax_ok
+        and ws_ok
+        and chrome_runnable
+        and ytdlp_runnable
+    )
+    return {
+        "skill": SKILL_NAME,
+        "skillVersion": SKILL_VERSION,
+        "minimumNodeVersion": ".".join(str(part) for part in MINIMUM_NODE_VERSION),
+        "node": node,
+        "nodeVersion": node_version,
+        "nodeSupported": node_supported,
+        "engineSyntaxOk": engine_syntax_ok,
+        "engineSyntaxErrors": syntax_errors,
+        "wsModule": ws_ok,
+        "chrome": chrome,
+        "chromeRunnable": chrome_runnable,
+        "ytDlp": ytdlp,
+        "ytDlpRunnable": ytdlp_runnable,
+        "runtimeReady": runtime_ready,
+    }
+
+
+def dependency_status(args: argparse.Namespace) -> dict[str, object]:
+    runtime = runtime_status(args)
     try:
         if args.source:
             if not is_facebook_url(args.source[1]):
@@ -338,14 +430,28 @@ def dependency_status(args: argparse.Namespace) -> dict[str, object]:
         "sources": len(sources),
         "source_error": source_error,
         "output": str(args.output.expanduser()),
-        "node": node,
-        "ws_module": ws_ok,
-        "yt_dlp": ytdlp,
-        "chrome": chrome,
+        "node": runtime["node"],
+        "node_version": runtime["nodeVersion"],
+        "node_supported": runtime["nodeSupported"],
+        "engine_syntax_ok": runtime["engineSyntaxOk"],
+        "engine_syntax_errors": runtime["engineSyntaxErrors"],
+        "ws_module": runtime["wsModule"],
+        "yt_dlp": runtime["ytDlp"],
+        "chrome": runtime["chrome"],
+        "chrome_runnable": runtime["chromeRunnable"],
+        "yt_dlp_runnable": runtime["ytDlpRunnable"],
+        "runtime_ready": runtime["runtimeReady"],
         "browser_profile": str(args.browser_profile.expanduser()),
         "browser_login_ready": enabled_browser_profile(args) is not None,
-        "ready_for_preview": bool(node and ws_ok and chrome and sources and not source_error),
-        "ready_for_execute": bool(node and ws_ok and chrome and ytdlp and sources and not source_error),
+        "ready_for_preview": bool(
+            runtime["nodeSupported"]
+            and runtime["engineSyntaxOk"]
+            and runtime["wsModule"]
+            and runtime["chromeRunnable"]
+            and sources
+            and not source_error
+        ),
+        "ready_for_execute": bool(runtime["runtimeReady"] and sources and not source_error),
     }
 
 
@@ -437,6 +543,7 @@ def _load_result(path: Path, exit_code: int, execution_id: str | None) -> dict[s
             "mode": "unknown",
             "status": "failed",
             "sources": [],
+            "errorCode": "DOWNLOAD_MANIFEST_MISSING",
             "error": "download engine did not produce a result manifest",
         }
     payload["executionId"] = execution_id
@@ -537,7 +644,8 @@ def _run_download_with_accounts(args: argparse.Namespace, accounts: Path) -> int
             # Preserve the engine's opt-in per-video JSONL events in real time
             # when this entry point is itself piped into an orchestrator.
             print(line, end="", flush=True)
-            captured.append(line)
+            if not line.startswith(VIDEO_RESULT_EVENT_PREFIX):
+                captured.append(line)
         exit_code = process.wait()
 
         if run_log:
@@ -604,6 +712,10 @@ def main() -> int:
 
     if args.login:
         return prepare_browser_login(args)
+    if args.runtime_check:
+        status = runtime_status(args)
+        print(json.dumps(status, ensure_ascii=False, indent=2))
+        return 0 if status["runtimeReady"] else 1
     if args.check:
         status = dependency_status(args)
         print(json.dumps(status, ensure_ascii=False, indent=2))

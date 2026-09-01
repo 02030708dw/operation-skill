@@ -1,0 +1,54 @@
+name: Facebook video stability
+
+on:
+  push:
+    paths:
+      - "skills/facebook-followed-video-download/**"
+      - "skills/facebook-video-ingest/**"
+      - ".github/workflows/facebook-video-stability.yml"
+  pull_request:
+    paths:
+      - "skills/facebook-followed-video-download/**"
+      - "skills/facebook-video-ingest/**"
+      - ".github/workflows/facebook-video-stability.yml"
+
+jobs:
+  node-runtime:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [12.22.12, 22]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Check Node 12-compatible runtime syntax
+        run: |
+          node --check skills/facebook-followed-video-download/scripts/facebook_followed_video_engine.js
+          node --check skills/facebook-followed-video-download/scripts/facebook_followed_video_report.js
+      - name: Install downloader dependency
+        if: matrix.node == 22
+        working-directory: skills/facebook-followed-video-download/scripts
+        run: npm ci
+      - name: Run modern Node tests
+        if: matrix.node == 22
+        run: node --test skills/facebook-followed-video-download/tests/test_selection.js
+
+  python-pipeline:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run downloader entry-point tests
+        run: python -m unittest discover -s skills/facebook-followed-video-download/tests -p "test_*.py"
+      - name: Run ingest and Runner tests
+        run: python -m unittest discover -s skills/facebook-video-ingest/tests -p "test_*.py"

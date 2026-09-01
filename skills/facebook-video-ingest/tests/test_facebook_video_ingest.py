@@ -43,6 +43,14 @@ EXTENSION_SPEC.loader.exec_module(EXTENSION)
 
 
 class PipelineTests(unittest.TestCase):
+    def setUp(self):
+        self.runtime_check = mock.patch.object(
+            MODULE,
+            "download_runtime_check",
+            return_value={"runtimeReady": True, "nodeSupported": True},
+        ).start()
+        self.addCleanup(mock.patch.stopall)
+
     def test_installer_allows_production_admin_origin_by_default(self):
         self.assertIn(
             "https://hermes.mvkbmb.online",
@@ -77,6 +85,29 @@ class PipelineTests(unittest.TestCase):
             )
             EXTENSION.cleanup_capture_job_script(prepared, home=home)
             self.assertFalse((scripts / expected).exists())
+
+    def test_gateway_extension_versions_scheduled_runner_filename(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            scripts = home / "scripts"
+            scripts.mkdir()
+            (scripts / EXTENSION.BASE_RUNNER_NAME).write_text(
+                "# trusted runner\n", encoding="utf-8"
+            )
+            prepared = EXTENSION.prepare_capture_job_body(
+                {
+                    "hm_capture_runner": {
+                        "taskNo": "C-5786859AED6E",
+                        "scheduleKey": "1400",
+                        "runnerRevision": "r2",
+                    }
+                },
+                home=home,
+            )
+            self.assertEqual(
+                prepared["script"],
+                "hm_capture_C-5786859AED6E_1400_r2.py",
+            )
 
     def test_gateway_extension_rejects_ambiguous_runner_target(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -165,6 +196,45 @@ class PipelineTests(unittest.TestCase):
     def test_daily_recent_video_target_defaults_to_ten(self):
         args = MODULE.build_parser().parse_args(["--check"])
         self.assertEqual(args.count, 10)
+
+    def test_machine_video_events_are_forwarded_but_not_logged(self):
+        event = MODULE.VIDEO_RESULT_EVENT_PREFIX + '{"event":"video-result"}'
+        received = []
+        command = [
+            MODULE.sys.executable,
+            "-c",
+            f"print('human line'); print({event!r})",
+        ]
+        with mock.patch("builtins.print") as output:
+            exit_code, raw_output = MODULE.run_command(
+                command, on_line=received.append
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(raw_output, "human line\n")
+        self.assertEqual(received, ["human line\n", event + "\n"])
+        self.assertEqual(output.call_count, 1)
+
+    def test_runtime_preflight_failure_happens_before_claim(self):
+        args = MODULE.build_parser().parse_args(
+            [
+                "--execute",
+                "--backend",
+                "https://backend.example.com",
+                "--worker-id",
+                "worker-01",
+            ]
+        )
+        args.worker_token = "secret"
+        self.runtime_check.side_effect = MODULE.PipelineError(
+            "Node syntax unsupported", "DOWNLOAD_RUNTIME_NOT_READY"
+        )
+        with (
+            mock.patch.object(MODULE, "register_media_endpoint"),
+            mock.patch.object(MODULE, "claim") as claim,
+            self.assertRaisesRegex(MODULE.PipelineError, "Node syntax unsupported"),
+        ):
+            MODULE.execute_one(args)
+        claim.assert_not_called()
 
     def test_worker_loads_private_hermes_env_without_overwriting_process(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -259,7 +329,7 @@ class PipelineTests(unittest.TestCase):
                 "--task-no",
                 "C-5786859AED6E",
                 "--wait-for-work-seconds",
-                "30",
+                "90",
                 "--json",
             ],
         )
@@ -274,6 +344,12 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(
             RUNNER.task_no_from_runner(
                 Path("/tmp/hm_capture_C-5786859AED6E_immediate.py")
+            ),
+            "C-5786859AED6E",
+        )
+        self.assertEqual(
+            RUNNER.task_no_from_runner(
+                Path("/tmp/hm_capture_C-5786859AED6E_1400_r2.py")
             ),
             "C-5786859AED6E",
         )
@@ -351,12 +427,35 @@ class PipelineTests(unittest.TestCase):
             home / "facebook-video-ingest" / "upload-worker.lock",
         )
 
+    def test_recurring_capture_queue_runner_claims_one_unfiltered_job(self):
+        home = Path("/tmp/hermes")
+        runner = Path("/tmp/hm_capture_queue_worker.py")
+        self.assertEqual(
+            RUNNER.worker_command(
+                Path("/tmp/facebook_video_ingest.py"), runner
+            ),
+            [
+                RUNNER.sys.executable,
+                "/tmp/facebook_video_ingest.py",
+                "--execute",
+                "--json",
+            ],
+        )
+        self.assertEqual(
+            RUNNER.worker_lock_path(home, runner),
+            home / "facebook-video-ingest" / "capture-queue-worker.lock",
+        )
+
     def test_installer_installs_recurring_upload_runner(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
             INSTALLER.install_runner(home)
             self.assertEqual(
                 (home / "scripts" / INSTALLER.UPLOAD_RUNNER_NAME).read_bytes(),
+                RUNNER_PATH.read_bytes(),
+            )
+            self.assertEqual(
+                (home / "scripts" / INSTALLER.CAPTURE_QUEUE_RUNNER_NAME).read_bytes(),
                 RUNNER_PATH.read_bytes(),
             )
 
@@ -384,6 +483,33 @@ class PipelineTests(unittest.TestCase):
             )
 
         self.assertEqual(job["script"], INSTALLER.UPLOAD_RUNNER_NAME)
+        self.assertEqual(calls[-1][0:2], ("POST", "/api/jobs"))
+        self.assertEqual(calls[-1][2]["schedule"], "* * * * *")
+
+    def test_installer_creates_capture_queue_fallback_job(self):
+        calls = []
+
+        def fake_api(base, key, method, path, payload=None):
+            calls.append((method, path, payload))
+            if method == "GET":
+                return {"jobs": []}
+            return {
+                "job": {
+                    "id": "capture-worker",
+                    "name": INSTALLER.CAPTURE_QUEUE_WORKER_JOB_NAME,
+                    "schedule_display": INSTALLER.CAPTURE_QUEUE_WORKER_SCHEDULE,
+                    "enabled": True,
+                    "script": INSTALLER.CAPTURE_QUEUE_RUNNER_NAME,
+                    "no_agent": True,
+                }
+            }
+
+        with mock.patch.object(INSTALLER, "local_api_json", side_effect=fake_api):
+            job = INSTALLER.ensure_capture_queue_worker_job(
+                "http://127.0.0.1:8642", "secret"
+            )
+
+        self.assertEqual(job["script"], INSTALLER.CAPTURE_QUEUE_RUNNER_NAME)
         self.assertEqual(calls[-1][0:2], ("POST", "/api/jobs"))
         self.assertEqual(calls[-1][2]["schedule"], "* * * * *")
 

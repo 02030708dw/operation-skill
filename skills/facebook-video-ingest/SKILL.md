@@ -1,6 +1,8 @@
 ---
 name: facebook-video-ingest
 description: Run customer-side Hermes Workers for backend-managed Facebook capture executions, filter videos over 20 minutes before download, hold videos for operator review or honor task-level backend auto-review, upload approved files to Cloudflare R2, consume rejected-file deletion jobs on the source computer, and report results to HM. Use when Hermes must install its local API, pair with the HM admin browser, create or run local Cron jobs, execute a targeted HM ingest job, or troubleshoot the local video pipeline while HM runs on another server.
+metadata:
+  version: "1.2.0"
 ---
 
 # Facebook Video Ingest
@@ -85,6 +87,11 @@ idempotent. If final reconciliation still cannot reach HM, leave the execution
 running for its lease retry rather than reporting completion.
 
 The Hermes Cron runner resolves only `<hermes-home>/skills/facebook-video-ingest/scripts/facebook_video_ingest.py`. It must fail clearly if that installed Skill is missing; never fall back to a categorized copy or a recursive match.
+
+Before any capture claim, the Worker runs the downloader's `--runtime-check`.
+An incomplete Skill update, unsupported Node version, JavaScript syntax error,
+missing `ws`, Chrome, or `yt-dlp` returns `DOWNLOAD_RUNTIME_NOT_READY` without
+claiming the backend execution.
 
 ## Operations
 
@@ -175,6 +182,13 @@ claims capture executions,
 and is the correctness path for cross-computer review. A browser on the source
 computer may still start a one-shot upload as a latency optimization.
 
+It also maintains one `HM 视频抓取队列兜底 Worker` no-agent Cron every minute.
+That runner makes one unfiltered, idempotent claim and processes at most one
+queued capture, covering a missed task-specific Cron without competing with a
+normally claimed execution. Task-specific scheduled runners still take
+priority, wait up to 90 seconds for the exact backend enqueue, and include a
+revision suffix so an updated admin can replace stale script copies.
+
 The installer removes the old `HM 后台任务接收 Worker`, `HM 视频抓取 Worker`,
 and stale `HM 立即抓取 C-*` jobs, and stops the old continuous `--watch`
 process on POSIX machines. Preserve `HM 视频抓取 C-*` scheduled jobs during
@@ -196,7 +210,7 @@ completion.
 
 ## Execution Rules
 
-1. Run `--check` before first execution. Fix missing scripts, `yt-dlp`, Node `ws`, `boto3`, Chrome, backend settings, or R2 settings before claiming work.
+1. Run `--check` before first execution. Fix missing scripts, Node.js 12.22+, JavaScript syntax, `yt-dlp`, Node `ws`, `boto3`, Chrome, backend settings, or R2 settings before claiming work.
    The check also refreshes the Worker media-address registration without
    printing either Worker or media credentials.
 2. Claim only through the HM internal Worker API. For a scheduled local Cron, include its backend task number. For immediate execution, include both the backend task and execution numbers. Never invent an execution ID, source URL, or result.
@@ -240,9 +254,9 @@ Read [references/backend-api.md](references/backend-api.md) before changing the 
 
 ## Result Interpretation
 
-- `COMPLETED`: every selected/reused video downloaded successfully and is waiting for review or was automatically queued by HM, or the source exposed no videos.
+- `COMPLETED`: every selected/reused video downloaded successfully and is waiting for review or was automatically queued by HM.
 - `PARTIAL`: at least one selected video downloaded and entered review, while at least one other selected video failed to download.
-- `FAILED`: no item completed and the download, upload, or orchestration failed.
+- `FAILED`: no item completed and the download, discovery, access, upload, or orchestration failed. A public page with no supported video link is `FACEBOOK_DISCOVERY_EMPTY`, not a successful no-update result.
 - `no-work`: no queued Facebook execution, approved upload, or local-delete job was available; the continuous Worker waits and polls again.
 
 Use the HM task detail API for per-video fields and the execution-history API for progress, terminal status, error, and combined result JSON.
