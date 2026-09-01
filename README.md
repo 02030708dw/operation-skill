@@ -165,7 +165,7 @@ git pull
 | `facebook-daily-like` | 2.4.0 | 通过 MYT HTTP API 并发操作云手机，为 Facebook 动态按指定数量点赞 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-daily-like/SKILL.md) |
 | `facebook-daily-comment` | 2.8.0 | 通过 MYT HTTP API 并发操作云手机，为 Facebook 动态发表指定数量和内容的评论 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-daily-comment/SKILL.md) |
 | `facebook-post-publish` | 1.2.0 | 在 MYT 云手机的 Facebook 中发布纯文字、图片或视频帖子，并严格校验图库素材类型 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-post-publish/SKILL.md) |
-| `facebook-followed-video-download` | 1.1.0 | 扫描获准访问的 Facebook 来源，按来源下载新增视频、去重并输出可供后台消费的结果清单 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-followed-video-download/SKILL.md) |
+| `facebook-followed-video-download` | 1.6.2 | 扫描获准访问的 Facebook 来源，按来源下载新增视频、去重并输出可供后台消费的结果清单 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-followed-video-download/SKILL.md) |
 | `cloudflare-r2-video-upload` | 1.1.0 | 将本地视频或下载结果清单安全上传到 Cloudflare R2，支持校验、去重、并发和结果清单 | Windows、Linux、macOS | [查看 SKILL.md](skills/cloudflare-r2-video-upload/SKILL.md) |
 | `facebook-video-ingest` | 1.1.0 | 按后台任务编号定向认领，串联 Facebook 下载、R2 上传，并回写逐视频和执行记录 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-video-ingest/SKILL.md) |
 | `myt-cloud-phone-file-upload` | 2.0.0 | 将用户指定的单个文件或目录内全部文件并发上传到魔云腾云手机，保持相对子目录并验证每个文件 | Windows、Linux、macOS | [查看 SKILL.md](skills/myt-cloud-phone-file-upload/SKILL.md) |
@@ -321,6 +321,7 @@ git pull
 - 默认只预演；只有用户明确要求下载时才使用真实执行模式。
 - `--count` 表示每个来源本次最多下载多少个，`0` 表示不限制。
 - 每次真实执行生成 Markdown、JSON 和原始日志报告。
+- 共用 Chrome 配置的重叠任务会自动排队，避免并发启动导致 CDP 连接失败；繁忙来源仍建议错峰调度。
 - 不保存账号、密码、Token 或 cookie 内容；可选 cookie 只能通过本地文件路径引用。
 
 #### 使用前准备

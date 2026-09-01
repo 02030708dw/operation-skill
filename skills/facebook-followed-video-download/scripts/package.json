@@ -1,7 +1,7 @@
 {
   "name": "facebook-followed-video-download",
   "private": true,
-  "version": "1.6.1",
+  "version": "1.6.2",
   "description": "Local helper dependencies for the Hermes Facebook followed-video download skill.",
   "dependencies": {
     "ws": "^8.21.0"

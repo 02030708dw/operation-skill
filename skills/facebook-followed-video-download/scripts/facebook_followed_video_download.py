@@ -11,13 +11,15 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
 
 SKILL_NAME = "facebook-followed-video-download"
-SKILL_VERSION = "1.6.1"
+SKILL_VERSION = "1.6.2"
 SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_DIR = SCRIPT_DIR.parent
 
@@ -60,6 +62,90 @@ DEFAULT_REPORTS = Path(
 DEFAULT_DAILY_COUNT = 10
 DEFAULT_BROWSER_PROFILE = STATE_DIR / "chrome-profile"
 LOGIN_MARKER = ".hermes-login-enabled"
+RUN_LOCK = STATE_DIR / ".capture-run.lock"
+
+
+class ConcurrentRunError(RuntimeError):
+    """Raised when a second downloader run cannot acquire the shared lock."""
+
+
+@contextmanager
+def single_run_lock(path: Path, *, wait: bool = True):
+    """Serialize runs that share the isolated Chrome profile.
+
+    The operating system releases this advisory lock automatically if a worker
+    exits or crashes, so a stale PID written in the file never blocks a later
+    run. Scheduled runs wait in order instead of starting a competing Chrome.
+    """
+    path = path.expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+", encoding="utf-8")
+    acquired = False
+    announced_wait = False
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write("0")
+                handle.flush()
+            while True:
+                handle.seek(0)
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    acquired = True
+                    break
+                except OSError as exc:
+                    if not wait:
+                        raise ConcurrentRunError(
+                            "another Facebook capture is already active"
+                        ) from exc
+                    if not announced_wait:
+                        print(
+                            "Another Facebook capture is active; waiting for the shared Chrome session...",
+                            flush=True,
+                        )
+                        announced_wait = True
+                    time.sleep(1)
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except (OSError, BlockingIOError) as exc:
+                if not wait:
+                    raise ConcurrentRunError(
+                        "another Facebook capture is already active"
+                    ) from exc
+                print(
+                    "Another Facebook capture is active; waiting for the shared Chrome session...",
+                    flush=True,
+                )
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                acquired = True
+
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"{os.getpid()}\n")
+        handle.flush()
+        yield
+    finally:
+        if acquired:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -536,7 +622,8 @@ def main() -> int:
     if args.add_source:
         add_source(args.accounts, args.add_source[0], args.add_source[1])
         return 0
-    return run_download(args)
+    with single_run_lock(RUN_LOCK):
+        return run_download(args)
 
 
 if __name__ == "__main__":

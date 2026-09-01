@@ -2,7 +2,7 @@
 name: facebook-followed-video-download
 description: Find, download, or locally reuse recent permitted Facebook Page, creator, Reels, watch, or direct video URLs in per-source folders with archive-backed duplicate prevention and reports. Use when the user asks Hermes to configure followed Facebook video sources, preview recent videos, download the latest or all videos, list sources, check dependencies, or troubleshoot this downloader. Defaults to preview and downloads only with explicit execution approval.
 metadata:
-  version: "1.6.1"
+  version: "1.6.2"
   platforms:
     - windows
     - macos
@@ -59,6 +59,7 @@ Paths with `/` are intentional and work with Python on Windows. Do not call the 
 - Full mode: unlimited new videos per source and 80 scroll rounds
 - Execution: dry run unless `--execute` is present
 - Login profile: disabled until the user explicitly runs `--login`; stored only in the isolated Skill state directory
+- Concurrency: runs sharing the isolated Chrome profile are serialized with an OS-released lock; overlapping schedules wait instead of launching a competing Chrome
 
 The entry point infers `<hermes-home>` from its installed location. All defaults can be overridden with arguments, so the Skill is portable across computers.
 
@@ -197,6 +198,7 @@ Do not delete or rewrite these files during routine use. A dry run never appends
 - `ready_for_preview: false`: inspect `node`, `ws_module`, the accounts file, and its source count.
 - `ready_for_execute: false`: install or configure `yt-dlp`.
 - Chrome not found: pass `--chrome "<executable-path>"` or set `FACEBOOK_FOLLOWED_CHROME`.
+- `Chrome CDP did not start` during overlapping schedules: version 1.6.2 serializes runs automatically. Stagger busy sources as well to reduce queue time.
 - Direct Reel URLs work but Page scanning finds nothing: treat this as a discovery limitation; do not claim the Page contains no videos.
 - Zero discovered URLs is a discovery failure, not a successful no-update result. The recent-video fallback requires at least one publicly discoverable URL.
 - Access/login errors: stop unless the user has an authorized, non-bypassing access method.

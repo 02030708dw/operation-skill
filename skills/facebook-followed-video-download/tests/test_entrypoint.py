@@ -97,6 +97,16 @@ class EntryPointTests(unittest.TestCase):
             self.assertEqual(payload["executionId"], "E-001")
             self.assertEqual(payload["exitCode"], 0)
 
+    def test_single_run_lock_rejects_a_competing_nonblocking_run(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            lock_path = Path(temporary) / "capture.lock"
+            with MODULE.single_run_lock(lock_path):
+                with self.assertRaises(MODULE.ConcurrentRunError):
+                    with MODULE.single_run_lock(lock_path, wait=False):
+                        pass
+            with MODULE.single_run_lock(lock_path, wait=False):
+                pass
+
 
 if __name__ == "__main__":
     unittest.main()
