@@ -62,101 +62,123 @@ operation-skill/
 └── README.md
 ```
 
-## 获取 Skill
+## 获取和自动更新 Skill
 
-### 方法一：订阅 Hermes Tap（推荐）
+运营电脑使用 Cloudflare R2 发布包，不需要 GitHub 账号、GitHub Token 或 Git。仓库合并到 `main` 后，GitHub Actions 将完整 Skill ZIP、SHA-256 清单和更新器发布到 R2；客户端只请求一个小型 `manifest.json`，版本变化时才下载 ZIP。
 
-添加本仓库后，Hermes 会按默认 `skills/` 路径发现其中所有 Skill：
+管理员先提供类似下面的公开下载地址。这个地址不包含 R2 写入凭据：
 
-```powershell
-hermes skills tap add 02030708dw/operation-skill
+```text
+https://skills.88shorts.com/operation-skills/stable
 ```
 
-搜索并安装需要的 Skill：
+### Windows
+
+在 PowerShell 中按电脑现状选择一种命令。
+
+新电脑：安装并纳管 5 个核心 Skill：
 
 ```powershell
-hermes skills search facebook-daily-like
-hermes skills search facebook-daily-comment
-hermes skills search facebook-post-publish
-hermes skills search facebook-followed-video-download
-hermes skills search cloudflare-r2-video-upload
-hermes skills search facebook-video-ingest
-hermes skills search myt-cloud-phone-file-upload
-hermes skills search philippines-lottery-result-media
-hermes skills install 02030708dw/operation-skill/facebook-daily-like
-hermes skills install 02030708dw/operation-skill/facebook-daily-comment
-hermes skills install 02030708dw/operation-skill/facebook-post-publish
-hermes skills install 02030708dw/operation-skill/facebook-followed-video-download
-hermes skills install 02030708dw/operation-skill/cloudflare-r2-video-upload
-hermes skills install 02030708dw/operation-skill/facebook-video-ingest
-hermes skills install 02030708dw/operation-skill/myt-cloud-phone-file-upload
-hermes skills install 02030708dw/operation-skill/philippines-lottery-result-media
+$env:OPERATION_SKILL_BASE_URL='https://skills.88shorts.com/operation-skills/stable'
+$installer="$env:TEMP\install-operation-skill-updater.ps1"
+Invoke-WebRequest -UseBasicParsing -MaximumRedirection 0 -Uri "$env:OPERATION_SKILL_BASE_URL/install-operation-skill-updater.ps1" -OutFile $installer
+& $installer -InstallCore
 ```
 
-安装后，如果 Hermes 会话已经打开，执行：
+已经由本更新器管理的电脑：普通重装更新器，不改变原纳管范围：
+
+```powershell
+$env:OPERATION_SKILL_BASE_URL='https://skills.88shorts.com/operation-skills/stable'
+$installer="$env:TEMP\install-operation-skill-updater.ps1"
+Invoke-WebRequest -UseBasicParsing -MaximumRedirection 0 -Uri "$env:OPERATION_SKILL_BASE_URL/install-operation-skill-updater.ps1" -OutFile $installer
+& $installer
+```
+
+旧电脑曾人工复制核心 Skill、尚未由更新器管理：管理员确认没有需要保留的本地修改后，执行采用：
+
+```powershell
+$env:OPERATION_SKILL_BASE_URL='https://skills.88shorts.com/operation-skills/stable'
+$installer="$env:TEMP\install-operation-skill-updater.ps1"
+Invoke-WebRequest -UseBasicParsing -MaximumRedirection 0 -Uri "$env:OPERATION_SKILL_BASE_URL/install-operation-skill-updater.ps1" -OutFile $installer
+& $installer -AdoptExistingCore
+```
+
+### macOS
+
+在终端中按电脑现状选择一种命令。
+
+新电脑：安装并纳管 5 个核心 Skill：
+
+```bash
+export OPERATION_SKILL_BASE_URL='https://skills.88shorts.com/operation-skills/stable'
+installer="$(mktemp)"
+curl -fsSL --proto '=https' --proto-redir '=https' "$OPERATION_SKILL_BASE_URL/install-operation-skill-updater.sh" -o "$installer"
+bash "$installer" --install-core
+```
+
+已经由本更新器管理的电脑：普通重装更新器，不改变原纳管范围：
+
+```bash
+export OPERATION_SKILL_BASE_URL='https://skills.88shorts.com/operation-skills/stable'
+installer="$(mktemp)"
+curl -fsSL --proto '=https' --proto-redir '=https' "$OPERATION_SKILL_BASE_URL/install-operation-skill-updater.sh" -o "$installer"
+bash "$installer"
+```
+
+旧电脑曾人工复制核心 Skill、尚未由更新器管理：管理员确认没有需要保留的本地修改后，执行采用：
+
+```bash
+export OPERATION_SKILL_BASE_URL='https://skills.88shorts.com/operation-skills/stable'
+installer="$(mktemp)"
+curl -fsSL --proto '=https' --proto-redir '=https' "$OPERATION_SKILL_BASE_URL/install-operation-skill-updater.sh" -o "$installer"
+bash "$installer" --adopt-existing-core
+```
+
+安装器会先在前台检查一次，再创建“登录时运行”和“每天当地时间 04:00–04:29 运行”的当前用户计划任务。即使首次检查返回可恢复错误，也会继续尝试注册自动重试计划；计划注册成功后，安装器会保留首次检查的退出码。如果计划注册本身失败，则优先返回计划注册错误。具体分钟由电脑名稳定分散，避免所有运营机同时下载。
+
+`InstallCore`/`--install-core` 会把 5 个核心 Skill 加入原有 `managedSkills`，不会移除原来纳管的其他 Skill，也不会删除配置中的未知字段。管理员采用会校验当前发布序列；若需替换旧文件，会先写入不参与普通备份轮换的永久采用备份。纳管后若再发生本地修改，更新器只告警并保留本地文件，绝不覆盖。
+
+重新运行安装器也会读取本机已接受的发布序列：旧序列或“同一序列但 commit 不同”的安装包会在覆盖更新器前被拒绝，不能借重装绕过防回退保护。
+
+更新前会等待正在运行的运营任务结束。新版本先完成 ZIP 和逐 Skill SHA-256 校验，再备份和替换；本地文件被人工修改时保留本地版本并告警。`facebook-video-ingest` 更新后会在空闲状态同步刷新 Hermes Worker、Cron runner 和 Gateway 扩展。
+
+更新状态、日志和最近 3 份备份位于：
+
+```text
+~/.hermes/operation-skill-updater/
+```
+
+如果更新时 Hermes 会话已经打开，收到更新通知后执行：
 
 ```text
 /reload-skills
 ```
 
-随后便可通过斜杠命令加载：
+手工检查但不安装：
 
-```text
-/facebook-daily-like
-/facebook-daily-comment
-/facebook-post-publish
-/facebook-followed-video-download
-/cloudflare-r2-video-upload
-/facebook-video-ingest
-/myt-cloud-phone-file-upload
-/philippines-lottery-result-media
+```bash
+~/.hermes/hermes-agent/venv/bin/python ~/.hermes/operation-skill-updater/operation_skill_updater.py check
 ```
 
-检查和更新通过 Hermes 安装的 Skill：
+Windows 将上面两个路径分别替换为 `~\.hermes\hermes-agent\venv\Scripts\python.exe` 和 `~\.hermes\operation-skill-updater\operation_skill_updater.py`。
 
-```powershell
-hermes skills check
-hermes skills update
-```
+### 管理员发布配置
 
-查看或移除已经订阅的 Tap：
+在 GitHub 仓库的 Actions secrets 中配置：
 
-```powershell
-hermes skills tap list
-hermes skills tap remove 02030708dw/operation-skill
-```
+- `CLOUDFLARE_R2_ACCOUNT_ID`
+- `CLOUDFLARE_R2_ACCESS_KEY_ID`
+- `CLOUDFLARE_R2_SECRET_ACCESS_KEY`
+- `CLOUDFLARE_R2_BUCKET`
+- `OPERATION_SKILL_PUBLIC_BASE_URL`：R2 公共域名根地址，不包含 `/operation-skills`
 
-### 方法二：直接安装单个 Skill
+`.github/workflows/publish-operation-skills.yml` 会先上传按 commit 命名的不可变 ZIP 和按 SHA-256 命名的不可变更新器，再上传安装器，最后发布 stable manifest，避免客户端下载到半发布状态。
 
-不订阅整个仓库，只安装一个 Skill：
+### GitHub Tap（开发和排障备用）
 
-```powershell
-hermes skills install 02030708dw/operation-skill/skills/facebook-daily-like
-hermes skills install 02030708dw/operation-skill/skills/facebook-daily-comment
-hermes skills install 02030708dw/operation-skill/skills/facebook-post-publish
-hermes skills install 02030708dw/operation-skill/skills/facebook-followed-video-download
-hermes skills install 02030708dw/operation-skill/skills/cloudflare-r2-video-upload
-hermes skills install 02030708dw/operation-skill/skills/facebook-video-ingest
-hermes skills install 02030708dw/operation-skill/skills/myt-cloud-phone-file-upload
-hermes skills install 02030708dw/operation-skill/skills/philippines-lottery-result-media
-```
+开发人员仍可使用 `hermes skills tap add 02030708dw/operation-skill` 和 `hermes skills install ...`。不建议运营机把它作为日常更新方式：GitHub 匿名 REST API 按出口 IP 限流，同一办公室的多台电脑会共享额度。
 
-### 方法三：使用 Git 拉取整个仓库
-
-适合查看源码、参与开发或同时维护多个 Skill：
-
-```powershell
-git clone https://github.com/02030708dw/operation-skill.git
-cd operation-skill
-```
-
-以后同步最新内容：
-
-```powershell
-git pull
-```
-
-如需手动安装，将 `skills/<skill-name>/` 的完整目录复制到当前 Hermes 配置使用的本地 `skills` 目录，并在运行中的 Hermes 会话执行 `/reload-skills`。
+离线环境仍可由管理员发放 ZIP，将完整 `skills/<skill-name>/` 目录复制到 Hermes 的 `skills` 目录。
 
 ## Skill 一览
 
