@@ -398,7 +398,7 @@ function discoveryExpression() {
     (() => {
       const found = new Set();
       const add = value => {
-        const href = String(value || '').replace(/\\\\\//g, '/');
+        const href = String(value || '').replace(/\\\\\\\//g, '/');
         if (
           href.includes('/reel/') || href.includes('/watch/?v=')
           || href.includes('/videos/') || href.includes('/video.php?v=')
@@ -424,7 +424,7 @@ function discoveryExpression() {
       for (const script of Array.from(document.querySelectorAll('script')).slice(0, 60)) {
         if (scriptBudget <= 0) break;
         const rawText = String(script.textContent || '').slice(0, Math.min(100000, scriptBudget));
-        const text = rawText.replace(/\\\\\//g, '/');
+        const text = rawText.replace(/\\\\\\\//g, '/');
         scriptBudget -= rawText.length;
         for (const pattern of patterns) {
           pattern.lastIndex = 0;

@@ -109,6 +109,34 @@ test('bounded browser extraction expression compiles without whole-page HTML', (
   assert.equal(expression.includes('scriptBudget = 2000000'), true);
 });
 
+test('bounded browser extraction expression executes and decodes escaped URLs', () => {
+  const expression = discoveryExpression();
+  const document = {
+    body: { innerText: 'Public Facebook page' },
+    querySelector: () => null,
+    querySelectorAll: selector => {
+      if (selector === 'a[href]') {
+        return [{ href: String.raw`https:\/\/www.facebook.com\/reel\/12345` }];
+      }
+      if (selector === 'script') {
+        return [{ textContent: String.raw`{"url":"https:\/\/fb.watch\/AbCdEf\/"}` }];
+      }
+      return [];
+    },
+  };
+  const location = {
+    href: 'https://www.facebook.com/example/reels/',
+    origin: 'https://www.facebook.com',
+  };
+  const evaluate = new Function('document', 'location', `return (${expression});`);
+  const snapshot = JSON.parse(evaluate(document, location));
+
+  assert.deepEqual(snapshot.urls, [
+    'https://www.facebook.com/reel/12345',
+    'https://fb.watch/AbCdEf',
+  ]);
+});
+
 test('reads Chrome dynamic DevToolsActivePort and waits for its endpoint', async () => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'fb-cdp-port-'));
   const server = http.createServer((request, response) => {
