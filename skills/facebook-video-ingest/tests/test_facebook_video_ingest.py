@@ -324,7 +324,7 @@ class PipelineTests(unittest.TestCase):
             command,
             [
                 RUNNER.sys.executable,
-                "/tmp/facebook_video_ingest.py",
+                str(Path("/tmp/facebook_video_ingest.py")),
                 "--execute",
                 "--task-no",
                 "C-5786859AED6E",
@@ -379,7 +379,7 @@ class PipelineTests(unittest.TestCase):
             ),
             [
                 RUNNER.sys.executable,
-                "/tmp/facebook_video_ingest.py",
+                str(Path("/tmp/facebook_video_ingest.py")),
                 "--watch",
             ],
         )
@@ -394,7 +394,7 @@ class PipelineTests(unittest.TestCase):
             command,
             [
                 RUNNER.sys.executable,
-                "/tmp/facebook_video_ingest.py",
+                str(Path("/tmp/facebook_video_ingest.py")),
                 "--execute",
                 "--upload-only",
                 "--task-no",
@@ -416,7 +416,7 @@ class PipelineTests(unittest.TestCase):
             ),
             [
                 RUNNER.sys.executable,
-                "/tmp/facebook_video_ingest.py",
+                str(Path("/tmp/facebook_video_ingest.py")),
                 "--execute",
                 "--upload-only",
                 "--json",
@@ -436,7 +436,7 @@ class PipelineTests(unittest.TestCase):
             ),
             [
                 RUNNER.sys.executable,
-                "/tmp/facebook_video_ingest.py",
+                str(Path("/tmp/facebook_video_ingest.py")),
                 "--execute",
                 "--json",
             ],
@@ -558,6 +558,15 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
         self.assertEqual(run.call_args.kwargs["errors"], "replace")
         self.assertTrue(run.call_args.kwargs["capture_output"])
+
+    def test_installer_replaces_unencodable_console_characters(self):
+        buffer = io.BytesIO()
+        stream = io.TextIOWrapper(buffer, encoding="cp1252", errors="strict")
+
+        INSTALLER.write_console("✓ Gateway is running\n", stream=stream)
+        stream.flush()
+
+        self.assertEqual(buffer.getvalue().decode("cp1252"), "? Gateway is running\n")
 
     def test_installer_keeps_console_attached_for_windows_uac(self):
         completed = INSTALLER.subprocess.CompletedProcess(

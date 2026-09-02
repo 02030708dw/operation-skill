@@ -48,6 +48,17 @@ SUBPROCESS_ENCODING = "utf-8"
 SUBPROCESS_ERRORS = "replace"
 
 
+def write_console(text: str, *, stream=None) -> None:
+    """Write subprocess output without crashing on a narrow Windows code page."""
+    destination = stream if stream is not None else sys.stdout
+    try:
+        destination.write(text)
+    except UnicodeEncodeError:
+        encoding = getattr(destination, "encoding", None) or "utf-8"
+        safe_text = text.encode(encoding, errors="replace").decode(encoding)
+        destination.write(safe_text)
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         description="Install or inspect the HM capture and upload Worker bridge"
@@ -106,9 +117,9 @@ def call(
         check=False,
     )
     if completed.stdout:
-        print(completed.stdout, end="")
+        write_console(completed.stdout)
     if completed.stderr:
-        print(completed.stderr, end="", file=sys.stderr)
+        write_console(completed.stderr, stream=sys.stderr)
     combined = ANSI_PATTERN.sub("", f"{completed.stdout}\n{completed.stderr}")
     reported_failure = any(
         line.strip().startswith("Failed to ") for line in combined.splitlines()

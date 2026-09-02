@@ -46,15 +46,26 @@ def include_file(path: Path, root: Path) -> bool:
     return not any(part in IGNORED_PARTS for part in relative.parts)
 
 
+def relative_path_key(path: Path, root: Path) -> str:
+    """Return an OS-independent, case-sensitive path ordering key."""
+    return path.relative_to(root).as_posix()
+
+
 def skill_files(skill_dir: Path) -> list[Path]:
-    symlinks = sorted(path for path in skill_dir.rglob("*") if path.is_symlink())
+    symlinks = sorted(
+        (path for path in skill_dir.rglob("*") if path.is_symlink()),
+        key=lambda path: relative_path_key(path, skill_dir),
+    )
     if symlinks:
         relative = symlinks[0].relative_to(skill_dir)
         raise ValueError(f"skill contains unsupported symlink: {skill_dir.name}/{relative}")
     return sorted(
-        path
-        for path in skill_dir.rglob("*")
-        if path.is_file() and include_file(path, skill_dir)
+        (
+            path
+            for path in skill_dir.rglob("*")
+            if path.is_file() and include_file(path, skill_dir)
+        ),
+        key=lambda path: relative_path_key(path, skill_dir),
     )
 
 
@@ -123,7 +134,10 @@ def zip_info(name: str, executable: bool) -> zipfile.ZipInfo:
 def build_archive(skills_dir: Path, archive_path: Path) -> list[dict[str, object]]:
     skills: list[dict[str, object]] = []
     with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
-        for skill_dir in sorted(path for path in skills_dir.iterdir() if path.is_dir()):
+        for skill_dir in sorted(
+            (path for path in skills_dir.iterdir() if path.is_dir()),
+            key=lambda path: relative_path_key(path, skills_dir),
+        ):
             skill_md = skill_dir / "SKILL.md"
             if not skill_md.is_file():
                 continue
