@@ -561,7 +561,9 @@ class PipelineTests(unittest.TestCase):
 
     def test_installer_replaces_unencodable_console_characters(self):
         buffer = io.BytesIO()
-        stream = io.TextIOWrapper(buffer, encoding="cp1252", errors="strict")
+        stream = io.TextIOWrapper(
+            buffer, encoding="cp1252", errors="strict", newline=""
+        )
 
         INSTALLER.write_console("✓ Gateway is running\n", stream=stream)
         stream.flush()
