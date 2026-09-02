@@ -2,7 +2,7 @@
 name: facebook-video-ingest
 description: Run customer-side Hermes Workers for backend-managed Facebook capture executions, filter videos over 20 minutes before download, hold videos for operator review or honor task-level backend auto-review, upload approved files to Cloudflare R2, consume rejected-file deletion jobs on the source computer, and report results to HM. Use when Hermes must install its local API, pair with the HM admin browser, create or run local Cron jobs, execute a targeted HM ingest job, or troubleshoot the local video pipeline while HM runs on another server.
 metadata:
-  version: "1.2.0"
+  version: "1.2.1"
 ---
 
 # Facebook Video Ingest
@@ -254,9 +254,11 @@ Read [references/backend-api.md](references/backend-api.md) before changing the 
 
 ## Result Interpretation
 
-- `COMPLETED`: every selected/reused video downloaded successfully and is waiting for review or was automatically queued by HM.
+- `COMPLETED`: every actionable video downloaded successfully and is waiting for review or was automatically queued by HM. A batch containing only `archived-existing` or `filtered-duration` items is also complete with no new video callback.
 - `PARTIAL`: at least one selected video downloaded and entered review, while at least one other selected video failed to download.
 - `FAILED`: no item completed and the download, discovery, access, upload, or orchestration failed. A public page with no supported video link is `FACEBOOK_DISCOVERY_EMPTY`, not a successful no-update result.
 - `no-work`: no queued Facebook execution, approved upload, or local-delete job was available; the continuous Worker waits and polls again.
+
+`archived-existing` is an informational downloader result: yt-dlp previously completed the video, its archive still contains the stable ID, and the approved upload flow may already have removed the local file. Advance progress, record the count in the execution result, and do not create a failed HM video callback.
 
 Use the HM task detail API for per-video fields and the execution-history API for progress, terminal status, error, and combined result JSON.

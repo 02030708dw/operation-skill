@@ -11,7 +11,9 @@ const {
   classifyDiscoveryFailure,
   discoveryExpression,
   discoverWithRecovery,
+  existingVideoState,
   isSupportedVideoUrl,
+  isYtDlpArchived,
   normalizeVideoUrl,
   pageCandidates,
   readDevToolsActivePort,
@@ -22,7 +24,7 @@ const {
   publishedAtFromMetadata,
   waitForChrome,
 } = require('../scripts/facebook_followed_video_engine.js');
-const { parseRunLog } = require('../scripts/facebook_followed_video_report.js');
+const { parseRunLog, renderReport } = require('../scripts/facebook_followed_video_report.js');
 
 function reel(id) {
   return `https://www.facebook.com/reel/${id}`;
@@ -345,6 +347,29 @@ test('full import still excludes archived videos', () => {
   );
 });
 
+test('archive-only video is classified without replacing a retained local file', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'fb-archive-test-'));
+  const url = reel(987654321);
+  const archivePath = path.join(temporary, '.yt-dlp-archive.txt');
+  try {
+    fs.writeFileSync(archivePath, 'facebook 987654321\n', 'utf8');
+    assert.equal(isYtDlpArchived(temporary, url), true);
+    assert.deepEqual(
+      existingVideoState(temporary, url, '987654321'),
+      { status: 'archived-existing', localPath: null },
+    );
+
+    const retained = path.join(temporary, '20260902_987654321_creator.mp4');
+    fs.writeFileSync(retained, 'video', 'utf8');
+    assert.deepEqual(
+      existingVideoState(temporary, url, '987654321'),
+      { status: 'local-existing', localPath: retained },
+    );
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
 test('daily report recognizes the recent-window selection summary', () => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'fb-report-test-'));
   const logPath = path.join(temporary, 'daily.log');
@@ -359,6 +384,28 @@ test('daily report recognizes the recent-window selection summary', () => {
     assert.equal(creator.found, 16);
     assert.equal(creator.pending, 10);
     assert.equal(creator.ok, 10);
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test('daily report treats archive-only fallback as completed with no new video', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'fb-report-archive-test-'));
+  const logPath = path.join(temporary, 'daily.log');
+  try {
+    fs.writeFileSync(
+      logPath,
+      '=== creator ===\n找到影片: 12，本次選取: 10\n已歸檔跳過: 10\n成功: 0/0\n',
+      'utf8',
+    );
+    const parsed = parseRunLog(logPath);
+    const rendered = renderReport([{ folder: 'creator', url: reel(1) }], parsed);
+    assert.equal(rendered.json.totalNew, 0);
+    assert.equal(rendered.json.totalFailures, 0);
+    assert.equal(rendered.json.totalArchivedExisting, 10);
+    assert.equal(rendered.json.accounts[0].state, '無新增，已歸檔 10');
+    assert.match(rendered.markdown, /沒有新影片/);
+    assert.doesNotMatch(rendered.markdown, /有處理失敗/);
   } finally {
     fs.rmSync(temporary, { recursive: true, force: true });
   }

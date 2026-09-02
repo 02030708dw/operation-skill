@@ -838,6 +838,42 @@ class PipelineTests(unittest.TestCase):
         record_video.assert_not_called()
         self.assertEqual(progress, [85])
 
+    def test_archived_existing_event_advances_progress_without_recording_video(self):
+        line = MODULE.VIDEO_RESULT_EVENT_PREFIX + json.dumps(
+            {
+                "event": "video-result",
+                "completed": 1,
+                "total": 1,
+                "video": {
+                    "status": "archived-existing",
+                    "canonicalUrl": "https://www.facebook.com/reel/already-uploaded",
+                },
+            }
+        )
+        progress = []
+        recorder = MODULE.IncrementalVideoRecorder(
+            "https://backend.example.com",
+            "secret",
+            "worker-01",
+            "E-ARCHIVED",
+            progress.append,
+        )
+
+        with mock.patch.object(MODULE, "record_video") as record_video:
+            recorder.start()
+            recorder.handle_line(line)
+            recorder.finish(
+                [
+                    {
+                        "status": "archived-existing",
+                        "canonicalUrl": "https://www.facebook.com/reel/already-uploaded",
+                    }
+                ]
+            )
+
+        record_video.assert_not_called()
+        self.assertEqual(progress, [85])
+
     def test_upload_status_mapping_is_explicit(self):
         self.assertEqual(MODULE.normalized_upload_status("uploaded"), "UPLOADED")
         self.assertEqual(
@@ -1555,6 +1591,155 @@ class PipelineTests(unittest.TestCase):
             download_run_kwargs["env"][MODULE.VIDEO_RESULT_EVENTS_ENV],
             "1",
         )
+
+    def test_all_archived_existing_execution_completes_without_video_callback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            args = MODULE.build_parser().parse_args(
+                [
+                    "--execute",
+                    "--backend",
+                    "https://backend.example.com",
+                    "--worker-id",
+                    "worker-01",
+                    "--state-dir",
+                    temporary,
+                ]
+            )
+            args.worker_token = "secret"
+            archived = {
+                "source": "C-001",
+                "platformVideoId": "123",
+                "originalUrl": "https://www.facebook.com/reel/123",
+                "canonicalUrl": "https://www.facebook.com/reel/123",
+                "status": "archived-existing",
+            }
+
+            def fake_run(command, **kwargs):
+                kwargs["on_line"](
+                    MODULE.VIDEO_RESULT_EVENT_PREFIX
+                    + json.dumps(
+                        {
+                            "event": "video-result",
+                            "completed": 1,
+                            "total": 1,
+                            "video": archived,
+                        }
+                    )
+                )
+                result_path = Path(command[command.index("--result-json") + 1])
+                result_path.write_text(
+                    json.dumps(
+                        {
+                            "status": "completed",
+                            "totalArchivedExisting": 1,
+                            "sources": [{"name": "C-001", "videos": [archived]}],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return 0, "archived\n"
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "claim",
+                    return_value={
+                        "executionId": "E-ARCHIVED",
+                        "sourceName": "C-001",
+                        "sourceUrl": "https://www.facebook.com/example/reels/",
+                    },
+                ),
+                mock.patch.object(MODULE, "heartbeat"),
+                mock.patch.object(MODULE, "run_command", side_effect=fake_run),
+                mock.patch.object(MODULE, "record_video") as record_video,
+                mock.patch.object(MODULE, "complete") as complete,
+                mock.patch.object(MODULE, "claim_upload", return_value=None),
+                mock.patch.object(MODULE, "claim_local_delete", return_value=None),
+            ):
+                exit_code, result = MODULE.execute_one(args)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(result["status"], "COMPLETED")
+        self.assertEqual(result["review"]["archivedExisting"], 1)
+        self.assertEqual(result["review"]["downloaded"], 0)
+        record_video.assert_not_called()
+        self.assertEqual(complete.call_args.args[4], "COMPLETED")
+
+    def test_archived_and_new_mix_records_only_the_new_video(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            args = MODULE.build_parser().parse_args(
+                [
+                    "--execute",
+                    "--backend",
+                    "https://backend.example.com",
+                    "--worker-id",
+                    "worker-01",
+                    "--state-dir",
+                    temporary,
+                ]
+            )
+            args.worker_token = "secret"
+            archived = {
+                "source": "C-001",
+                "platformVideoId": "old",
+                "originalUrl": "https://www.facebook.com/reel/old",
+                "canonicalUrl": "https://www.facebook.com/reel/old",
+                "status": "archived-existing",
+            }
+            downloaded = {
+                "source": "C-001",
+                "platformVideoId": "new",
+                "originalUrl": "https://www.facebook.com/reel/new",
+                "canonicalUrl": "https://www.facebook.com/reel/new",
+                "localPath": "/tmp/new.mp4",
+                "fileName": "new.mp4",
+                "status": "downloaded",
+            }
+
+            def fake_run(command, **kwargs):
+                result_path = Path(command[command.index("--result-json") + 1])
+                result_path.write_text(
+                    json.dumps(
+                        {
+                            "status": "completed",
+                            "sources": [
+                                {"name": "C-001", "videos": [archived, downloaded]}
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return 0, "ok\n"
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "claim",
+                    return_value={
+                        "executionId": "E-MIXED",
+                        "sourceName": "C-001",
+                        "sourceUrl": "https://www.facebook.com/example/reels/",
+                    },
+                ),
+                mock.patch.object(MODULE, "heartbeat"),
+                mock.patch.object(MODULE, "run_command", side_effect=fake_run),
+                mock.patch.object(MODULE, "record_video") as record_video,
+                mock.patch.object(MODULE, "complete") as complete,
+                mock.patch.object(MODULE, "claim_upload", return_value=None),
+                mock.patch.object(MODULE, "claim_local_delete", return_value=None),
+            ):
+                exit_code, result = MODULE.execute_one(args)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(result["status"], "COMPLETED")
+        self.assertEqual(result["review"]["archivedExisting"], 1)
+        self.assertEqual(result["review"]["downloaded"], 1)
+        record_video.assert_called_once()
+        self.assertEqual(
+            record_video.call_args.args[4]["canonicalUrl"],
+            downloaded["canonicalUrl"],
+        )
+        self.assertEqual(complete.call_args.args[4], "COMPLETED")
 
     def test_unreconciled_stream_callback_leaves_execution_for_lease_retry(self):
         with tempfile.TemporaryDirectory() as temporary:

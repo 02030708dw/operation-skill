@@ -19,12 +19,13 @@ from urllib import error, request
 
 
 SKILL_NAME = "facebook-video-ingest"
-SKILL_VERSION = "1.2.0"
+SKILL_VERSION = "1.2.1"
 WORKER_USER_AGENT = "HM-Hermes-Worker/1.0"
 TRANSIENT_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 TRANSIENT_BACKEND_ATTEMPTS = 6
 VIDEO_RESULT_EVENT_PREFIX = "__HM_VIDEO_RESULT__:"
 VIDEO_RESULT_EVENTS_ENV = "HM_VIDEO_RESULT_EVENTS"
+NON_ACTIONABLE_VIDEO_STATUSES = {"filtered-duration", "archived-existing"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
 MAX_LOCAL_DELETE_JOBS_PER_POLL = 100
 SKILL_DIR = Path(__file__).resolve().parent.parent
@@ -523,7 +524,7 @@ def video_result_identity(video: dict[str, Any]) -> str:
 
 def capture_download_status(video: dict[str, Any]) -> str | None:
     status = str(video.get("status") or "").strip().lower()
-    if status == "filtered-duration":
+    if status in NON_ACTIONABLE_VIDEO_STATUSES:
         return None
     return "DOWNLOADED" if status == "downloaded" else "DOWNLOAD_FAILED"
 
@@ -1392,9 +1393,11 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         else:
             download_exit = int(download_result.get("exitCode") or 0)
             raw_parts.append(f"Reused durable download manifest: {download_manifest}\n")
+        manifest_items = manifest_videos(download_result)
         videos = [
-            video for video in manifest_videos(download_result)
-            if video.get("status") != "filtered-duration"
+            video for video in manifest_items
+            if str(video.get("status") or "").strip().lower()
+            not in NON_ACTIONABLE_VIDEO_STATUSES
         ]
         video_recorder.finish(videos)
 
@@ -1414,7 +1417,11 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 "downloaded": sum(video.get("status") == "downloaded" for video in videos),
                 "filteredOver20Minutes": sum(
                     video.get("status") == "filtered-duration"
-                    for video in manifest_videos(download_result)
+                    for video in manifest_items
+                ),
+                "archivedExisting": sum(
+                    video.get("status") == "archived-existing"
+                    for video in manifest_items
                 ),
             },
         }

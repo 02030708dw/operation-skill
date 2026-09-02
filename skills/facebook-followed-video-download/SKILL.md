@@ -2,7 +2,7 @@
 name: facebook-followed-video-download
 description: Find, download, or locally reuse recent permitted Facebook Page, creator, Reels, watch, or direct video URLs in per-source folders with archive-backed duplicate prevention and reports. Use when the user asks Hermes to configure followed Facebook video sources, preview recent videos, download the latest or all videos, list sources, check dependencies, or troubleshoot this downloader. Defaults to preview and downloads only with explicit execution approval.
 metadata:
-  version: "1.7.0"
+  version: "1.7.1"
   platforms:
     - windows
     - macos
@@ -60,6 +60,7 @@ Paths with `/` are intentional and work with Python on Windows. Do not call the 
 - Execution: dry run unless `--execute` is present
 - Login profile: disabled until the user explicitly runs `--login`; stored only in the isolated Skill state directory
 - Concurrency: runs sharing the isolated Chrome profile are serialized with an OS-released lock; overlapping schedules wait instead of launching a competing Chrome
+- Archived fallback: a recent-window item already present in yt-dlp's archive with no retained local file is reported as `archived-existing`; it is not downloaded again and is not a failure
 
 The entry point infers `<hermes-home>` from its installed location. All defaults can be overridden with arguments, so the Skill is portable across computers.
 
@@ -166,6 +167,8 @@ python "<skill-dir>/scripts/facebook_followed_video_download.py" --source "C-012
 ```
 
 `--result-json` writes the machine-readable download manifest even when the engine fails. Each successfully downloaded video includes its canonical URL, local path, byte size, SHA-256, and Facebook publish time when yt-dlp exposes it. `publishedAtPrecision` is `SECOND` when `timestamp` or `release_timestamp` provides an exact time, and `DATE` when only `upload_date` is available; a `DATE` value uses `T00:00:00` as a placeholder and must not be presented as an exact midnight publish time. Use this manifest as the input to the R2 Skill; do not rediscover the output directory.
+
+`archived-existing` means yt-dlp previously completed that video and the local file is no longer retained, normally because the approved upload flow already removed it after an accepted R2 callback. It advances the scan but does not count as a new download or a failure. Never clear the archive to retry this state.
 
 When a trusted orchestrator sets `HM_VIDEO_RESULT_EVENTS=1`, the entry point
 also flushes one structured stdout line immediately after each selected video

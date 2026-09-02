@@ -21,7 +21,7 @@ const DEFAULT_COOKIES = process.env.FACEBOOK_FOLLOWED_COOKIES || process.env.FB_
 const DEFAULT_DESKTOP = process.env.FACEBOOK_FOLLOWED_OUTPUT || process.env.FB_FOLLOWED_DESKTOP || path.join(HOME, 'Desktop', 'Facebook');
 const DEFAULT_YTDLP = process.env.FACEBOOK_FOLLOWED_YTDLP || process.env.FB_FOLLOWED_YTDLP || process.env.YTDLP || 'yt-dlp';
 const CONFIGURED_CDP_PORT = Number(process.env.FACEBOOK_FOLLOWED_CDP_PORT || process.env.FB_CDP_PORT || '0');
-const SKILL_VERSION = '1.7.0';
+const SKILL_VERSION = '1.7.1';
 const VIDEO_RESULT_EVENT_PREFIX = '__HM_VIDEO_RESULT__:';
 const ERROR_CODES = {
   CHROME_START: 'CHROME_CDP_START_FAILED',
@@ -578,6 +578,19 @@ function appendArchiveOnce(archivePath, value) {
   if (!readArchiveKeys(archivePath).has(key)) appendArchive(archivePath, value);
 }
 
+function isYtDlpArchived(outputDir, url) {
+  return readArchiveKeys(path.join(outputDir, '.yt-dlp-archive.txt')).has(videoKey(url));
+}
+
+function existingVideoState(outputDir, url, platformVideoId) {
+  const localPath = findDownloadedFile(outputDir, platformVideoId, '');
+  if (localPath) return { status: 'local-existing', localPath };
+  if (isYtDlpArchived(outputDir, url)) {
+    return { status: 'archived-existing', localPath: null };
+  }
+  return null;
+}
+
 /**
  * Facebook's Reels/videos pages expose links newest-first. The first daily run
  * is limited to the requested recent window. Later daily runs take every URL
@@ -774,6 +787,12 @@ function downloadVideo(account, url, outputDir, archivePath) {
     item.status = 'preview';
     return item;
   }
+  const existing = existingVideoState(outputDir, url, item.platformVideoId);
+  if (existing && existing.status === 'archived-existing') {
+    item.status = 'archived-existing';
+    console.log('    跳過: 已在下載歸檔中，本地檔案已清理');
+    return item;
+  }
   const metadata = probeVideoMetadata(url);
   item.durationSeconds = metadata.durationSeconds === undefined ? null : metadata.durationSeconds;
   item.publishedAt = metadata.publishedAt === undefined ? null : metadata.publishedAt;
@@ -786,11 +805,10 @@ function downloadVideo(account, url, outputDir, archivePath) {
     console.log(`    跳過: 時長 ${item.durationSeconds}s 超過 ${maxDurationSeconds}s`);
     return item;
   }
-  const cachedPath = findDownloadedFile(outputDir, item.platformVideoId, '');
-  if (cachedPath) {
+  if (existing && existing.status === 'local-existing') {
     appendArchiveOnce(archivePath, url);
     console.log('    復用本地檔案');
-    return completedVideoResult(item, cachedPath);
+    return completedVideoResult(item, existing.localPath);
   }
   const args = [];
   args.push(...ytdlpSessionArgs());
@@ -996,6 +1014,7 @@ async function main() {
         succeeded: 0,
         failed: discoveryFailure ? 1 : 0,
         filteredDuration: 0,
+        archivedExisting: 0,
         errorCode: discoveryFailure ? discoveryFailure.code : null,
         error: discoveryFailure ? discoveryFailure.message : null,
         videos: []
@@ -1013,11 +1032,20 @@ async function main() {
           ));
         }
         if (item.status === 'filtered-duration') sourceResult.filteredDuration++;
+        else if (item.status === 'archived-existing') sourceResult.archivedExisting++;
         else if (item.status === 'downloaded' || item.status === 'preview') sourceResult.succeeded++;
         else sourceResult.failed++;
       }
       if (dryRun) console.log(`  預演: ${selected.length} 個待下載，未寫入檔案`);
-      else console.log(`  成功: ${sourceResult.succeeded}/${selected.length}`);
+      else {
+        if (sourceResult.archivedExisting > 0) {
+          console.log(`  已歸檔跳過: ${sourceResult.archivedExisting}`);
+        }
+        const actionable = selected.length
+          - sourceResult.filteredDuration
+          - sourceResult.archivedExisting;
+        console.log(`  成功: ${sourceResult.succeeded}/${actionable}`);
+      }
       runResult.sources.push(sourceResult);
     }
     const failures = runResult.sources.reduce((sum, source) => sum + source.failed, 0);
@@ -1076,7 +1104,9 @@ module.exports = {
   classifyDiscoveryFailure,
   discoveryExpression,
   discoverWithRecovery,
+  existingVideoState,
   isSupportedVideoUrl,
+  isYtDlpArchived,
   normalizeVideoUrl,
   pageCandidates,
   readDevToolsActivePort,

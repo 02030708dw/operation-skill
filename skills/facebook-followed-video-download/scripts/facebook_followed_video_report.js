@@ -124,6 +124,7 @@ function parseRunLog(filePath) {
         pending: null,
         ok: null,
         total: null,
+        archivedExisting: 0,
         downloads: [],
         failures: [],
         scanFailures: []
@@ -147,12 +148,20 @@ function parseRunLog(filePath) {
       current.total = Number(match[2]);
       continue;
     }
+    match = line.match(/已歸檔跳過:\s*(\d+)/);
+    if (match) {
+      current.archivedExisting = Number(match[1]);
+      continue;
+    }
     match = line.match(/下載:\s*(https?:\/\/\S+)/);
     if (match) {
       current.downloads.push(match[1]);
       continue;
     }
-    if (/掃描失敗:/.test(line)) current.scanFailures.push(line.slice(0, 220));
+    if (/掃描失敗(?:\s+\[[^\]]+\])?:/.test(line)) {
+      current.scanFailures.push(line.slice(0, 220));
+      continue;
+    }
     if (/失敗:/.test(line)) current.failures.push(line.slice(0, 220));
   }
   return parsed;
@@ -176,6 +185,7 @@ function renderReport(accounts, parsed) {
   let totalNew = 0;
   let totalPending = 0;
   let totalFailures = 0;
+  let totalArchivedExisting = 0;
 
   for (const account of accounts) {
     const run = parsed.byFolder.get(account.folder);
@@ -184,12 +194,15 @@ function renderReport(accounts, parsed) {
     const pending = run && Number.isFinite(run.pending) ? run.pending : null;
     const found = run && Number.isFinite(run.found) ? run.found : null;
     const failures = run ? run.failures.length + run.scanFailures.length : 0;
+    const archivedExisting = run ? run.archivedExisting || 0 : 0;
     totalNew += ok || 0;
     totalPending += pending || 0;
     totalFailures += failures;
+    totalArchivedExisting += archivedExisting;
     let state = '未掃描到摘要';
-    if (ok !== null && pending !== null && pending > ok) state = '有處理失敗';
+    if (failures > 0) state = '有處理失敗';
     else if (ok !== null && ok > 0) state = `已處理 ${ok}`;
+    else if (archivedExisting > 0) state = `無新增，已歸檔 ${archivedExisting}`;
     else if (pending === 0) state = '未找到影片';
     else if (status !== 0) state = '檢查可能失敗';
     rows.push({
@@ -202,7 +215,8 @@ function renderReport(accounts, parsed) {
       archive: `${snap.urlArchiveCount}/${snap.ytdlpArchiveCount}`,
       state,
       outputDir: snap.outputDir,
-      failures: run ? [...run.scanFailures, ...run.failures] : []
+      failures: run ? [...run.scanFailures, ...run.failures] : [],
+      archivedExisting
     });
   }
 
@@ -216,7 +230,13 @@ function renderReport(accounts, parsed) {
   lines.push(`- 結果: ${result}`);
   lines.push(`- 本次成功處理: ${totalNew}`);
   lines.push(`- 本次選取: ${totalPending}`);
-  lines.push(`- 報告給 Hermes: ${totalPending > 0 ? `最近影片已成功處理 ${totalNew}/${totalPending} 個。` : '來源未顯示可用影片。'}`);
+  lines.push(`- 已歸檔跳過: ${totalArchivedExisting}`);
+  const hermesSummary = totalNew > 0
+    ? `最近影片已成功處理 ${totalNew} 個。`
+    : totalArchivedExisting > 0
+      ? `沒有新影片，已確認 ${totalArchivedExisting} 個最近影片存在於下載歸檔。`
+      : '來源未顯示可用影片。';
+  lines.push(`- 報告給 Hermes: ${hermesSummary}`);
   if (runLog) lines.push(`- 原始日誌: ${runLog}`);
   lines.push('');
   lines.push('| 博主 | 本次找到 | 本次選取 | 成功 | 桌面檔案 | 大小 | URL/yt-dlp 記錄 | 狀態 |');
@@ -256,6 +276,7 @@ function renderReport(accounts, parsed) {
       totalNew,
       totalPending,
       totalFailures,
+      totalArchivedExisting,
       runLog,
       accounts: rows
     }

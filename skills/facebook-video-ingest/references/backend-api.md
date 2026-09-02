@@ -117,6 +117,8 @@ The JSON body supports:
 
 Accepted download statuses are `DISCOVERED`, `DOWNLOADING`, `DOWNLOADED`, and `DOWNLOAD_FAILED`. Accepted upload statuses are `PENDING`, `UPLOADING`, `UPLOADED`, `SKIPPED_EXISTING`, `R2_CONFLICT`, and `UPLOAD_FAILED`. Initial capture callbacks always use `PENDING`. HM keeps a newly downloaded record pending when task-level automatic review is disabled; when it is enabled, HM automatically marks that new record approved and enqueues its upload. Existing pending records are not bulk-approved when the switch changes. Hermes must still wait for `/uploads/claim` and never upload from the claim flag alone.
 
+Downloader items with machine status `filtered-duration` or `archived-existing` are informational and must not be sent to this video callback. Both advance execution progress. `archived-existing` additionally increments the combined execution result's archived count; a batch containing only these informational items completes successfully with no new video record.
+
 The backend deduplicates videos by `(task_id, SHA-256(canonicalUrl))`. A second callback updates the same record, which is how the upload result enriches the earlier download record.
 
 For a multi-video capture, the Worker sends this callback immediately after
