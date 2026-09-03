@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 
 
 SKILL_NAME = "facebook-followed-video-download"
-SKILL_VERSION = "1.7.2"
+SKILL_VERSION = "1.7.3"
 MINIMUM_NODE_VERSION = (12, 22, 0)
 VIDEO_RESULT_EVENT_PREFIX = "__HM_VIDEO_RESULT__:"
 SCRIPT_DIR = Path(__file__).resolve().parent

@@ -21,7 +21,7 @@ const DEFAULT_COOKIES = process.env.FACEBOOK_FOLLOWED_COOKIES || process.env.FB_
 const DEFAULT_DESKTOP = process.env.FACEBOOK_FOLLOWED_OUTPUT || process.env.FB_FOLLOWED_DESKTOP || path.join(HOME, 'Desktop', 'Facebook');
 const DEFAULT_YTDLP = process.env.FACEBOOK_FOLLOWED_YTDLP || process.env.FB_FOLLOWED_YTDLP || process.env.YTDLP || 'yt-dlp';
 const CONFIGURED_CDP_PORT = Number(process.env.FACEBOOK_FOLLOWED_CDP_PORT || process.env.FB_CDP_PORT || '0');
-const SKILL_VERSION = '1.7.2';
+const SKILL_VERSION = '1.7.3';
 const VIDEO_RESULT_EVENT_PREFIX = '__HM_VIDEO_RESULT__:';
 const ERROR_CODES = {
   CHROME_START: 'CHROME_CDP_START_FAILED',
@@ -252,9 +252,13 @@ function readDevToolsActivePort(profile) {
   }
 }
 
-async function waitForChrome(chrome, profile, stderrChunks) {
+async function waitForChrome(chrome, profile, stderrChunks, startupError = () => null) {
   let port = CONFIGURED_CDP_PORT > 0 ? CONFIGURED_CDP_PORT : 0;
   for (let i = 0; i < 60; i++) {
+    const launchError = startupError();
+    if (launchError) {
+      throw codedError(ERROR_CODES.CHROME_START, `Chrome could not start: ${launchError.message}`);
+    }
     if (chrome.exitCode !== null) {
       const detail = boundedChromeDiagnostic(stderrChunks);
       throw codedError(
@@ -653,6 +657,29 @@ function assertRunnable(command, label) {
   }
 }
 
+function assertChromeAvailable(command) {
+  if (process.platform !== 'win32') {
+    assertRunnable(command, 'Chrome');
+    return command;
+  }
+  // Windows Chrome treats --version as a normal browser launch. Python already
+  // checks its version resource; the engine must only inspect files before CDP.
+  const names = path.extname(command) ? [command] : [command, `${command}.exe`];
+  const candidates = names.slice();
+  if (path.dirname(command) === '.') {
+    for (const directory of String(process.env.PATH || process.env.Path || '').split(path.delimiter)) {
+      if (directory) {
+        for (const name of names) candidates.push(path.join(directory.replace(/^"|"$/g, ''), name));
+      }
+    }
+  }
+  const executable = candidates.find(candidate => {
+    try { return fs.statSync(candidate).isFile(); } catch { return false; }
+  });
+  if (!executable) throw new Error(`Missing Chrome: ${command}`);
+  return executable;
+}
+
 function sha256File(filePath) {
   const hash = crypto.createHash('sha256');
   const descriptor = fs.openSync(filePath, 'r');
@@ -852,7 +879,7 @@ function downloadVideo(account, url, outputDir, archivePath) {
 }
 
 async function stopChrome(chrome) {
-  if (!chrome) return;
+  if (!chrome || !chrome.pid) return;
   try {
     if (process.platform === 'win32') {
       spawnSync('taskkill', ['/pid', String(chrome.pid), '/T', '/F'], {
@@ -877,14 +904,15 @@ function removeTree(directory) {
   fs.rmdirSync(directory, { recursive: true, maxRetries: 3, retryDelay: 100 });
 }
 
-async function startBrowser(profile) {
+async function startBrowser(profile, executable = chromePath) {
   const activePortFile = path.join(profile, 'DevToolsActivePort');
   let lastError;
   for (let attempt = 1; attempt <= 2; attempt++) {
     try { fs.unlinkSync(activePortFile); } catch {}
     const stderrChunks = [];
     let stderrSize = 0;
-    const chrome = spawn(chromePath, [
+    let launchError = null;
+    const chrome = spawn(executable, [
       `--remote-debugging-port=${CONFIGURED_CDP_PORT > 0 ? CONFIGURED_CDP_PORT : 0}`,
       `--user-data-dir=${profile}`,
       attempt === 1 ? '--headless=new' : '--headless',
@@ -897,6 +925,7 @@ async function startBrowser(profile) {
       detached: process.platform !== 'win32',
       windowsHide: true
     });
+    chrome.once('error', error => { launchError = error; });
     if (chrome.stderr) {
       chrome.stderr.on('data', chunk => {
         if (stderrSize >= 6400) return;
@@ -906,7 +935,7 @@ async function startBrowser(profile) {
       });
     }
     try {
-      const port = await waitForChrome(chrome, profile, stderrChunks);
+      const port = await waitForChrome(chrome, profile, stderrChunks, () => launchError);
       const ws = await connectTab(port);
       return { chrome, port, ws };
     } catch (err) {
@@ -940,7 +969,7 @@ function classifyDiscoveryFailure(scanErrors, layoutUnsupported) {
 
 async function main() {
   if (!fs.existsSync(accountsFile)) throw new Error(`Missing accounts file: ${accountsFile}`);
-  assertRunnable(chromePath, 'Chrome');
+  const executable = assertChromeAvailable(chromePath);
   if (!dryRun) assertRunnable(ytdlpPath, 'yt-dlp');
   const accounts = readAccounts(accountsFile);
   if (!accounts.length) throw new Error('No accounts configured');
@@ -961,7 +990,7 @@ async function main() {
   fs.mkdirSync(profile, { recursive: true, mode: 0o700 });
   let browser;
   try {
-    browser = await startBrowser(profile);
+    browser = await startBrowser(profile, executable);
     const cookieCount = await injectCookies(browser.ws);
     console.log(`Facebook cookies: ${cookieCount}`);
     console.log(`Facebook CDP port: ${browser.port}`);
@@ -1106,18 +1135,23 @@ if (require.main === module) runMain();
 module.exports = {
   ERROR_CODES,
   VIDEO_RESULT_EVENT_PREFIX,
+  assertChromeAvailable,
+  detectChrome,
   classifyDiscoveryFailure,
   discoveryExpression,
   discoverWithRecovery,
   existingVideoState,
   isSupportedVideoUrl,
   isYtDlpArchived,
+  main,
   normalizeVideoUrl,
   pageCandidates,
   readDevToolsActivePort,
   removeTree,
   selectDailyVideoUrls,
   selectVideoUrls,
+  startBrowser,
+  stopChrome,
   videoKey,
   videoResultEventLine,
   waitForChrome,
