@@ -27,7 +27,7 @@ try {
     $smoke = Join-Path $testRoot 'tests/windows_operation_skill_smoke.py'
     $stdout = Join-Path $testRoot 'stdout.log'
     $stderr = Join-Path $testRoot 'stderr.log'
-    $process = Start-Process -FilePath $Python -ArgumentList ('"' + $smoke + '"') -Credential $credential -LoadUserProfile -WorkingDirectory $testRoot -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru -Wait
+    $process = Start-Process -FilePath $Python -ArgumentList ('-X utf8 "' + $smoke + '" --ci-standard-user') -Credential $credential -LoadUserProfile -WorkingDirectory $testRoot -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru -Wait
     if (Test-Path $stdout) { Get-Content -Raw -Encoding UTF8 $stdout | Write-Output }
     if (Test-Path $stderr) { Get-Content -Raw -Encoding UTF8 $stderr | Write-Output }
     if ($process.ExitCode -ne 0) { throw "Standard-user installer smoke test failed: $($process.ExitCode)" }

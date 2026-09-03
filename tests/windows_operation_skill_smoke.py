@@ -15,7 +15,10 @@ from test_operation_skill_updater import UPDATER, make_release, seed_managed_sta
 
 
 def main() -> None:
-    if os.name != "nt" or os.getenv("GITHUB_ACTIONS") != "true":
+    # Start-Process -Credential builds the new user's environment instead of
+    # inheriting GITHUB_ACTIONS. The guarded CI launcher passes this flag.
+    if (os.name != "nt" or sys.argv[1:] != ["--ci-standard-user"]
+            or not os.getenv("USERNAME", "").startswith("hm-ci-")):
         raise RuntimeError("This smoke test is restricted to ephemeral Windows CI runners")
     if ctypes.windll.shell32.IsUserAnAdmin():
         raise RuntimeError("The installer smoke test must run WITHOUT administrator privileges")
