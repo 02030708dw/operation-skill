@@ -2,7 +2,7 @@
 name: facebook-video-ingest
 description: Run customer-side Hermes Workers for backend-managed Facebook capture executions, filter videos over 20 minutes before download, hold videos for operator review or honor task-level backend auto-review, upload approved files to Cloudflare R2, consume rejected-file deletion jobs on the source computer, and report results to HM. Use when Hermes must install its local API, pair with the HM admin browser, create or run local Cron jobs, execute a targeted HM ingest job, or troubleshoot the local video pipeline while HM runs on another server.
 metadata:
-  version: "1.2.2"
+  version: "1.2.3"
 ---
 
 # Facebook Video Ingest
@@ -178,6 +178,13 @@ configured HM admin origins, starts or restarts Hermes Gateway, and prints an
 `HMHERMES1.` pairing code. The full API key stays only in that browser's local
 storage and is never sent to HM; the backend can use only the restricted media
 token it derives independently.
+
+On macOS, a running Gateway is stopped before the installer waits up to 90
+seconds for an exclusive bind on its existing API port, then starts it again.
+This includes TCP connections in TIME_WAIT, which do not appear as a listening
+process. A fresh start is not immediately restarted. Authenticated API readiness
+is checked for up to 60 seconds; persistent port conflicts or API failures leave
+the updater's bridge repair pending rather than claiming a successful recovery.
 
 The installer also maintains one `HM 审核上传队列 Worker` no-agent Cron that
 polls every minute. Despite its legacy name, `--execute --upload-only` drains

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
 import hashlib
 import hmac
 import ipaddress
@@ -46,6 +47,8 @@ PAIRING_PREFIX = "HMHERMES1."
 ANSI_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
 SUBPROCESS_ENCODING = "utf-8"
 SUBPROCESS_ERRORS = "replace"
+API_PORT_RELEASE_TIMEOUT_SECONDS = 90
+API_READY_TIMEOUT_SECONDS = 60
 
 
 def write_console(text: str, *, stream=None) -> None:
@@ -471,6 +474,66 @@ def ensure_gateway(hermes: str) -> None:
         raise RuntimeError("Hermes Gateway did not start")
 
 
+def wait_for_api_port_release(
+    port: int, timeout_seconds: float = API_PORT_RELEASE_TIMEOUT_SECONDS
+) -> None:
+    """Wait for an exclusive bind, including sockets still in TIME_WAIT.
+
+    Hermes deliberately disables SO_REUSEADDR on macOS. A missing LISTEN
+    process does not prove the old port can be rebound. Probe with the same
+    exclusive bind and close it before starting Hermes; never evict a port
+    owner or change the operator's paired port.
+    """
+    deadline = time.monotonic() + max(0, timeout_seconds)
+    announced = False
+    while True:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind(("0.0.0.0", port))
+            return
+        except OSError as exc:
+            if exc.errno != errno.EADDRINUSE:
+                raise RuntimeError(f"Cannot prepare Hermes API port {port}: {exc}") from exc
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Hermes API port {port} is still in use after waiting "
+                    f"{timeout_seconds:g}s; check the port owner before retrying"
+                ) from exc
+            if not announced:
+                print(f"Waiting for Hermes API port {port} to be released...", flush=True)
+                announced = True
+            time.sleep(min(0.5, max(0, deadline - time.monotonic())))
+
+
+def restart_gateway_for_bridge(hermes: str, port: int) -> None:
+    """Load the patched API without racing macOS's exclusive port rebinding."""
+    if sys.platform != "darwin":
+        ensure_gateway(hermes)
+        call([hermes, "gateway", "restart"])
+        return
+
+    status = call([hermes, "gateway", "status"], allow_failure=True)
+    was_running = gateway_is_running(f"{status.stdout}\n{status.stderr}")
+    if was_running:
+        # stop unloads launchd supervision, preventing an immediate KeepAlive
+        # respawn while the old API connections are still draining.
+        call([hermes, "gateway", "stop"])
+    try:
+        wait_for_api_port_release(port)
+    except Exception:
+        if was_running:
+            # Restore the other Gateway channels on failure, but preserve the
+            # bridge error and updater pause; this is not a successful repair.
+            call([hermes, "gateway", "start"], allow_failure=True)
+        raise
+    if was_running:
+        call([hermes, "gateway", "start"])
+    else:
+        # A newly started Gateway already loads the patched files. Restarting
+        # it immediately would create the same port race on a fresh install.
+        ensure_gateway(hermes)
+
+
 def parse_env_file(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     if not path.is_file():
@@ -720,7 +783,11 @@ def stop_legacy_watchers(home: Path) -> int:
     return stopped
 
 
-def api_is_ready(api_base_url: str, api_key: str, timeout_seconds: float = 15) -> bool:
+def api_is_ready(
+    api_base_url: str, api_key: str,
+    timeout_seconds: float = API_READY_TIMEOUT_SECONDS,
+    *, diagnostics: list[str] | None = None,
+) -> bool:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         outgoing = request.Request(
@@ -734,7 +801,14 @@ def api_is_ready(api_base_url: str, api_key: str, timeout_seconds: float = 15) -
             with request.urlopen(outgoing, timeout=2) as response:
                 if response.status == 200:
                     return True
-        except (error.URLError, TimeoutError, OSError):
+        except (error.URLError, TimeoutError, OSError) as exc:
+            if diagnostics is not None:
+                # Do not echo headers, API keys, or response bodies.
+                detail = (
+                    f"HTTP {exc.code}" if isinstance(exc, error.HTTPError)
+                    else str(getattr(exc, "reason", exc))
+                )
+                diagnostics[:] = [detail]
             time.sleep(0.5)
     return False
 
@@ -929,12 +1003,16 @@ def main(argv: list[str] | None = None) -> int:
         worker_id=worker_id, worker_token=worker_token, backend=backend,
         media_base_url=args.media_base_url,
     )
-    ensure_gateway(hermes)
-    call([hermes, "gateway", "restart"])
+    restart_gateway_for_bridge(hermes, args.api_port)
     remove_obsolete_jobs(hermes)
     stopped = stop_legacy_watchers(home)
-    if not api_is_ready(api_base_url, api_key):
-        raise RuntimeError(f"Hermes local API did not become ready at {api_base_url}")
+    diagnostics: list[str] = []
+    if not api_is_ready(api_base_url, api_key, diagnostics=diagnostics):
+        detail = diagnostics[-1] if diagnostics else "no successful response"
+        raise RuntimeError(
+            f"Hermes local API did not become ready at {api_base_url} "
+            f"after {API_READY_TIMEOUT_SECONDS}s: {detail}"
+        )
     ensure_upload_worker_job(api_base_url, api_key)
     ensure_capture_queue_worker_job(api_base_url, api_key)
     register_media_endpoint(backend, worker_token, worker_id, media_base_url)
