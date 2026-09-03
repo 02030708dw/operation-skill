@@ -101,7 +101,10 @@ jobs:
       - name: Test philippines-lottery-result-media
         run: python -m unittest discover -s skills/philippines-lottery-result-media/tests -p "test_*.py" -v
       - name: Test downloader selection logic
-        run: node --test skills/facebook-followed-video-download/tests/test_selection.js
+        run: >-
+          node --test
+          skills/facebook-followed-video-download/tests/test_selection.js
+          skills/facebook-followed-video-download/tests/test_chrome_startup.js
 
   publish:
     if: github.ref == 'refs/heads/main'
