@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import base64
+import errno
 import importlib.util
 import inspect
 import json
@@ -657,6 +658,121 @@ class OperationSkillUpdaterTest(unittest.TestCase):
             finally:
                 for handle in handles or []:
                     handle.close()
+
+    @unittest.skipIf(os.name == "nt", "POSIX descriptor limits")
+    def test_many_historical_locks_recover_orphan_pause_under_low_soft_limit(self):
+        # Isolate real process limits; do not lower the test runner's limit or
+        # fake the host OS. This reproduces macOS's Errno 24 during recovery.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            lock_dir = home / "facebook-video-ingest"
+            lock_dir.mkdir(parents=True)
+            for index in range(300):
+                (lock_dir / f"worker-E-{index:04d}.lock").touch()
+            (home / "ESTOP").write_text(json.dumps({
+                "reason": "operation-skill-update", "owner": "a" * 32,
+            }), encoding="utf-8")
+            manifest = make_release(root, "published", "a" * 40)
+            probe = '''
+import importlib.util, json, pathlib, resource, sys
+spec = importlib.util.spec_from_file_location("updater", sys.argv[1])
+updater = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(updater)
+home = pathlib.Path(sys.argv[2])
+_, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (128, hard))
+result = updater.run_update(home, sys.argv[3], 0, True, {"demo-skill"})
+assert result["status"] == "updated", result
+assert not (home / "ESTOP").exists()
+assert (home / "skills/demo-skill/scripts/run.py").is_file()
+handles = updater.acquire_worker_locks(home)
+assert handles is not None and len(handles) == 301
+try:
+    assert updater.try_lock(lock_dir := home / "facebook-video-ingest/worker-E-0299.lock") is None
+    # Transactions still need descriptors for state persistence while ALL
+    # worker locks are retained, not only enough to reach the last lock.
+    updater.durable_json_write(home / "probe.json", {"locked": True})
+finally:
+    for handle in handles:
+        handle.close()
+handle = updater.try_lock(lock_dir)
+assert handle is not None
+handle.close()
+assert resource.getrlimit(resource.RLIMIT_NOFILE)[1] == hard
+print("recovered with retained locks and unchanged hard limit")
+'''
+            completed = subprocess.run(
+                [UPDATER.sys.executable, "-c", probe, str(ROOT / "scripts/operation_skill_updater.py"),
+                 str(home), manifest.as_uri()],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+
+    def test_partial_locks_are_released_on_open_failure_or_contention(self):
+        for failure in (OSError(errno.EMFILE, "Too many open files"), None):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                home = Path(temporary)
+                lock_dir = home / "facebook-video-ingest"
+                lock_dir.mkdir()
+                for name in ("worker-A.lock", "worker-B.lock"):
+                    (lock_dir / name).touch()
+                first, second = mock.Mock(), mock.Mock()
+                with mock.patch.object(UPDATER, "try_lock", side_effect=[first, second, failure]):
+                    if failure is None:
+                        self.assertIsNone(UPDATER.acquire_worker_locks(home))
+                    else:
+                        with self.assertRaises(OSError) as raised:
+                            UPDATER.acquire_worker_locks(home)
+                        self.assertEqual(errno.EMFILE, raised.exception.errno)
+                first.close.assert_called_once_with()
+                second.close.assert_called_once_with()
+
+    @unittest.skipIf(os.name == "nt", "POSIX descriptor limits")
+    def test_insufficient_hard_limit_does_not_open_locks_or_remove_existing_pause(self):
+        import resource
+
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            sentinel = home / "ESTOP"
+            sentinel.write_text('{"reason":"operator-maintenance"}', encoding="utf-8")
+            with mock.patch.object(resource, "getrlimit", return_value=(64, 64)), \
+                    mock.patch.object(resource, "setrlimit") as set_limit, \
+                    mock.patch.object(UPDATER, "try_lock") as lock, \
+                    mock.patch.object(UPDATER, "active_skill_processes", return_value=[]):
+                with self.assertRaisesRegex(UPDATER.UpdaterError, "硬限制"):
+                    with UPDATER.paused_for_update(home, [], 0):
+                        self.fail("Capacity failure must not enter an update transaction")
+            lock.assert_not_called()
+            set_limit.assert_not_called()
+            self.assertEqual('{"reason":"operator-maintenance"}', sentinel.read_text())
+
+    @unittest.skipIf(os.name == "nt", "POSIX descriptor limits")
+    def test_capacity_raise_failure_releases_new_update_pause(self):
+        import resource
+
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            with mock.patch.object(resource, "getrlimit", return_value=(64, 4096)), \
+                    mock.patch.object(resource, "setrlimit", side_effect=ValueError("system limit")), \
+                    mock.patch.object(UPDATER, "try_lock") as lock, \
+                    mock.patch.object(UPDATER, "active_skill_processes", return_value=[]):
+                with self.assertRaisesRegex(UPDATER.UpdaterError, "无法.*文件句柄上限"):
+                    with UPDATER.paused_for_update(home, [], 0):
+                        self.fail("Capacity failure must not enter an update transaction")
+            lock.assert_not_called()
+            self.assertFalse((home / "ESTOP").exists())
+
+    @unittest.skipIf(os.name == "nt", "POSIX descriptor limits")
+    def test_capacity_reservation_preserves_sufficient_or_unlimited_soft_limit(self):
+        import resource
+
+        for limits in ((4096, 4096), (resource.RLIM_INFINITY, resource.RLIM_INFINITY)):
+            with self.subTest(limits=limits), \
+                    mock.patch.object(resource, "getrlimit", return_value=limits), \
+                    mock.patch.object(resource, "setrlimit") as set_limit:
+                UPDATER.reserve_worker_lock_capacity(300)
+            set_limit.assert_not_called()
 
     def test_pause_rechecks_processes_after_acquiring_worker_locks(self):
         with tempfile.TemporaryDirectory() as temporary:

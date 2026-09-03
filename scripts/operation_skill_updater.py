@@ -65,6 +65,7 @@ MAX_ARCHIVE_COMPONENT_CHARS = 255
 LOG_LIMIT_BYTES = 1024 * 1024
 BACKUP_RETENTION = 3
 USER_AGENT = "HM-Operation-Skill-Updater/1.0"
+WORKER_LOCK_FD_HEADROOM = 128
 TRANSACTION_SCHEMA_VERSION = 1
 TRANSACTION_JOURNAL_NAME = "journal.json"
 
@@ -726,19 +727,55 @@ def downloader_lock_path(home: Path) -> Path:
     return state_dir / ".capture-run.lock"
 
 
+def reserve_worker_lock_capacity(lock_count: int) -> None:
+    """Budget for retained locks plus update I/O without changing hard limits.
+
+    Per-execution lock files survive completed Cron runs. On macOS the inherited
+    soft descriptor limit can be lower than this history alone. All locks must
+    remain held until the transaction finishes; probing and closing them one at
+    a time would allow an old runner to start during replacement.
+    """
+    if os.name == "nt":
+        return
+    import resource
+
+    required = lock_count + WORKER_LOCK_FD_HEADROOM
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft == resource.RLIM_INFINITY or soft >= required:
+        return
+    if hard != resource.RLIM_INFINITY and required > hard:
+        raise UpdaterError(
+            f"更新器需保留 {lock_count} 个任务锁并预留文件操作空间，"
+            f"所需文件句柄 {required} 超过当前进程硬限制 {hard}；"
+            "未开始替换 Skill，保留原有暂停状态"
+        )
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (required, hard))
+    except (OSError, ValueError) as exc:
+        raise UpdaterError(
+            f"无法为 {lock_count} 个任务锁提高当前更新进程的文件句柄上限"
+            f"（当前 {soft}，需要 {required}）：{exc}"
+        ) from exc
+
+
 def acquire_worker_locks(home: Path) -> Optional[list[IO[bytes]]]:
     lock_dir = home / "facebook-video-ingest"
     handles: list[IO[bytes]] = []
     paths = {downloader_lock_path(home)}
     if lock_dir.is_dir():
         paths.update(lock_dir.glob("*.lock"))
-    for path in sorted(paths):
-        handle = try_lock(path)
-        if handle is None:
-            for acquired in handles:
-                acquired.close()
-            return None
-        handles.append(handle)
+    reserve_worker_lock_capacity(len(paths))
+    # Release partial acquisitions on contention AND exceptions (including an
+    # open() failure), leaving descriptors for state/error reporting and ESTOP
+    # cleanup. Successful acquisitions transfer ownership to paused_for_update.
+    with contextlib.ExitStack() as cleanup:
+        for path in sorted(paths):
+            handle = try_lock(path)
+            if handle is None:
+                return None
+            cleanup.callback(handle.close)
+            handles.append(handle)
+        cleanup.pop_all()
     return handles
 
 
