@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import importlib.util
 import inspect
 import json
@@ -1656,6 +1657,13 @@ class OperationSkillUpdaterTest(unittest.TestCase):
         with mock.patch.object(UPDATER.subprocess, "run", return_value=result):
             with self.assertRaisesRegex(UPDATER.UpdaterError, "Task service unavailable"):
                 UPDATER.run_windows_schedule_script("test")
+
+    def test_windows_schedule_explicitly_succeeds_after_optional_missing_task(self):
+        result = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(UPDATER.subprocess, "run", return_value=result) as run:
+            UPDATER.run_windows_schedule_script("# optional legacy lookup")
+        wrapped = base64.b64decode(run.call_args.args[0][-1]).decode("utf-16le")
+        self.assertIn("exit 0\n} catch", wrapped)
         with mock.patch.object(UPDATER.subprocess, "run", side_effect=subprocess.TimeoutExpired("ps", 60)):
             with self.assertRaisesRegex(UPDATER.UpdaterError, "超时"):
                 UPDATER.run_windows_schedule_script("test")

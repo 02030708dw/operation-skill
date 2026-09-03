@@ -2253,6 +2253,9 @@ $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 try {
 """ + script + """
+  # Optional lookups (for an absent legacy task) may leave $? false even
+  # though registration succeeded. Do not leak that as process exit code 1.
+  exit 0
 } catch {
   [Console]::Error.WriteLine($_.Exception.Message)
   [Console]::Error.WriteLine($_.FullyQualifiedErrorId)
