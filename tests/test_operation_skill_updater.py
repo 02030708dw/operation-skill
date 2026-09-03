@@ -1633,6 +1633,7 @@ class OperationSkillUpdaterTest(unittest.TestCase):
         self.assertEqual(first, UPDATER.windows_task_name(Path("c:/users/WEI/.hermes")))
         self.assertNotEqual(first, UPDATER.windows_task_name(Path("C:/Users/other/.hermes")))
         self.assertRegex(first, r"^HM Operation Skill Updater-[0-9a-f]{12}$")
+        self.assertEqual(UPDATER.windows_task_name(Path(".")), UPDATER.windows_task_name(Path.cwd()))
 
     def test_windows_legacy_cleanup_checks_owner_and_exact_action(self):
         script = UPDATER.windows_legacy_schedule_cleanup()

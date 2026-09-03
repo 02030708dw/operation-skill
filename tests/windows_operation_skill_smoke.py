@@ -25,7 +25,7 @@ def main() -> None:
     repo = Path(__file__).resolve().parents[1]
     with tempfile.TemporaryDirectory(prefix="hm-updater-smoke-") as temporary:
         root = Path(temporary)
-        home = root / "\u8fd0\u8425 smoke O'Neil"
+        home = (root / "\u8fd0\u8425 smoke O'Neil").resolve()
         installed = home / "skills" / "demo-skill"
         write_skill(installed, "old")
         seed_managed_state(home, installed)
@@ -57,10 +57,14 @@ def main() -> None:
 $ErrorActionPreference = 'Stop'
 $task = Get-ScheduledTask -TaskName '{task_name}' -TaskPath '\\'
 $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-if ($task.Principal.UserId -ne $sid) {{ throw 'Wrong principal' }}
+function Resolve-UserSid([string]$value) {{
+  if ($value.StartsWith('S-1-')) {{ return $value }}
+  return (New-Object Security.Principal.NTAccount($value)).Translate([Security.Principal.SecurityIdentifier]).Value
+}}
+if ((Resolve-UserSid $task.Principal.UserId) -ne $sid) {{ throw 'Wrong principal' }}
 if ($task.Principal.RunLevel -ne 'Limited') {{ throw 'Task must not be elevated' }}
 $logon = @($task.Triggers | Where-Object {{ $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' }})
-if ($logon.Count -ne 1 -or $logon[0].UserId -ne $sid) {{ throw 'Wrong logon trigger' }}
+if ($logon.Count -ne 1 -or (Resolve-UserSid $logon[0].UserId) -ne $sid) {{ throw 'Wrong logon trigger' }}
 if (@($task.Triggers).Count -ne 2) {{ throw 'Missing daily trigger' }}
 """
             UPDATER.run_windows_schedule_script(check)

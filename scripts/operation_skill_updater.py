@@ -2196,7 +2196,8 @@ def powershell_encoded(script: str) -> str:
 
 
 def windows_task_name(home: Path) -> str:
-    identity = ntpath.normcase(ntpath.normpath(str(home)))
+    # Resolve aliases (including Windows 8.3 TEMP/profile paths) before hashing.
+    identity = ntpath.normcase(ntpath.normpath(str(home.resolve())))
     suffix = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
     return f"HM Operation Skill Updater-{suffix}"
 
