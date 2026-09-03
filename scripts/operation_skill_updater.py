@@ -1464,7 +1464,9 @@ def refresh_bridge(home: Path, targets: list[dict[str, Any]]) -> None:
         text=True,
         capture_output=True,
         check=False,
-        timeout=300,
+        # macOS recovery includes service stop/start, exclusive port-release
+        # waiting, and authenticated API readiness before registering Workers.
+        timeout=600,
     )
     if completed.returncode:
         preview = (completed.stderr or completed.stdout or "unknown error")[-1000:]

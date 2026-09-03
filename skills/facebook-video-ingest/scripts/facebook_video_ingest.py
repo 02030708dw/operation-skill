@@ -19,7 +19,7 @@ from urllib import error, request
 
 
 SKILL_NAME = "facebook-video-ingest"
-SKILL_VERSION = "1.2.2"
+SKILL_VERSION = "1.2.3"
 WORKER_USER_AGENT = "HM-Hermes-Worker/1.0"
 TRANSIENT_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 TRANSIENT_BACKEND_ATTEMPTS = 6
