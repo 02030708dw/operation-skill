@@ -8,6 +8,7 @@ import base64
 import contextlib
 import hashlib
 import json
+import ntpath
 import os
 import plistlib
 import re
@@ -324,9 +325,14 @@ def directory_hash(skill_dir: Path) -> str:
         raise UpdaterError(f"Skill 不允许符号链接: {skill_dir.name}/{relative}")
     digest = hashlib.sha256()
     paths = sorted(
-        path
-        for path in skill_dir.rglob("*")
-        if path.is_file() and included_hash_file(path, skill_dir)
+        (
+            path
+            for path in skill_dir.rglob("*")
+            if path.is_file() and included_hash_file(path, skill_dir)
+        ),
+        # Path ordering is case-insensitive on Windows. Match the builder's
+        # case-sensitive POSIX relative strings on every platform.
+        key=lambda path: path.relative_to(skill_dir).as_posix(),
     )
     for path in paths:
         relative = path.relative_to(skill_dir).as_posix().encode("utf-8")
@@ -2189,20 +2195,98 @@ def powershell_encoded(script: str) -> str:
     return base64.b64encode(script.encode("utf-16le")).decode("ascii")
 
 
-def windows_schedule_script(home: Path, minute: int) -> str:
-    task_name = "HM Operation Skill Updater"
+def windows_task_name(home: Path) -> str:
+    # Resolve aliases (including Windows 8.3 TEMP/profile paths) before hashing.
+    identity = ntpath.normcase(ntpath.normpath(str(home.resolve())))
+    suffix = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+    return f"HM Operation Skill Updater-{suffix}"
+
+
+def windows_schedule_context(home: Path) -> str:
     script_path = Path(__file__).resolve()
     argument = f'"{script_path}" --hermes-home "{home}" run'
     return f"""
+$currentUser = [Security.Principal.WindowsIdentity]::GetCurrent()
+$userId = $currentUser.User.Value
 $action = New-ScheduledTaskAction -Execute '{str(Path(sys.executable)).replace("'", "''")}' -Argument '{argument.replace("'", "''")}'
+""".strip()
+
+
+def windows_legacy_schedule_cleanup() -> str:
+    # Migrate only the old task belonging to this user AND installation.
+    return """
+$legacy = Get-ScheduledTask -TaskName 'HM Operation Skill Updater' -TaskPath '\\' -ErrorAction SilentlyContinue
+if ($legacy) {
+  $legacyUser = $legacy.Principal.UserId
+  $ours = ($legacyUser -eq $userId -or $legacyUser -eq $currentUser.Name)
+  if ($ours -and @($legacy.Actions).Count -eq 1 -and
+      $legacy.Actions[0].Execute -eq $action.Execute -and
+      $legacy.Actions[0].Arguments -eq $action.Arguments) {
+    try {
+      $legacy | Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop
+    } catch {
+      [Console]::Out.WriteLine('WARNING: The matching legacy task could not be removed; ask IT to inspect HM Operation Skill Updater.')
+    }
+  }
+}
+""".strip()
+
+
+def windows_schedule_script(home: Path, minute: int) -> str:
+    task_name = windows_task_name(home)
+    return f"""
+{windows_schedule_context(home)}
 $triggers = @(
-  (New-ScheduledTaskTrigger -AtLogOn)
+  (New-ScheduledTaskTrigger -AtLogOn -User $userId)
   (New-ScheduledTaskTrigger -Daily -At '04:{minute:02d}')
 )
-$principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited
+$principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 2)
-Register-ScheduledTask -TaskName '{task_name}' -Action $action -Trigger $triggers -Principal $principal -Settings $settings -Force | Out-Null
+Register-ScheduledTask -TaskName '{task_name}' -TaskPath '\\' -Action $action -Trigger $triggers -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+{windows_legacy_schedule_cleanup()}
 """.strip()
+
+
+def run_windows_schedule_script(script: str) -> None:
+    wrapped = """
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+try {
+""" + script + """
+  # Optional lookups (for an absent legacy task) may leave $? false even
+  # though registration succeeded. Do not leak that as process exit code 1.
+  exit 0
+} catch {
+  [Console]::Error.WriteLine($_.Exception.Message)
+  [Console]::Error.WriteLine($_.FullyQualifiedErrorId)
+  exit 1
+}
+"""
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", powershell_encoded(wrapped)],
+            check=False,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise UpdaterError("Windows 自动更新计划操作超时；请联系网管检查任务计划程序服务。") from exc
+    except OSError as exc:
+        raise UpdaterError("无法启动 Windows PowerShell；请联系网管检查安装环境。") from exc
+    if result.returncode:
+        detail = (result.stderr or result.stdout or f"exit {result.returncode}").strip()
+        if "80070005" in detail or "access is denied" in detail.lower() or "拒绝访问" in detail:
+            raise UpdaterError(
+                "Windows 拒绝创建或修改当前用户的自动更新计划 (0x80070005)。"
+                "Skill 文件不会因此删除。请让网管检查当前账号的计划任务权限；"
+                "不要换成其他账号重装，也不要关闭安全策略。"
+            )
+        raise UpdaterError(f"Windows 自动更新计划操作失败：{detail[:800]}")
+    if result.stdout.strip():
+        print(result.stdout.strip(), file=sys.stderr)
 
 
 def install_schedule(home: Path, dry_run: bool) -> dict[str, Any]:
@@ -2211,14 +2295,10 @@ def install_schedule(home: Path, dry_run: bool) -> dict[str, Any]:
     log_dir = updater_home(home) / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     if os.name == "nt":
-        task_name = "HM Operation Skill Updater"
+        task_name = windows_task_name(home)
         ps = windows_schedule_script(home, minute)
         if not dry_run:
-            subprocess.run(
-                ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", powershell_encoded(ps)],
-                check=True,
-                timeout=60,
-            )
+            run_windows_schedule_script(ps)
         return {"platform": "windows", "task": task_name, "dailyAt": f"04:{minute:02d}", "dryRun": dry_run}
     if sys.platform == "darwin":
         label = "com.hm.operation-skill-updater"
@@ -2244,14 +2324,17 @@ def install_schedule(home: Path, dry_run: bool) -> dict[str, Any]:
 
 def uninstall_schedule(home: Path, dry_run: bool) -> dict[str, Any]:
     if os.name == "nt":
-        task_name = "HM Operation Skill Updater"
-        ps = f"Unregister-ScheduledTask -TaskName '{task_name}' -Confirm:$false -ErrorAction SilentlyContinue"
+        task_name = windows_task_name(home)
+        ps = f"""
+{windows_schedule_context(home)}
+$task = Get-ScheduledTask -TaskName '{task_name}' -TaskPath '\\' -ErrorAction SilentlyContinue
+if ($task) {{
+  $task | Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop
+}}
+{windows_legacy_schedule_cleanup()}
+"""
         if not dry_run:
-            subprocess.run(
-                ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", powershell_encoded(ps)],
-                check=False,
-                timeout=60,
-            )
+            run_windows_schedule_script(ps)
         return {"platform": "windows", "removed": task_name, "dryRun": dry_run}
     if sys.platform == "darwin":
         label = "com.hm.operation-skill-updater"
@@ -2311,6 +2394,9 @@ def render(payload: dict[str, Any], as_json: bool) -> None:
         print(f"永久采用备份: {payload['adoptionBackup']}")
     if payload.get("reloadRequired"):
         print("已打开的 Hermes 会话请执行 /reload-skills")
+    if payload.get("task"):
+        print(f"自动更新任务: {payload['task']}")
+        print(f"检查时间: 当前用户登录后，以及每天 {payload['dailyAt']}（当前用户登录期间）")
 
 
 def main(argv: Optional[list[str]] = None) -> int:

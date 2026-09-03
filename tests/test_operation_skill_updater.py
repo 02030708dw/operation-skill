@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import importlib.util
 import inspect
 import json
@@ -1615,13 +1616,58 @@ class OperationSkillUpdaterTest(unittest.TestCase):
     def test_windows_schedule_has_valid_trigger_array_and_two_hour_limit(self):
         script = UPDATER.windows_schedule_script(Path("C:/Hermes"), 7)
 
-        self.assertIn("(New-ScheduledTaskTrigger -AtLogOn)", script)
+        self.assertIn("(New-ScheduledTaskTrigger -AtLogOn -User $userId)", script)
+        self.assertIn("$userId = $currentUser.User.Value", script)
+        self.assertIn("-UserId $userId -LogonType Interactive -RunLevel Limited", script)
+        self.assertNotIn("-RunLevel Highest", script)
+        self.assertIn("-Force -ErrorAction Stop", script)
         self.assertIn(
             "(New-ScheduledTaskTrigger -Daily -At '04:07')", script
         )
         self.assertNotIn("-AtLogOn,", script)
         self.assertIn("-ExecutionTimeLimit (New-TimeSpan -Hours 2)", script)
         self.assertNotIn("New-TimeSpan -Minutes 15", script)
+
+    def test_windows_task_name_is_stable_and_isolated_by_installation(self):
+        first = UPDATER.windows_task_name(Path("C:/Users/wei/.hermes"))
+        self.assertEqual(first, UPDATER.windows_task_name(Path("c:/users/WEI/.hermes")))
+        self.assertNotEqual(first, UPDATER.windows_task_name(Path("C:/Users/other/.hermes")))
+        self.assertRegex(first, r"^HM Operation Skill Updater-[0-9a-f]{12}$")
+        self.assertEqual(UPDATER.windows_task_name(Path(".")), UPDATER.windows_task_name(Path.cwd()))
+
+    def test_windows_legacy_cleanup_checks_owner_and_exact_action(self):
+        script = UPDATER.windows_legacy_schedule_cleanup()
+        self.assertIn("$legacyUser -eq $userId", script)
+        self.assertIn("$legacy.Actions[0].Execute -eq $action.Execute", script)
+        self.assertIn("$legacy.Actions[0].Arguments -eq $action.Arguments", script)
+
+    def test_windows_schedule_permission_error_is_readable_not_encoded_command(self):
+        result = subprocess.CompletedProcess([], 1, "", "HRESULT 0x80070005,Register-ScheduledTask")
+        with mock.patch.object(UPDATER.subprocess, "run", return_value=result) as run:
+            with self.assertRaises(UPDATER.UpdaterError) as caught:
+                UPDATER.run_windows_schedule_script("throw 'test'")
+        message = str(caught.exception)
+        self.assertIn("0x80070005", message)
+        self.assertIn("网管", message)
+        self.assertNotIn("EncodedCommand", message)
+        self.assertTrue(run.call_args.kwargs["capture_output"])
+        self.assertEqual("utf-8", run.call_args.kwargs["encoding"])
+
+    def test_windows_schedule_other_errors_and_timeout_are_concise(self):
+        result = subprocess.CompletedProcess([], 1, "", "Task service unavailable")
+        with mock.patch.object(UPDATER.subprocess, "run", return_value=result):
+            with self.assertRaisesRegex(UPDATER.UpdaterError, "Task service unavailable"):
+                UPDATER.run_windows_schedule_script("test")
+
+    def test_windows_schedule_explicitly_succeeds_after_optional_missing_task(self):
+        result = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(UPDATER.subprocess, "run", return_value=result) as run:
+            UPDATER.run_windows_schedule_script("# optional legacy lookup")
+        wrapped = base64.b64decode(run.call_args.args[0][-1]).decode("utf-16le")
+        self.assertIn("exit 0\n} catch", wrapped)
+        with mock.patch.object(UPDATER.subprocess, "run", side_effect=subprocess.TimeoutExpired("ps", 60)):
+            with self.assertRaisesRegex(UPDATER.UpdaterError, "超时"):
+                UPDATER.run_windows_schedule_script("test")
 
     def test_hidden_backup_skill_is_not_discovered(self):
         with tempfile.TemporaryDirectory() as temporary:

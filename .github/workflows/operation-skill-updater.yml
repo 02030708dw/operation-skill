@@ -9,6 +9,8 @@ on:
       - "scripts/install-operation-skill-updater.ps1"
       - "scripts/install-operation-skill-updater.sh"
       - "tests/test_operation_skill_*.py"
+      - "tests/windows_operation_skill_smoke.py"
+      - "scripts/test-windows-skill-updater.ps1"
       - ".github/workflows/operation-skill-updater.yml"
       - ".github/workflows/publish-operation-skills.yml"
   pull_request:
@@ -19,6 +21,8 @@ on:
       - "scripts/install-operation-skill-updater.ps1"
       - "scripts/install-operation-skill-updater.sh"
       - "tests/test_operation_skill_*.py"
+      - "tests/windows_operation_skill_smoke.py"
+      - "scripts/test-windows-skill-updater.ps1"
       - ".github/workflows/operation-skill-updater.yml"
       - ".github/workflows/publish-operation-skills.yml"
 
@@ -45,9 +49,9 @@ jobs:
       - name: Validate macOS installer
         if: runner.os == 'macOS'
         run: bash -n scripts/install-operation-skill-updater.sh
-      - name: Validate Windows installer
+      - name: Validate Windows PowerShell 5.1 installer
         if: runner.os == 'Windows'
-        shell: pwsh
+        shell: powershell
         run: |
           $tokens = $null
           $errors = $null
@@ -59,3 +63,7 @@ jobs:
           if ($errors.Count) {
             $errors | Format-List | Out-String | Write-Error
           }
+      - name: Exercise Windows installer as a standard user
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/test-windows-skill-updater.ps1 -Python (Get-Command python.exe).Source
