@@ -17,6 +17,7 @@ const {
   normalizeVideoUrl,
   pageCandidates,
   readDevToolsActivePort,
+  removeTree,
   selectDailyVideoUrls,
   selectVideoUrls,
   videoKey,
@@ -29,6 +30,55 @@ const { parseRunLog, renderReport } = require('../scripts/facebook_followed_vide
 function reel(id) {
   return `https://www.facebook.com/reel/${id}`;
 }
+
+test('temporary cleanup uses rmSync on modern Node and tolerates missing directories', t => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'fb-cleanup-modern-'));
+  t.after(() => fs.rmSync(temporary, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(temporary, 'nested'));
+  fs.writeFileSync(path.join(temporary, 'nested', 'file.txt'), 'test');
+  const remove = t.mock.method(fs, 'rmSync');
+  removeTree(temporary);
+  assert.equal(fs.existsSync(temporary), false);
+  assert.deepEqual(remove.mock.calls[0].arguments, [temporary, {
+    recursive: true, force: true, maxRetries: 3, retryDelay: 100,
+  }]);
+  removeTree(temporary);
+  assert.equal(remove.mock.callCount(), 1);
+});
+
+test('temporary cleanup falls back to recursive rmdir only when rmSync is unavailable', () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'fb-cleanup-legacy-'));
+  const modernRemove = fs.rmSync;
+  const legacyRemove = fs.rmdirSync;
+  fs.mkdirSync(path.join(temporary, 'nested'));
+  fs.writeFileSync(path.join(temporary, 'nested', 'file.txt'), 'test');
+  let calls = 0;
+  try {
+    fs.rmSync = undefined;
+    fs.rmdirSync = (directory, options) => {
+      calls++;
+      assert.equal(directory, temporary);
+      assert.deepEqual(options, { recursive: true, maxRetries: 3, retryDelay: 100 });
+    };
+    removeTree(temporary);
+    assert.equal(calls, 1);
+  } finally {
+    fs.rmSync = modernRemove;
+    fs.rmdirSync = legacyRemove;
+    modernRemove(temporary, { recursive: true, force: true });
+  }
+});
+
+test('rmSync errors are not retried with the deprecated interface', t => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'fb-cleanup-error-'));
+  const modernRemove = fs.rmSync;
+  t.after(() => modernRemove(temporary, { recursive: true, force: true }));
+  const error = Object.assign(new Error('busy'), { code: 'EBUSY' });
+  t.mock.method(fs, 'rmSync', () => { throw error; });
+  const legacy = t.mock.method(fs, 'rmdirSync', () => {});
+  assert.throws(() => removeTree(temporary), caught => caught === error);
+  assert.equal(legacy.mock.callCount(), 0);
+});
 
 test('per-video event line is structured and includes batch progress', () => {
   const video = {

@@ -28,3 +28,13 @@ Use the manifest error code to separate access requirements
 (`CDP_RUNTIME_TIMEOUT`), unsupported layouts
 (`FACEBOOK_LAYOUT_UNSUPPORTED`), and a genuinely empty public discovery result
 (`FACEBOOK_DISCOVERY_EMPTY`).
+
+On Windows, a subprocess reader `UnicodeDecodeError` can be a log-encoding
+failure rather than a failed download. Preflight commands capture bytes first,
+then decode UTF-8, the system encoding (including Windows ANSI/OEM code pages),
+or replacement characters as a last resort. The real command exit code and
+timeout still determine readiness; undecodable output must not hide a failure.
+The engine's UTF-8 progress/event stream retains replacement-character tolerance.
+
+Temporary browser directories use `fs.rmSync` when available. Node.js 12 falls
+back to recursive `fs.rmdirSync`; modern Node must not call that deprecated API.

@@ -20,6 +20,74 @@ assert SPEC and SPEC.loader
 SPEC.loader.exec_module(MODULE)
 
 
+class ProbeOutputTests(unittest.TestCase):
+    def test_utf8_takes_priority_over_windows_locale(self):
+        text = "检查完成：视频 🎬"
+        with mock.patch.object(MODULE.locale, "getpreferredencoding", return_value="cp936"):
+            self.assertEqual(MODULE._decode_probe_output(text.encode("utf-8")), text)
+
+    def test_windows_gbk_output_preserves_chinese(self):
+        text = "正在检查浏览器"
+        self.assertEqual(text.encode("gbk")[0], 0xD5)
+        with mock.patch.object(MODULE.sys, "platform", "win32"), \
+                mock.patch.object(MODULE.locale, "getpreferredencoding", return_value="cp936"):
+            self.assertEqual(MODULE._decode_probe_output(text.encode("gbk")), text)
+
+    @unittest.skipUnless(sys.platform == "win32", "requires native Windows ANSI codec")
+    def test_windows_native_encoding_is_used_even_in_python_utf8_mode(self):
+        text = "caf\u00e9"
+        output = text.encode("mbcs")
+        with mock.patch.object(MODULE.locale, "getpreferredencoding", return_value="utf-8"):
+            self.assertEqual(MODULE._decode_probe_output(output), text)
+
+    def test_unrecognized_bytes_and_codec_do_not_raise(self):
+        with mock.patch.object(MODULE.sys, "platform", "linux"), \
+                mock.patch.object(MODULE.locale, "getpreferredencoding", return_value="missing-codec"):
+            self.assertEqual(MODULE._decode_probe_output(b"\xd5\xff"), "\ufffd\ufffd")
+            self.assertEqual(MODULE._decode_probe_output(b""), "")
+            self.assertEqual(MODULE._decode_probe_output(None), "")
+
+    def test_real_subprocess_captures_gbk_and_invalid_bytes_without_reader_errors(self):
+        stdout = "正在检查浏览器".encode("gbk")
+        stderr = b"failure: \xff"
+        command = [sys.executable, "-c", (
+            "import os; "
+            f"os.write(1, {stdout!r}); os.write(2, {stderr!r}); raise SystemExit(7)"
+        )]
+        with mock.patch.object(MODULE.locale, "getpreferredencoding", return_value="cp936"), \
+                mock.patch.object(MODULE.sys, "platform", "linux"):
+            result = MODULE._run_probe(command, timeout=15)
+        self.assertEqual(result.args, command)
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(result.stdout, "正在检查浏览器")
+        self.assertEqual(result.stderr, "failure: \ufffd")
+
+    def test_probe_timeout_is_not_swallowed_by_decoding(self):
+        with mock.patch.object(MODULE.subprocess, "run", side_effect=subprocess.TimeoutExpired("node", 15)):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                MODULE._run_probe(["node", "--version"], timeout=15)
+
+    def test_preflight_keeps_syntax_failure_and_checks_every_probe_in_binary_mode(self):
+        args = MODULE.build_parser().parse_args(["--runtime-check"])
+
+        def run(command, **kwargs):
+            self.assertIs(kwargs["text"], False)
+            output = b"v22.0.0" if command == ["node", "--version"] else b""
+            code = 1 if "--check" in command else 0
+            return subprocess.CompletedProcess(command, code, output, "语法错误".encode("gbk"))
+
+        with mock.patch.object(MODULE.sys, "platform", "linux"), \
+                mock.patch.object(MODULE.locale, "getpreferredencoding", return_value="cp936"), \
+                mock.patch.object(MODULE, "command_path", side_effect=lambda command: command), \
+                mock.patch.object(MODULE, "detect_chrome", return_value="chrome"), \
+                mock.patch.object(MODULE.subprocess, "run", side_effect=run):
+            result = MODULE.runtime_status(args)
+        self.assertFalse(result["engineSyntaxOk"])
+        self.assertFalse(result["runtimeReady"])
+        self.assertEqual(len(result["engineSyntaxErrors"]), 2)
+        self.assertTrue(all("语法错误" in error for error in result["engineSyntaxErrors"]))
+
+
 class WindowsVersionResourceTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -105,8 +173,9 @@ class ChromePreflightTests(unittest.TestCase):
 
         def run(command, **kwargs):
             self.assertNotEqual(command[0], chrome, "preflight must not launch Chrome")
-            output = "v22.0.0" if command == ["node", "--version"] else ""
-            return subprocess.CompletedProcess(command, 0, output, "")
+            self.assertIs(kwargs["text"], False)
+            output = b"v22.0.0" if command == ["node", "--version"] else b""
+            return subprocess.CompletedProcess(command, 0, output, b"")
 
         with mock.patch.object(MODULE.sys, "platform", "win32"), \
                 mock.patch.object(MODULE, "command_path", side_effect=lambda command: command), \
@@ -133,8 +202,8 @@ class ChromePreflightTests(unittest.TestCase):
                 run.return_value = subprocess.CompletedProcess([], 0)
                 self.assertTrue(MODULE._chrome_version_ok("chrome"))
                 run.assert_called_once_with(
-                    ["chrome", "--version"], capture_output=True, text=True,
-                    check=False, timeout=15,
+                    ["chrome", "--version"], capture_output=True, text=False,
+                    check=False, cwd=None, timeout=15,
                 )
                 run.return_value = subprocess.CompletedProcess([], 1)
                 self.assertFalse(MODULE._chrome_version_ok("chrome"))

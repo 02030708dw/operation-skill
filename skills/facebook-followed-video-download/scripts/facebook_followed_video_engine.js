@@ -869,6 +869,11 @@ async function stopChrome(chrome) {
 
 function removeTree(directory) {
   if (!fs.existsSync(directory)) return;
+  if (typeof fs.rmSync === 'function') {
+    fs.rmSync(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    return;
+  }
+  // Node.js 12 has no rmSync; retain its recursive rmdir implementation.
   fs.rmdirSync(directory, { recursive: true, maxRetries: 3, retryDelay: 100 });
 }
 
@@ -1110,6 +1115,7 @@ module.exports = {
   normalizeVideoUrl,
   pageCandidates,
   readDevToolsActivePort,
+  removeTree,
   selectDailyVideoUrls,
   selectVideoUrls,
   videoKey,

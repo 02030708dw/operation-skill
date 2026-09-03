@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import json
+import locale
 import os
 import re
 import shutil
@@ -312,12 +313,42 @@ def is_facebook_url(value: str) -> bool:
     return host == "facebook.com" or host.endswith(".facebook.com") or host == "fb.watch"
 
 
+def _decode_probe_output(output: bytes | str | None) -> str:
+    if output is None:
+        return ""
+    if isinstance(output, str):
+        return output
+    encodings = ["utf-8", locale.getpreferredencoding(False)]
+    if sys.platform == "win32":
+        # UTF-8 mode can hide the code page used by native Windows commands.
+        encodings.extend(["mbcs", "oem"])
+    for encoding in dict.fromkeys(encodings):
+        try:
+            return output.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return output.decode("utf-8", errors="replace")
+
+
+def _run_probe(
+    command: list[str], *, cwd: Path | None = None, timeout: float | None = None
+) -> subprocess.CompletedProcess[str]:
+    # Capture bytes so Windows communicate() reader threads never decode text.
+    # Decode afterwards without hiding the actual exit code or timeout.
+    probe = subprocess.run(
+        command, capture_output=True, text=False, check=False,
+        cwd=cwd, timeout=timeout,
+    )
+    return subprocess.CompletedProcess(
+        probe.args, probe.returncode,
+        _decode_probe_output(probe.stdout), _decode_probe_output(probe.stderr),
+    )
+
+
 def _node_version(node: str | None) -> tuple[str | None, tuple[int, int, int] | None]:
     if not node:
         return None, None
-    probe = subprocess.run(
-        [node, "--version"], capture_output=True, text=True, check=False
-    )
+    probe = _run_probe([node, "--version"])
     raw = (probe.stdout or probe.stderr or "").strip()
     match = re.search(r"v?(\d+)\.(\d+)\.(\d+)", raw)
     if probe.returncode != 0 or not match:
@@ -334,12 +365,9 @@ def _node_syntax_ok(node: str | None) -> tuple[bool, list[str]]:
     if not node:
         return False, ["Node.js executable was not found"]
     for script in scripts:
-        probe = subprocess.run(
+        probe = _run_probe(
             [node, "--check", str(script)],
             cwd=SCRIPT_DIR,
-            capture_output=True,
-            text=True,
-            check=False,
         )
         if probe.returncode != 0:
             detail = (probe.stderr or probe.stdout or "syntax check failed").strip()
@@ -351,11 +379,8 @@ def _command_version_ok(command: str | None) -> bool:
     if not command:
         return False
     try:
-        probe = subprocess.run(
+        probe = _run_probe(
             [command, "--version"],
-            capture_output=True,
-            text=True,
-            check=False,
             timeout=15,
         )
     except (OSError, subprocess.SubprocessError):
@@ -447,12 +472,9 @@ def runtime_status(args: argparse.Namespace) -> dict[str, object]:
     ytdlp_runnable = _command_version_ok(ytdlp)
     ws_ok = False
     if node:
-        probe = subprocess.run(
+        probe = _run_probe(
             [node, "-e", "require.resolve('ws');"],
             cwd=SCRIPT_DIR,
-            capture_output=True,
-            text=True,
-            check=False,
         )
         ws_ok = probe.returncode == 0
     runtime_ready = bool(
