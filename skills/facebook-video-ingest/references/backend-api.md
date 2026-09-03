@@ -121,14 +121,22 @@ Downloader items with machine status `filtered-duration` or `archived-existing` 
 
 The backend deduplicates videos by `(task_id, SHA-256(canonicalUrl))`. A second callback updates the same record, which is how the upload result enriches the earlier download record.
 
+The backend limits `title` to 300 and `errorMessage` to 500 Java UTF-16 code
+units. Bound these display fields without splitting a surrogate pair; keep the
+full downloader values in `metadataJson` for diagnostics and recovery.
+
 For a multi-video capture, the Worker sends this callback immediately after
 each downloader `video-result` event instead of waiting for the whole child
 process. Callback delivery uses transient retries in parallel with continuing
 downloads. Before calling execution `complete`, the Worker reconciles the final
 download manifest: already accepted canonical URLs are skipped and any failed
-early callback is retried. If that final callback still fails, the Worker must
-not call `complete`; the execution lease and durable final manifest provide the
-safe retry path.
+early callback is retried. If that final callback still has a network error,
+server failure, or transient 4xx response (408/425/429), the Worker must not call
+`complete`; the execution lease and durable final manifest provide the safe
+retry path. An explicit non-transient 4xx rejection instead requires a `FAILED`
+completion with `BACKEND_REQUEST_REJECTED`, so invalid data cannot leave the
+task stuck in `RUNNING`. If that failure completion cannot reach HM, retain the
+lease recovery path and report `callbackError` rather than claiming delivery.
 
 ## Approved Upload Jobs
 
@@ -238,6 +246,12 @@ Content-Type: application/json
 ```
 
 Terminal statuses are `COMPLETED`, `PARTIAL`, `FAILED`, and `CANCELLED`. Only the owning Worker can complete a still-running execution.
+
+Bound `errorMessage` to 500 and the trailing `rawOutput` to 1,000,000 Java UTF-16
+code units. Keep the original error in `resultJson`. A lost completion response
+can mean HM already committed the terminal state: retry the same request or
+leave lease recovery intact, and never replace an uncertain success with a
+`FAILED` callback.
 
 ## Operator Read APIs
 

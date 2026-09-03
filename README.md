@@ -189,7 +189,7 @@ Windows 将上面两个路径分别替换为 `~\.hermes\hermes-agent\venv\Script
 | `facebook-post-publish` | 1.2.0 | 在 MYT 云手机的 Facebook 中发布纯文字、图片或视频帖子，并严格校验图库素材类型 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-post-publish/SKILL.md) |
 | `facebook-followed-video-download` | 1.7.2 | 扫描获准访问的 Facebook 来源，按来源下载新增视频、去重并输出可供后台消费的结果清单 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-followed-video-download/SKILL.md) |
 | `cloudflare-r2-video-upload` | 1.1.0 | 将本地视频或下载结果清单安全上传到 Cloudflare R2，支持校验、去重、并发和结果清单 | Windows、Linux、macOS | [查看 SKILL.md](skills/cloudflare-r2-video-upload/SKILL.md) |
-| `facebook-video-ingest` | 1.2.1 | 按后台任务编号定向认领，串联 Facebook 下载、R2 上传，并回写逐视频和执行记录 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-video-ingest/SKILL.md) |
+| `facebook-video-ingest` | 1.2.2 | 按后台任务编号定向认领，串联 Facebook 下载、R2 上传，并回写逐视频和执行记录 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-video-ingest/SKILL.md) |
 | `myt-cloud-phone-file-upload` | 2.0.0 | 将用户指定的单个文件或目录内全部文件并发上传到魔云腾云手机，保持相对子目录并验证每个文件 | Windows、Linux、macOS | [查看 SKILL.md](skills/myt-cloud-phone-file-upload/SKILL.md) |
 | `philippines-lottery-result-media` | 2.2.1 | 并发对比多个菲律宾彩票结果来源，为 2D、3D、4D、6D 生成高对比号码和时间字体、电影感动画、共享品牌素材和音乐的竖屏图片或视频 | Windows、Linux、macOS | [查看 SKILL.md](skills/philippines-lottery-result-media/SKILL.md) |
 
@@ -441,6 +441,8 @@ Windows 将上面两个路径分别替换为 `~\.hermes\hermes-agent\venv\Script
 ```
 
 安装器会创建每分钟运行的 `HM 视频抓取队列兜底 Worker`，每次只认领一条遗漏任务；任务专属 Cron 仍优先按任务编号执行并等待 90 秒。每次认领前都会检查 Node 版本、下载器语法、`ws`、Chrome 与 `yt-dlp`，避免 Skill 更新不完整时占用后台执行。脚本会在下载期间持续发送心跳，并按执行编号持久保留下载清单；Worker 异常退出且租约过期后，后台会把执行记录重新放回队列，并复用仍通过文件大小和 SHA-256 校验的本地下载。
+
+从 1.2.2 起，视频显示标题按后台的 300 字符限制处理（表情按 UTF-16 长度计算），完整标题保留在原始数据中。后台明确拒绝回写参数时，Worker 会提交失败状态，避免 Hermes 已报错而后台仍显示“抓取中”；网络中断、限流和服务暂时不可用仍按原有租约机制恢复。
 
 详细配置、状态映射和后台 API 协议请阅读 [`skills/facebook-video-ingest/SKILL.md`](skills/facebook-video-ingest/SKILL.md)。
 
