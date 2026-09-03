@@ -21,7 +21,7 @@ const DEFAULT_COOKIES = process.env.FACEBOOK_FOLLOWED_COOKIES || process.env.FB_
 const DEFAULT_DESKTOP = process.env.FACEBOOK_FOLLOWED_OUTPUT || process.env.FB_FOLLOWED_DESKTOP || path.join(HOME, 'Desktop', 'Facebook');
 const DEFAULT_YTDLP = process.env.FACEBOOK_FOLLOWED_YTDLP || process.env.FB_FOLLOWED_YTDLP || process.env.YTDLP || 'yt-dlp';
 const CONFIGURED_CDP_PORT = Number(process.env.FACEBOOK_FOLLOWED_CDP_PORT || process.env.FB_CDP_PORT || '0');
-const SKILL_VERSION = '1.7.1';
+const SKILL_VERSION = '1.7.2';
 const VIDEO_RESULT_EVENT_PREFIX = '__HM_VIDEO_RESULT__:';
 const ERROR_CODES = {
   CHROME_START: 'CHROME_CDP_START_FAILED',
