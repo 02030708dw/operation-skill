@@ -19,7 +19,7 @@ from urllib import error, request
 
 
 SKILL_NAME = "facebook-video-ingest"
-SKILL_VERSION = "1.2.1"
+SKILL_VERSION = "1.2.2"
 WORKER_USER_AGENT = "HM-Hermes-Worker/1.0"
 TRANSIENT_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 TRANSIENT_BACKEND_ATTEMPTS = 6
@@ -63,7 +63,28 @@ class PipelineError(RuntimeError):
 
 
 class BackendError(PipelineError):
-    pass
+    def __init__(self, message: str, *, http_status: int | None = None) -> None:
+        # An explicit client rejection was not committed. Network failures and
+        # server errors can have an uncertain outcome and must keep lease recovery.
+        self.retryable = not (
+            http_status is not None
+            and 400 <= http_status < 500
+            and http_status not in TRANSIENT_HTTP_STATUSES
+        )
+        self.http_status = http_status
+        super().__init__(
+            message,
+            "PIPELINE_ERROR" if self.retryable else "BACKEND_REQUEST_REJECTED",
+        )
+
+
+def bounded_backend_text(value: str | None, limit: int, *, tail: bool = False) -> str | None:
+    """Match Java String.length limits without splitting a Unicode surrogate pair."""
+    if value is None:
+        return None
+    encoded = value.encode("utf-16-le")
+    bounded = encoded[-limit * 2:] if tail else encoded[:limit * 2]
+    return bounded.decode("utf-16-le", errors="ignore")
 
 
 def environment_path(name: str, fallback: Path) -> Path:
@@ -248,14 +269,19 @@ def api_call(
             detail = exc.read().decode("utf-8", errors="replace")[:1000]
             if exc.code not in TRANSIENT_HTTP_STATUSES or attempt + 1 >= attempts:
                 raise BackendError(
-                    f"backend returned HTTP {exc.code}: {detail}"
+                    f"backend returned HTTP {exc.code}: {detail}",
+                    http_status=exc.code,
                 ) from exc
         except (error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
             if attempt + 1 >= attempts:
                 raise BackendError(f"backend request failed: {exc}") from exc
         time.sleep(min(2 ** attempt, 8))
     if not isinstance(parsed, dict) or parsed.get("code") != 200:
-        raise BackendError(f"backend rejected request: {parsed}")
+        code = parsed.get("code") if isinstance(parsed, dict) else None
+        raise BackendError(
+            f"backend rejected request: {parsed}",
+            http_status=code if isinstance(code, int) else None,
+        )
     return parsed.get("data")
 
 
@@ -451,7 +477,10 @@ def record_video(
     payload = {
         "platformVideoId": video.get("platformVideoId"),
         "sourceName": video.get("source"),
-        "title": video.get("title") or video.get("fileName") or video.get("platformVideoId"),
+        "title": bounded_backend_text(
+            video.get("title") or video.get("fileName") or video.get("platformVideoId"),
+            300,
+        ),
         "originalUrl": original_url,
         "canonicalUrl": video.get("canonicalUrl") or original_url,
         "localPath": video.get("localPath"),
@@ -466,7 +495,7 @@ def record_video(
         "r2ObjectKey": video.get("r2ObjectKey"),
         "r2Url": video.get("r2Url"),
         "errorCode": status_error_code(download_status, upload_status),
-        "errorMessage": video.get("error"),
+        "errorMessage": bounded_backend_text(video.get("error"), 500),
         "metadataJson": json.dumps(video, ensure_ascii=False),
     }
     api_call(
@@ -672,9 +701,9 @@ def complete(
             "status": status,
             "progress": 100 if status == "COMPLETED" else 95,
             "resultJson": json.dumps(result, ensure_ascii=False),
-            "rawOutput": raw_output[-1_000_000:],
+            "rawOutput": bounded_backend_text(raw_output, 1_000_000, tail=True),
             "errorCode": error_code,
-            "errorMessage": error_message,
+            "errorMessage": bounded_backend_text(error_message, 500),
         },
         retry_transient=True,
     )
@@ -1486,7 +1515,7 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             "status": "FAILED",
             "error": str(exc),
         }
-        if isinstance(exc, BackendError):
+        if isinstance(exc, BackendError) and exc.retryable:
             failed["callbackError"] = str(exc)
             failed["retry"] = "lease"
             return 1, failed
@@ -1500,10 +1529,12 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 failed,
                 "".join(raw_parts),
                 getattr(exc, "error_code", "PIPELINE_ERROR"),
-                str(exc)[:500],
+                str(exc),
             )
         except Exception as callback_error:
             failed["callbackError"] = str(callback_error)
+            if isinstance(callback_error, BackendError) and callback_error.retryable:
+                failed["retry"] = "lease"
         return 1, failed
 
 

@@ -2,7 +2,7 @@
 name: facebook-video-ingest
 description: Run customer-side Hermes Workers for backend-managed Facebook capture executions, filter videos over 20 minutes before download, hold videos for operator review or honor task-level backend auto-review, upload approved files to Cloudflare R2, consume rejected-file deletion jobs on the source computer, and report results to HM. Use when Hermes must install its local API, pair with the HM admin browser, create or run local Cron jobs, execute a targeted HM ingest job, or troubleshoot the local video pipeline while HM runs on another server.
 metadata:
-  version: "1.2.1"
+  version: "1.2.2"
 ---
 
 # Facebook Video Ingest
@@ -85,6 +85,10 @@ already accepted by HM, and retry any streamed callback that failed. Because HM
 upserts by the canonical video URL, uncertain or repeated callbacks remain
 idempotent. If final reconciliation still cannot reach HM, leave the execution
 running for its lease retry rather than reporting completion.
+If HM explicitly rejects callback parameters (a non-transient 4xx response),
+report the execution as `FAILED` with `BACKEND_REQUEST_REJECTED` instead of
+leaving it running. Bound display titles to 300 Java UTF-16 code units and error
+messages to 500; retain the original values in `metadataJson` / `resultJson`.
 
 The Hermes Cron runner resolves only `<hermes-home>/skills/facebook-video-ingest/scripts/facebook_video_ingest.py`. It must fail clearly if that installed Skill is missing; never fall back to a categorized copy or a recursive match.
 
@@ -247,7 +251,7 @@ completion.
     so a backend retry policy cannot make one Cron invocation loop forever. A
     missing or incompatible local-delete API must be reported in
     `localDeleteError` without preventing approved uploads in the same poll.
-11. Complete every claimed execution as `COMPLETED`, `PARTIAL`, or `FAILED`. If a backend callback fails, leave the execution running for lease retry and do not claim that HM recorded completion.
+11. Complete every claimed execution as `COMPLETED`, `PARTIAL`, or `FAILED`. Report explicit, non-transient callback parameter rejections as `FAILED`. For network errors, server failures, or transient 4xx responses (408/425/429), leave the execution running for lease retry and do not claim that HM recorded completion. An uncertain completion response must never trigger a replacement `FAILED` callback.
 12. Do not impose a short overall timeout. Monitor the same active process rather than starting a duplicate.
 
 Read [references/backend-api.md](references/backend-api.md) before changing the backend contract or diagnosing claim, heartbeat, callback, or lease behavior.
