@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import codecs
 import importlib.util
 import io
 import json
@@ -9,7 +10,7 @@ import tempfile
 import unittest
 import zipfile
 from argparse import Namespace
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 from unittest import mock
 
@@ -27,6 +28,7 @@ def load_module(name: str, path: Path):
 
 BUILD = load_module("operation_skill_release_builder", ROOT / "scripts" / "build-operation-skill-release.py")
 PUBLISH = load_module("operation_skill_release_publisher", ROOT / "scripts" / "publish-operation-skill-release.py")
+UPDATER = load_module("operation_skill_release_updater", ROOT / "scripts" / "operation_skill_updater.py")
 
 
 class MissingKeyError(Exception):
@@ -54,6 +56,50 @@ class FakeR2Client:
 
 
 class OperationSkillReleaseTest(unittest.TestCase):
+    def test_windows_installer_is_utf8_with_bom(self):
+        payload = (ROOT / "scripts" / "install-operation-skill-updater.ps1").read_bytes()
+        self.assertTrue(payload.startswith(codecs.BOM_UTF8))
+        self.assertTrue(payload.decode("utf-8-sig").startswith("param("))
+
+    def test_builder_and_updater_use_identical_cross_platform_hashes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            skill = root / "skills" / "demo-skill"
+            files = {
+                "SKILL.md": b"---\nname: demo-skill\n---\n",
+                "a.txt": b"lowercase\n",
+                "Z.txt": b"uppercase\n",
+                "a/run.py": b"nested\n",
+                "scripts/run.py": b"print('ok')\n",
+            }
+            expected = hashlib.sha256()
+            for name, payload in sorted(files.items()):
+                path = skill / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(payload)
+                relative = name.encode("utf-8")
+                expected.update(len(relative).to_bytes(4, "big"))
+                expected.update(relative)
+                expected.update(len(payload).to_bytes(8, "big"))
+                expected.update(payload)
+            self.assertNotEqual(sorted(files), sorted(files, key=PureWindowsPath))
+            self.assertEqual(expected.hexdigest(), BUILD.directory_hash(skill))
+            self.assertEqual(expected.hexdigest(), UPDATER.directory_hash(skill))
+            archive = root / "release.zip"
+            entries = BUILD.build_archive(root / "skills", archive)
+            staging = root / "staging"
+            UPDATER.safe_extract(archive, staging)
+            UPDATER.validate_staging(staging, {"skills": entries})
+
+    def test_repository_archive_is_accepted_by_updater(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "release.zip"
+            entries = BUILD.build_archive(ROOT / "skills", archive)
+            staging = root / "staging"
+            UPDATER.safe_extract(archive, staging)
+            UPDATER.validate_staging(staging, {"skills": entries})
+
     def make_publish_fixture(self, root, sequence, commit):
         dist = root / "dist"
         scripts = root / "scripts"

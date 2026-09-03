@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$BaseUrl = $env:OPERATION_SKILL_BASE_URL,
     [switch]$InstallCore,
     [switch]$AdoptExistingCore,
