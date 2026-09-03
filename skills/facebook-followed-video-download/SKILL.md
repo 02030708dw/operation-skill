@@ -2,7 +2,7 @@
 name: facebook-followed-video-download
 description: Find, download, or locally reuse recent permitted Facebook Page, creator, Reels, watch, or direct video URLs in per-source folders with archive-backed duplicate prevention and reports. Use when the user asks Hermes to configure followed Facebook video sources, preview recent videos, download the latest or all videos, list sources, check dependencies, or troubleshoot this downloader. Defaults to preview and downloads only with explicit execution approval.
 metadata:
-  version: "1.7.1"
+  version: "1.7.2"
   platforms:
     - windows
     - macos
@@ -109,6 +109,13 @@ python "<skill-dir>/scripts/facebook_followed_video_download.py" --runtime-check
 ```
 
 `runtimeReady: true` is required before a backend Worker claims work.
+
+On Windows, the Chrome preflight reads the executable's version resource through
+the system API without launching Chrome. A missing executable or unreadable
+version resource fails readiness. The engine then verifies actual browser startup
+through its isolated headless CDP session; it reports `CHROME_CDP_START_FAILED`
+if that session cannot start. Normal checks and captures do not open the user's
+Chrome profile picker. Explicit `--login` still opens the dedicated login window.
 
 ### Authorize An Isolated Facebook Login
 

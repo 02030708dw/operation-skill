@@ -32,6 +32,12 @@ Install `yt-dlp` through the user's normal package manager and make it available
 
 The engine auto-detects common Google Chrome and Chromium locations on Windows, macOS, and Linux. Use `--chrome` only when auto-detection fails. By default Chrome chooses a free CDP port and the engine reads its own `DevToolsActivePort`; use `FACEBOOK_FOLLOWED_CDP_PORT` only for a controlled diagnostic override.
 
+Windows readiness checks read the Chrome executable's version information without
+starting it. If the Chrome check fails, verify that the configured executable exists
+and has readable Windows version information. Browser startup is checked separately
+when the engine opens its isolated headless CDP session. There is no need to select
+a personal Google account or change Chrome's profile-picker startup setting.
+
 ## Reports
 
 Actual executions write:

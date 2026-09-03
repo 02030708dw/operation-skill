@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import re
@@ -19,7 +20,7 @@ from urllib.parse import urlparse
 
 
 SKILL_NAME = "facebook-followed-video-download"
-SKILL_VERSION = "1.7.1"
+SKILL_VERSION = "1.7.2"
 MINIMUM_NODE_VERSION = (12, 22, 0)
 VIDEO_RESULT_EVENT_PREFIX = "__HM_VIDEO_RESULT__:"
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -362,6 +363,77 @@ def _command_version_ok(command: str | None) -> bool:
     return probe.returncode == 0
 
 
+class _WindowsFixedFileInfo(ctypes.Structure):
+    # VS_FIXEDFILEINFO contains thirteen DWORDs, including on 64-bit Windows.
+    _fields_ = [
+        (name, ctypes.c_uint32)
+        for name in (
+            "dwSignature", "dwStrucVersion", "dwFileVersionMS", "dwFileVersionLS",
+            "dwProductVersionMS", "dwProductVersionLS", "dwFileFlagsMask",
+            "dwFileFlags", "dwFileOS", "dwFileType", "dwFileSubtype",
+            "dwFileDateMS", "dwFileDateLS",
+        )
+    ]
+
+
+def _windows_file_version(command: str) -> tuple[int, int, int, int] | None:
+    """Read an executable's version resource without starting the executable."""
+    try:
+        path = Path(command).expanduser().resolve()
+        if not path.is_file():
+            return None
+        # Load only the system version API, never the executable being inspected.
+        version_api = ctypes.WinDLL("version.dll", winmode=0x00000800)
+        version_api.GetFileVersionInfoSizeW.argtypes = [
+            ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_uint32)
+        ]
+        version_api.GetFileVersionInfoSizeW.restype = ctypes.c_uint32
+        version_api.GetFileVersionInfoW.argtypes = [
+            ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p
+        ]
+        version_api.GetFileVersionInfoW.restype = ctypes.c_int
+        version_api.VerQueryValueW.argtypes = [
+            ctypes.c_void_p, ctypes.c_wchar_p,
+            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_uint),
+        ]
+        version_api.VerQueryValueW.restype = ctypes.c_int
+
+        size = version_api.GetFileVersionInfoSizeW(str(path), None)
+        if not size:
+            return None
+        data = ctypes.create_string_buffer(size)
+        if not version_api.GetFileVersionInfoW(str(path), 0, size, data):
+            return None
+        pointer = ctypes.c_void_p()
+        length = ctypes.c_uint()
+        if not version_api.VerQueryValueW(
+            data, "\\", ctypes.byref(pointer), ctypes.byref(length)
+        ):
+            return None
+        if not pointer.value or length.value < ctypes.sizeof(_WindowsFixedFileInfo):
+            return None
+        info = ctypes.cast(pointer, ctypes.POINTER(_WindowsFixedFileInfo)).contents
+        if info.dwSignature != 0xFEEF04BD:
+            return None
+        version = (
+            info.dwFileVersionMS >> 16, info.dwFileVersionMS & 0xFFFF,
+            info.dwFileVersionLS >> 16, info.dwFileVersionLS & 0xFFFF,
+        )
+        return version if any(version) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _chrome_version_ok(command: str | None) -> bool:
+    if not command:
+        return False
+    if sys.platform == "win32":
+        # chrome.exe --version can open the user's normal browser on Windows.
+        # The engine separately checks that its headless CDP session starts.
+        return _windows_file_version(command) is not None
+    return _command_version_ok(command)
+
+
 def runtime_status(args: argparse.Namespace) -> dict[str, object]:
     node = command_path("node")
     ytdlp = command_path(args.ytdlp or os.environ.get("FACEBOOK_FOLLOWED_YTDLP") or "yt-dlp")
@@ -371,7 +443,7 @@ def runtime_status(args: argparse.Namespace) -> dict[str, object]:
         parsed_node_version and parsed_node_version >= MINIMUM_NODE_VERSION
     )
     engine_syntax_ok, syntax_errors = _node_syntax_ok(node)
-    chrome_runnable = _command_version_ok(chrome)
+    chrome_runnable = _chrome_version_ok(chrome)
     ytdlp_runnable = _command_version_ok(ytdlp)
     ws_ok = False
     if node:
