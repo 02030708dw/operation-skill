@@ -109,6 +109,97 @@ class PipelineTests(unittest.TestCase):
                 "hm_capture_C-5786859AED6E_1400_r2.py",
             )
 
+    def test_gateway_extension_materializes_versioned_schedule_runner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            scripts = home / "scripts"
+            scripts.mkdir()
+            (scripts / EXTENSION.BASE_RUNNER_NAME).write_text(
+                "# trusted runner\n", encoding="utf-8"
+            )
+            prepared = EXTENSION.prepare_capture_job_body(
+                {
+                    "hm_capture_runner": {
+                        "taskNo": "C-5786859AED6E",
+                        "scheduleKey": "MORNING-1055-1",
+                        "scheduleVersion": 4,
+                        "runnerRevision": "r2",
+                    }
+                },
+                home=home,
+            )
+            expected = (
+                "hm_capture_C-5786859AED6E_"
+                "v4_MORNING-1055-1_r2.py"
+            )
+            self.assertEqual(prepared["script"], expected)
+            self.assertTrue((scripts / expected).is_file())
+            EXTENSION.cleanup_capture_job_script(prepared, home=home)
+            self.assertFalse((scripts / expected).exists())
+
+            manual_prepared = EXTENSION.prepare_capture_job_body(
+                {
+                    "hm_capture_runner": {
+                        "taskNo": "C-5786859AED6E",
+                        "scheduleKey": "CUSTOM-1900-0",
+                        "scheduleVersion": 4,
+                        "runnerRevision": "r2",
+                    }
+                },
+                home=home,
+            )
+            self.assertEqual(
+                manual_prepared["script"],
+                "hm_capture_C-5786859AED6E_v4_CUSTOM-1900-0_r2.py",
+            )
+            EXTENSION.cleanup_capture_job_script(manual_prepared, home=home)
+
+    def test_gateway_extension_accepts_prefixed_legacy_schedule_key(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            scripts = home / "scripts"
+            scripts.mkdir()
+            (scripts / EXTENSION.BASE_RUNNER_NAME).write_text(
+                "# trusted runner\n", encoding="utf-8"
+            )
+            prepared = EXTENSION.prepare_capture_job_body(
+                {
+                    "hm_capture_runner": {
+                        "taskNo": "C-5786859AED6E",
+                        "scheduleKey": "LEGACY-1525",
+                        "runnerRevision": "r2",
+                    }
+                },
+                home=home,
+            )
+            self.assertEqual(
+                prepared["script"],
+                "hm_capture_C-5786859AED6E_LEGACY-1525_r2.py",
+            )
+
+    def test_gateway_extension_rejects_unsafe_schedule_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            for schedule_key, schedule_version in (
+                ("MORNING-../../1055-0", 4),
+                ("MORNING-1055-0", "4/../../escape"),
+            ):
+                with self.subTest(
+                    schedule_key=schedule_key,
+                    schedule_version=schedule_version,
+                ):
+                    with self.assertRaises(ValueError):
+                        EXTENSION.prepare_capture_job_body(
+                            {
+                                "hm_capture_runner": {
+                                    "taskNo": "C-5786859AED6E",
+                                    "scheduleKey": schedule_key,
+                                    "scheduleVersion": schedule_version,
+                                }
+                            },
+                            home=home,
+                        )
+
     def test_gateway_extension_rejects_ambiguous_runner_target(self):
         with tempfile.TemporaryDirectory() as temporary:
             with self.assertRaises(ValueError):

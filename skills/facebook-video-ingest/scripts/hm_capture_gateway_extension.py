@@ -20,10 +20,16 @@ REQUEST_FIELD = "hm_capture_runner"
 BASE_RUNNER_NAME = "hm_facebook_video_ingest_worker.py"
 TASK_PATTERN = re.compile(r"^C-[A-Za-z0-9-]+$")
 EXECUTION_PATTERN = re.compile(r"^E-[A-Za-z0-9-]+$")
-SCHEDULE_KEY_PATTERN = re.compile(r"^\d{4}$")
+SCHEDULE_KEY_FRAGMENT = (
+    r"(?:\d{4}|LEGACY-\d{4}|[A-Z][A-Z0-9_]{0,31}-\d{4}-\d{1,3})"
+)
+SCHEDULE_KEY_PATTERN = re.compile(rf"^{SCHEDULE_KEY_FRAGMENT}$")
+SCHEDULE_VERSION_PATTERN = re.compile(r"^[1-9]\d{0,9}$")
 RUNNER_REVISION_PATTERN = re.compile(r"^r\d+$", re.IGNORECASE)
 MANAGED_RUNNER_PATTERN = re.compile(
-    r"^(?:hm_capture_C-[A-Za-z0-9-]+_(?:E-[A-Za-z0-9-]+|\d{4})(?:_r\d+)?|hm_capture_upload_C-[A-Za-z0-9-]+_V-[A-Za-z0-9-]+)\.py$",
+    rf"^(?:hm_capture_C-[A-Za-z0-9-]+_"
+    rf"(?:E-[A-Za-z0-9-]+|(?:v[1-9]\d{{0,9}}_)?{SCHEDULE_KEY_FRAGMENT})"
+    rf"(?:_r\d+)?|hm_capture_upload_C-[A-Za-z0-9-]+_V-[A-Za-z0-9-]+)\.py$",
     re.IGNORECASE,
 )
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
@@ -51,19 +57,43 @@ def _materialize_runner(spec: dict[str, Any], home: Path) -> str:
     task_no = _normalized(spec.get("taskNo"), TASK_PATTERN, "task number")
     execution_value = str(spec.get("executionNo") or "").strip()
     schedule_value = str(spec.get("scheduleKey") or "").strip()
+    schedule_version_value = str(spec.get("scheduleVersion") or "").strip()
     upload_value = str(spec.get("uploadVideoNo") or "").strip()
     revision_value = str(spec.get("runnerRevision") or "").strip().lower()
     if sum(bool(value) for value in (execution_value, schedule_value, upload_value)) != 1:
         raise ValueError(
             "HM capture runner requires exactly one executionNo, scheduleKey, or uploadVideoNo"
         )
-    suffix = (
-        _normalized(execution_value, EXECUTION_PATTERN, "execution number")
-        if execution_value
-        else _normalized(schedule_value, SCHEDULE_KEY_PATTERN, "schedule key")
-        if schedule_value
-        else _normalized(upload_value, re.compile(r"^V-[A-Za-z0-9-]+$"), "video number")
-    )
+    if schedule_version_value and not schedule_value:
+        raise ValueError("HM capture schedule version requires scheduleKey")
+    if execution_value:
+        suffix = _normalized(
+            execution_value, EXECUTION_PATTERN, "execution number"
+        )
+    elif schedule_value:
+        schedule_key = _normalized(
+            schedule_value, SCHEDULE_KEY_PATTERN, "schedule key"
+        )
+        schedule_version = (
+            _normalized(
+                schedule_version_value,
+                SCHEDULE_VERSION_PATTERN,
+                "schedule version",
+            )
+            if schedule_version_value
+            else ""
+        )
+        suffix = (
+            f"v{schedule_version}_{schedule_key}"
+            if schedule_version
+            else schedule_key
+        )
+    else:
+        suffix = _normalized(
+            upload_value,
+            re.compile(r"^V-[A-Za-z0-9-]+$"),
+            "video number",
+        )
     revision_suffix = ""
     if revision_value:
         revision_suffix = "_" + _normalized(
