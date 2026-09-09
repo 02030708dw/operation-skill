@@ -898,7 +898,13 @@ async function stopChrome(chrome) {
   } catch {
     try { chrome.kill(); } catch {}
   }
-  await sleep(300);
+  if (chrome.exitCode === null && typeof chrome.once === 'function') {
+    await Promise.race([new Promise(resolve => chrome.once('exit', resolve)), sleep(5000)]);
+    if (chrome.exitCode === null && !chrome.signalCode) {
+      try { process.kill(-chrome.pid, 'SIGKILL'); } catch {}
+      await Promise.race([new Promise(resolve => chrome.once('exit', resolve)), sleep(2000)]);
+    }
+  }
 }
 
 function removeTree(directory) {

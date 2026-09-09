@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -57,12 +58,43 @@ def report(config: dict, tenant: str, state: dict) -> None:
         if result.get('code')!=200: raise RuntimeError('Account status acknowledgement failed')
 
 
+def recover_profile(profile: Path) -> None:
+    """With account.lock held, reap only abandoned browsers for this exact account."""
+    proc=Path('/proc')
+    if not proc.is_dir():
+        return
+    expected=('--user-data-dir='+str(profile.resolve())).encode()
+    def matches(pid):
+        try:
+            entry=proc/str(pid)
+            args=(entry/'cmdline').read_bytes().split(b'\0')
+            return entry.stat().st_uid==os.getuid() and expected in args and not any(a.startswith(b'--type=') for a in args)
+        except (OSError,PermissionError):
+            return False
+    for entry in proc.iterdir():
+        if not entry.name.isdigit() or not matches(entry.name): continue
+        pid=int(entry.name)
+        try:
+            grouped=os.getpgid(pid)==pid
+            (os.killpg if grouped else os.kill)(pid,signal.SIGTERM)
+            deadline=time.monotonic()+5
+            while matches(pid) and time.monotonic()<deadline: time.sleep(0.1)
+            if matches(pid): (os.killpg if grouped else os.kill)(pid,signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    # Container hostnames change across recreation. Chrome refuses stale host locks.
+    for name in ('SingletonLock','SingletonSocket','SingletonCookie','DevToolsActivePort'):
+        path=profile/name
+        if path.is_symlink() or path.is_file(): path.unlink(missing_ok=True)
+
+
 def verify(config: dict, tenant: str, credentials: dict | None = None) -> dict:
     """Caller must hold account.lock throughout verification and capture."""
     os.umask(0o077)
     account=account_config(config)
     root=account_root(account)
     profile=root/'profile'; profile.mkdir(exist_ok=True,mode=0o700)
+    recover_profile(profile)
     script=Path(__file__).resolve().parents[2]/'facebook-followed-video-download/scripts/facebook_session.js'
     payload={'profile':str(profile),'action':'login' if credentials else 'verify'}
     payload.update(credentials or {})
@@ -70,11 +102,12 @@ def verify(config: dict, tenant: str, credentials: dict | None = None) -> dict:
         result=subprocess.run(['node',str(script)],input=json.dumps(payload),text=True,capture_output=True,timeout=90)
         outcome=json.loads(result.stdout.strip().splitlines()[-1])
         state=outcome['state']
-        reason=outcome.get('reasonCode')
+        reason=outcome.get('reasonCode') or outcome.get('reason')
         if state not in {'AVAILABLE','LOGIN_REQUIRED','VERIFICATION_REQUIRED','COOLDOWN'}: raise ValueError('state')
     except (ValueError,IndexError,OSError,subprocess.TimeoutExpired):
         state='COOLDOWN'
         reason='SESSION_CHECK_FAILED'
+        recover_profile(profile)
     marker=profile/'.hermes-login-enabled'
     if state=='AVAILABLE': marker.write_text('Server-authorized session\n');marker.chmod(0o600)
     else: marker.unlink(missing_ok=True)
