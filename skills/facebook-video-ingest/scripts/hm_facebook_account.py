@@ -58,9 +58,9 @@ def report(config: dict, tenant: str, state: dict) -> None:
         if result.get('code')!=200: raise RuntimeError('Account status acknowledgement failed')
 
 
-def recover_profile(profile: Path) -> None:
+def recover_profile(profile: Path, proc_root: Path | None = None) -> None:
     """With account.lock held, reap only abandoned browsers for this exact account."""
-    proc=Path('/proc')
+    proc=proc_root if proc_root is not None else Path('/proc')
     if not proc.is_dir():
         return
     expected=('--user-data-dir='+str(profile.resolve())).encode()

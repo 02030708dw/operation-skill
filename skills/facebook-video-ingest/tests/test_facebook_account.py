@@ -62,6 +62,18 @@ class AccountTests(unittest.TestCase):
             self.assertEqual(worker.run(spec),0)
             slots.assert_not_called()
 
+    def test_container_recreation_removes_only_stale_browser_locks(self):
+        with tempfile.TemporaryDirectory() as temp:
+            profile=Path(temp)/'profile';profile.mkdir()
+            proc=Path(temp)/'proc';proc.mkdir()
+            (profile/'Cookies').write_text('persisted-session')
+            (profile/'SingletonLock').symlink_to('old-container-123')
+            (profile/'SingletonSocket').symlink_to('/tmp/old-browser-socket')
+            accounts.recover_profile(profile,proc)
+            self.assertFalse((profile/'SingletonLock').is_symlink())
+            self.assertFalse((profile/'SingletonSocket').is_symlink())
+            self.assertEqual((profile/'Cookies').read_text(),'persisted-session')
+
     def test_invalid_or_missing_account_config(self):
         self.assertIsNone(accounts.account_config({}))
         with self.assertRaises(ValueError): accounts.account_config({'facebookAccount':{'key':'../th'}})
