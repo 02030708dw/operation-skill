@@ -48,15 +48,23 @@ async function main() {
         if(!focused.result.result.value) return false;
         await call('Input.insertText',{text});return true;
       }
-      await enter('input[name="email"]',input.username);
-      await enter('input[name="pass"]',input.password);
-      await evaluate(`(()=>{const submit=document.querySelector('button[name="login"],input[name="login"]');if(submit){submit.click();return true;}return false;})()`);
+      const emailEntered=await enter('input[name="email"]',input.username);
+      const passwordEntered=await enter('input[name="pass"]',input.password);
+      if(!emailEntered || !passwordEntered) {
+        console.log(JSON.stringify(await inspect(browser.ws)));return;
+      }
+      const submitted=await evaluate(`(()=>{const password=document.querySelector('input[name="pass"]');const form=password?.form;const submit=(form||document).querySelector('button[name="login"],input[name="login"],button[type="submit"],input[type="submit"]');if(submit){submit.click();return true;}if(form){form.requestSubmit();return true;}return false;})()`);
+      if(!submitted.result.result.value) {
+        console.log(JSON.stringify({state:'LOGIN_REQUIRED',reasonCode:'FACEBOOK_LOGIN_NOT_COMPLETED',errorText:'Login form submit control was not found.'}));return;
+      }
       await sleep(8000);
       if(input.twoFactorSecret) {
         const code=totp(input.twoFactorSecret);
-        await enter('input[name="approvals_code"],input[autocomplete="one-time-code"]',code);
-        await evaluate(`(()=>{const button=[...document.querySelectorAll('button,input[type="submit"],[role="button"]')].find(b=>/^(continue|submit|confirm|next|继续|繼續|ยืนยัน|ดำเนินการต่อ)$/i.test((b.innerText||b.value||'').trim()));if(button)button.click();})()`);
-        await sleep(7000);
+        const codeEntered=await enter('input[name="approvals_code"],input[autocomplete="one-time-code"]',code);
+        if(codeEntered) {
+          await evaluate(`(()=>{const button=[...document.querySelectorAll('button,input[type="submit"],[role="button"]')].find(b=>/^(continue|submit|confirm|next|继续|繼續|ยืนยัน|ดำเนินการต่อ)$/i.test((b.innerText||b.value||'').trim()));if(button)button.click();})()`);
+          await sleep(7000);
+        }
       }
     }
     const result=await inspect(browser.ws);
