@@ -28,7 +28,9 @@ async function waitForPage(ws) {
   const deadline=Date.now()+30000;
   while(Date.now()<deadline) {
     try {
-      const page=await engine.cdpCall(ws,{id:seq++,method:'Runtime.evaluate',params:{expression:"!!document.body && document.readyState !== 'loading'",returnByValue:true}},5000);
+      // The checkpoint SPA reports document.readyState=complete while only the
+      // account name has rendered and the actual verification step is in flight.
+      const page=await engine.cdpCall(ws,{id:seq++,method:'Runtime.evaluate',params:{expression:"!!document.body && document.readyState !== 'loading' && document.body.innerText.trim().length > 40",returnByValue:true}},5000);
       if(page.result.result.value) return;
     } catch (_) { /* Navigation can replace the execution context. */ }
     await sleep(1000);
