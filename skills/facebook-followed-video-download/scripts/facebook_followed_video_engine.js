@@ -779,7 +779,7 @@ function probeVideoMetadata(url) {
   if (dryRun) return {};
   const result = spawnSync(ytdlpPath, [
     ...ytdlpSessionArgs(),
-    '--force-ipv4', '--socket-timeout', '60', '--retries', '2',
+    '--force-ipv4', '--socket-timeout', '60', '--retries', '0', '--fragment-retries', '0', '--extractor-retries', '0',
     '--no-warnings', '--no-playlist', '--skip-download',
     '--dump-single-json', url
   ], { encoding: 'utf8' });
@@ -805,6 +805,12 @@ function completedVideoResult(item, downloadedPath) {
   item.sha256 = sha256File(downloadedPath);
   item.status = 'downloaded';
   return item;
+}
+
+function classifyDownloadError(output) {
+  if (/only available for registered users|login required|log in|checkpoint|verification|HTTP Error 403/i.test(output)) return 'FACEBOOK_ACCESS_REQUIRED';
+  if (/timed? out|timeout|connection reset|connection refused|temporary failure|HTTP Error (429|5[0-9][0-9])|unable to download.*network/i.test(output)) return 'FACEBOOK_NETWORK_ERROR';
+  return 'FACEBOOK_DOWNLOAD_UNSUPPORTED';
 }
 
 function downloadVideo(account, url, outputDir, archivePath) {
@@ -845,7 +851,7 @@ function downloadVideo(account, url, outputDir, archivePath) {
   args.push(
     '--force-ipv4',
     '--socket-timeout', '60',
-    '--retries', '2',
+    '--retries', '0', '--fragment-retries', '0', '--extractor-retries', '0',
     '--ignore-errors',
     '--no-warnings',
     '--no-playlist',
@@ -875,6 +881,7 @@ function downloadVideo(account, url, outputDir, archivePath) {
   console.log(`    失敗: ${errorLine.slice(0, 220)}`);
   item.status = 'download-failed';
   item.error = errorLine.slice(0, 500);
+  item.errorCode = classifyDownloadError(output);
   return item;
 }
 
@@ -1137,6 +1144,8 @@ async function runMain() {
 if (require.main === module) runMain();
 
 module.exports = {
+  cdpCall,
+  classifyDownloadError,
   createTemporaryProfile,
   ERROR_CODES,
   VIDEO_RESULT_EVENT_PREFIX,

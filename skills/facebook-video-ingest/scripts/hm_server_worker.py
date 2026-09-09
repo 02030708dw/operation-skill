@@ -139,6 +139,26 @@ def run(spec: dict) -> int:
     spec = validate_spec(spec)
     root = state_root()
     execution_root = tenant_root(spec)
+    import hm_facebook_account as accounts
+    config = tenant_config(spec)
+    account = accounts.account_config(config) if spec["kind"] == "CAPTURE" else None
+    account_lock = None
+    if account:
+        account_lock = accounts.acquire(account)
+        if account_lock is None:
+            os.environ.update(worker_environment(spec))
+            status(spec, "RETRY")
+            return 0
+        try:
+            verified = accounts.verify(config, spec["tenant"])
+            if verified["state"] != "AVAILABLE":
+                os.environ.update(worker_environment(spec))
+                status(spec, "RETRY")
+                account_lock.close()
+                return 0
+        except Exception:
+            account_lock.close()
+            raise
     slots = [spec["slot"]]
     if spec.get("tenant") and spec["kind"] == "CAPTURE":
         slots += [slot for slot in range(1, int(os.getenv("HM_CAPTURE_SLOTS", "8")) + 1) if slot != spec["slot"]]
@@ -149,6 +169,8 @@ def run(spec: dict) -> int:
             spec = dict(spec, slot=slot)
             break
     environment = worker_environment(spec)
+    if account:
+        environment["HM_FACEBOOK_PROFILE"] = str(accounts.account_root(account) / "profile")
     Path(environment["TMPDIR"]).mkdir(parents=True, exist_ok=True)
     # The runner's status callbacks and the child use the same trusted registry.
     if spec.get("tenant"):
@@ -202,6 +224,7 @@ def run(spec: dict) -> int:
                 child.wait()
         if execution_lock: execution_lock.close()
         if slot_lock: slot_lock.close()
+        if account_lock: account_lock.close()
 
 
 def delete_jobs() -> None:

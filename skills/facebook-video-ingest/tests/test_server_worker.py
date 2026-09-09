@@ -38,7 +38,7 @@ def simulate_regional_job(payload):
         return Child()
     spec=dict(tenant=('ph','th','vn','id')[index % 4],dispatchId=index+1,attempt=1,
               kind='CAPTURE',slot=1,taskNo=f'C-{index}',executionNo=f'E-{index}')
-    for _ in range(200):
+    for _ in range(2000):
         with patch.dict(os.environ, {'HM_TENANT_CONFIG':registry,'HM_SERVER_STATE_DIR':root,'HM_MIN_FREE_DISK_BYTES':'0'}), \
                 patch.object(worker,'status'), patch.object(worker.subprocess,'Popen',side_effect=start) as process, \
                 patch.object(worker.time,'sleep',side_effect=lambda _:real_sleep(0.04)):

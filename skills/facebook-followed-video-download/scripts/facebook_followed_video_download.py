@@ -697,6 +697,8 @@ def _run_download_with_accounts(args: argparse.Namespace, accounts: Path) -> int
     if args.chrome:
         command.extend(["--chrome", args.chrome])
     browser_profile = enabled_browser_profile(args)
+    if os.getenv("HM_FACEBOOK_PROFILE") and (browser_profile is None or browser_profile.resolve() != Path(os.environ["HM_FACEBOOK_PROFILE"]).resolve()):
+        raise RuntimeError("FACEBOOK_LOGIN_REQUIRED: configured server session is unavailable")
     if browser_profile:
         command.extend(["--browser-profile", str(browser_profile)])
     if args.execute:

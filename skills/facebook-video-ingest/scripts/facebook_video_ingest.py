@@ -494,7 +494,7 @@ def record_video(
         "r2Bucket": video.get("r2Bucket"),
         "r2ObjectKey": video.get("r2ObjectKey"),
         "r2Url": video.get("r2Url"),
-        "errorCode": status_error_code(download_status, upload_status),
+        "errorCode": video.get("errorCode") or status_error_code(download_status, upload_status),
         "errorMessage": bounded_backend_text(video.get("error"), 500),
         "metadataJson": json.dumps(video, ensure_ascii=False),
     }
@@ -790,14 +790,18 @@ def manifest_videos(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def manifest_error_code(payload: dict[str, Any]) -> str | None:
-    top_level = str(payload.get("errorCode") or "").strip()
-    if top_level:
-        return top_level[:100]
+    codes = [payload.get("errorCode")]
     for source in payload.get("sources", []):
-        source_code = str(source.get("errorCode") or "").strip()
-        if source_code:
-            return source_code[:100]
-    return None
+        codes.append(source.get("errorCode"))
+    videos = manifest_videos(payload)
+    codes.extend(video.get("errorCode") for video in videos)
+    # A restricted item does not block the whole source when other items worked.
+    if any(video.get("status") == "downloaded" for video in videos):
+        return "FACEBOOK_NETWORK_ERROR" if "FACEBOOK_NETWORK_ERROR" in codes else "FACEBOOK_ITEM_FAILURE"
+    for code in ["FACEBOOK_ACCESS_REQUIRED", "FACEBOOK_DISCOVERY_EMPTY", "FACEBOOK_LAYOUT_UNSUPPORTED", "FACEBOOK_DOWNLOAD_UNSUPPORTED", "FACEBOOK_NETWORK_ERROR"]:
+        if code in codes:
+            return code
+    return next((str(code) for code in codes if code), None)
 
 
 def normalized_upload_status(value: object) -> str:
@@ -843,9 +847,11 @@ def reusable_download_result(path: Path) -> dict[str, Any] | None:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    if not isinstance(payload, dict) or payload.get("status") not in {"completed", "partial"}:
+    if not isinstance(payload, dict) or payload.get("status") != "completed":
         return None
     for video in manifest_videos(payload):
+        if video.get("status") == "download-failed":
+            return None
         if video.get("status") != "downloaded":
             continue
         local_value = video.get("localPath")
@@ -1418,6 +1424,8 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 "--result-json",
                 str(download_manifest),
             ]
+            if os.getenv("HM_FACEBOOK_PROFILE"):
+                download_command.extend(["--browser-profile", os.environ["HM_FACEBOOK_PROFILE"]])
             if args.download_output:
                 download_command.extend(["--output", str(args.download_output.expanduser().resolve())])
             download_env = os.environ.copy()
