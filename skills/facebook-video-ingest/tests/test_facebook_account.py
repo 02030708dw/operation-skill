@@ -41,6 +41,27 @@ class AccountTests(unittest.TestCase):
             self.assertTrue((root/'profile/.hermes-login-enabled').exists())
             lock.close();accounts.acquire(config['facebookAccount']).close()
 
+    def test_failed_manifest_is_not_reused_after_login_recovery(self):
+        import facebook_video_ingest as ingest
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/'download.json'
+            payload={'status':'partial','sources':[{'videos':[{'status':'download-failed','errorCode':'FACEBOOK_ACCESS_REQUIRED'}]}]}
+            path.write_text(json.dumps(payload))
+            self.assertIsNone(ingest.reusable_download_result(path))
+            self.assertEqual(ingest.manifest_error_code(payload),'FACEBOOK_ACCESS_REQUIRED')
+            payload['sources'][0]['videos'].append({'status':'downloaded'})
+            self.assertEqual(ingest.manifest_error_code(payload),'FACEBOOK_ITEM_FAILURE')
+
+    def test_busy_account_does_not_take_a_capture_slot(self):
+        config={'backendUrl':'http://test','workerToken':'test','workerId':'hm-server-th','mediaToken':'test',
+                'mediaRoot':'/tmp/not-used','r2Prefix':'TH','facebookAccount':{'key':'th-test'}}
+        spec={'tenant':'th','kind':'CAPTURE','slot':1,'dispatchId':1,'attempt':1,'taskNo':'C-1','executionNo':'E-1'}
+        with patch.object(worker,'tenant_config',return_value=config), patch.object(accounts,'acquire',return_value=None), \
+             patch.object(worker,'status'), patch.object(worker,'lock_file') as slots, \
+             patch.object(worker.os,'environ',dict(os.environ)):
+            self.assertEqual(worker.run(spec),0)
+            slots.assert_not_called()
+
     def test_invalid_or_missing_account_config(self):
         self.assertIsNone(accounts.account_config({}))
         with self.assertRaises(ValueError): accounts.account_config({'facebookAccount':{'key':'../th'}})
