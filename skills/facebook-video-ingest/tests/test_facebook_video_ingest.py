@@ -1450,6 +1450,18 @@ class PipelineTests(unittest.TestCase):
             "PH/Sports/202608/10",
         )
 
+    def test_regional_root_keeps_catalog_region_and_rejects_foreign_or_duplicate_region(self):
+        for region in ("PH", "VN", "TH", "ID"):
+            with mock.patch.dict(os.environ, {"HM_R2_KEY_PREFIX":region}):
+                prefix=region+"/Sports/202609/09"
+                self.assertEqual(MODULE.job_r2_prefix({"r2Prefix":prefix}),prefix)
+                for invalid in (region+"/"+prefix,"hm-test/"+region.lower()+"/"+prefix,
+                                region+"/../202609/09",("VN" if region=="PH" else "PH")+"/Sports/202609/09"):
+                    with self.assertRaises(MODULE.PipelineError):MODULE.job_r2_prefix({"r2Prefix":invalid})
+            with mock.patch.dict(os.environ, {"HM_R2_KEY_PREFIX":"hm-test/"+region.lower()}):
+                prefix="hm-test/"+region.lower()+"/"+region+"/Sports/202609/09"
+                self.assertEqual(MODULE.job_r2_prefix({"r2Prefix":prefix}),prefix)
+
     def test_capture_review_status_reflects_backend_task_switch(self):
         self.assertEqual(
             MODULE.capture_review_status({"autoReviewEnabled": True}),

@@ -10,6 +10,9 @@ installed, trusted runner without gaining arbitrary filesystem write access.
 from __future__ import annotations
 
 import os
+import json
+import importlib.util
+import hmac
 import re
 import shutil
 from pathlib import Path
@@ -141,6 +144,25 @@ def prepare_capture_job_body(
     if not isinstance(body, dict):
         raise ValueError("Cron request body must be an object")
     prepared = dict(body)
+    server_spec = prepared.pop("hm_server_runner", None)
+    if server_spec is not None:
+        root = (home or _hermes_home()).resolve()
+        module_path = root / "skills/facebook-video-ingest/scripts/hm_server_worker.py"
+        module_spec = importlib.util.spec_from_file_location("hm_server_worker", module_path)
+        module = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+        server_spec = module.validate_spec(server_spec)
+        tenant_prefix = server_spec.get("tenant", "")
+        name = f'hm_server_{tenant_prefix + "_" if tenant_prefix else ""}{server_spec["dispatchId"]}_{server_spec["attempt"]}.py'
+        scripts = root / "scripts"
+        scripts.mkdir(parents=True, exist_ok=True)
+        content = "import sys\nfrom pathlib import Path\nsys.path.insert(0, " + repr(str(module_path.parent)) + ")\nfrom hm_server_worker import launch\nlaunch(" + repr(server_spec) + ")\n"
+        target = scripts / name
+        temporary = target.with_suffix(".tmp")
+        temporary.write_text(content, encoding="utf-8")
+        os.replace(temporary, target)
+        prepared.update(script=name, no_agent=True, skills=[])
+        return prepared
     spec = prepared.pop(REQUEST_FIELD, None)
     if spec is None:
         return prepared
@@ -161,7 +183,7 @@ def cleanup_capture_job_script(
     if not isinstance(job, dict):
         return
     script = str(job.get("script") or "").strip()
-    if not MANAGED_RUNNER_PATTERN.fullmatch(script):
+    if not (MANAGED_RUNNER_PATTERN.fullmatch(script) or re.fullmatch(r"hm_server_(?:(?:ph|th|vn|id)_)?[1-9][0-9]*_[1-9][0-9]*\.py", script)):
         return
     scripts_dir = ((home or _hermes_home()) / "scripts").resolve()
     target = (scripts_dir / script).resolve()
@@ -179,9 +201,27 @@ def cleanup_capture_job_script(
         pass
 
 
-def resolve_capture_video_path(value: Any, *, home: Path | None = None) -> Path:
+def regional_media_config(authorization: str) -> dict | None:
+    registry = os.getenv("HM_TENANT_CONFIG")
+    if not registry:
+        return None
+    token = authorization[7:].strip() if authorization.startswith("Bearer ") else ""
+    for config in json.loads(Path(registry).read_text()).values():
+        expected = config.get("mediaToken", "")
+        if expected and hmac.compare_digest(token.encode(), expected.encode()):
+            return config
+    raise PermissionError("Regional media token is invalid")
+
+
+def resolve_capture_video_path(value: Any, *, home: Path | None = None, authorization: str = "") -> Path:
     """Resolve only downloaded video files below configured HM media roots."""
+    regional = regional_media_config(authorization)
     candidate = Path(str(value or "")).expanduser().resolve()
+    if regional:
+        try:
+            candidate.relative_to(Path(regional["mediaRoot"]).resolve())
+        except ValueError as error:
+            raise PermissionError("Video belongs to another region") from error
     if candidate.suffix.lower() not in VIDEO_EXTENSIONS or not candidate.is_file():
         raise FileNotFoundError("HM capture video is missing")
     hermes_home = (home or _hermes_home()).resolve()
@@ -190,6 +230,8 @@ def resolve_capture_video_path(value: Any, *, home: Path | None = None) -> Path:
         Path(os.getenv("FACEBOOK_FOLLOWED_OUTPUT", Path.home() / "Desktop" / "Facebook")),
         Path(os.getenv("FB_FOLLOWED_DESKTOP", Path.home() / "Desktop" / "Facebook")),
     ]
+    if regional:
+        roots = [Path(regional["mediaRoot"])]
     for root in roots:
         try:
             candidate.relative_to(root.expanduser().resolve())
@@ -199,8 +241,8 @@ def resolve_capture_video_path(value: Any, *, home: Path | None = None) -> Path:
     raise PermissionError("HM capture video is outside configured media roots")
 
 
-def delete_capture_video_path(value: Any, *, home: Path | None = None) -> Path:
+def delete_capture_video_path(value: Any, *, home: Path | None = None, authorization: str = "") -> Path:
     """Delete one explicitly requested video below configured HM media roots."""
-    candidate = resolve_capture_video_path(value, home=home)
+    candidate = resolve_capture_video_path(value, home=home, authorization=authorization)
     candidate.unlink()
     return candidate

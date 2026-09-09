@@ -1191,7 +1191,8 @@ def make_video(
                 )
             command += ["-vf", video_filter, "-map", "0:v:0"]
 
-        command += ["-c:v", "libx264", "-preset", "medium", "-crf", "18"]
+        command += ["-c:v", "libx264", "-preset", "medium", "-crf", "18",
+                    "-threads", os.getenv("HM_FFMPEG_THREADS", "4")]
         if music and audio_index is not None:
             command += [
                 "-map",

@@ -189,11 +189,11 @@ def _replace_once(source: str, old: str, new: str, label: str) -> str:
 def patch_gateway_api_source(source: str) -> str:
     """Add standard no-agent fields plus the restricted HM runner hook."""
     marker = "prepare_capture_job_body(await request.json())"
-    media_marker = "resolve_capture_video_path(request.query.get(\"path\"))"
-    delete_media_marker = "delete_capture_video_path(request.query.get(\"path\"))"
+    media_marker = "resolve_capture_video_path(request.query.get(\"path\")"
+    delete_media_marker = "delete_capture_video_path(request.query.get(\"path\")"
     media_auth_marker = "_check_hm_capture_media_auth"
     if (marker in source and media_marker in source and delete_media_marker in source
-            and media_auth_marker in source):
+            and media_auth_marker in source and 'regional_media_config(request.headers' in source):
         return source
     if marker not in source:
         create_start = source.find("    async def _handle_create_job(")
@@ -247,6 +247,13 @@ def patch_gateway_api_source(source: str) -> str:
         if delete_start < 0 or delete_end < 0:
             raise RuntimeError("Hermes Gateway delete-job handler was not found")
         delete_block = source[delete_start:delete_end]
+        # Newer pinned Hermes images inline the remove result; normalize only
+        # this handler before applying the same cleanup hook.
+        if '            if not _cron_remove(job_id):\n' in delete_block:
+            delete_block = delete_block.replace(
+                '            if not _cron_remove(job_id):\n',
+                '            success = _cron_remove(job_id)\n'
+                '            if not success:\n', 1)
         delete_block = _replace_once(
         delete_block,
         "        try:\n"
@@ -348,6 +355,22 @@ def patch_gateway_api_source(source: str) -> str:
             source = _replace_once(
                 source, signature, guarded, f"secure {name}"
             )
+    if 'regional_media_config(request.headers' not in source:
+        for helper in ('resolve_capture_video_path', 'delete_capture_video_path'):
+            source = source.replace(helper + '(request.query.get("path"))',
+                                    helper + '(request.query.get("path"), authorization=request.headers.get("Authorization", ""))')
+        marker = '    def _check_hm_capture_media_auth(self, request: "web.Request"):\n'
+        regional_auth = (
+            marker
+            + '        if os.getenv("HM_TENANT_CONFIG"):\n'
+            + '            from gateway.platforms.hm_capture_extension import regional_media_config\n'
+            + '            try:\n'
+            + '                regional_media_config(request.headers.get("Authorization", ""))\n'
+            + '                return None\n'
+            + '            except PermissionError:\n'
+            + '                return web.json_response({"error": "Invalid regional media token"}, status=401)\n'
+        )
+        source = source.replace(marker, regional_auth)
     return source
 
 

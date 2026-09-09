@@ -62,6 +62,13 @@ function loadEngine(t, options = {}) {
   return { engine: sandbox.module.exports, chrome, temporary, calls };
 }
 
+test('100 browser profiles have unique directories even when starts share a timestamp', t => {
+  const { engine, temporary } = loadEngine(t);
+  const profiles = Array.from({ length: 100 }, () => engine.createTemporaryProfile());
+  assert.equal(new Set(profiles).size, 100);
+  assert.ok(profiles.every(profile => path.dirname(profile) === temporary && fs.statSync(profile).isDirectory()));
+});
+
 test('Windows preview and capture enter only isolated headless Chrome, including retry', async t => {
   for (const execute of [false, true]) {
     const { engine, chrome, calls } = loadEngine(t, { execute });

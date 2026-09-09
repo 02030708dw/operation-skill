@@ -967,6 +967,10 @@ function classifyDiscoveryFailure(scanErrors, layoutUnsupported) {
   };
 }
 
+function createTemporaryProfile() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'hermes_facebook_followed_'));
+}
+
 async function main() {
   if (!fs.existsSync(accountsFile)) throw new Error(`Missing accounts file: ${accountsFile}`);
   const executable = assertChromeAvailable(chromePath);
@@ -975,7 +979,7 @@ async function main() {
   if (!accounts.length) throw new Error('No accounts configured');
 
   const temporaryProfile = !browserProfileDir;
-  const profile = browserProfileDir || path.join(os.tmpdir(), `hermes_facebook_followed_${Date.now()}`);
+  const profile = browserProfileDir || createTemporaryProfile();
   const startedAt = new Date().toISOString();
   const runResult = {
     schemaVersion: '1.0',
@@ -1133,6 +1137,7 @@ async function runMain() {
 if (require.main === module) runMain();
 
 module.exports = {
+  createTemporaryProfile,
   ERROR_CODES,
   VIDEO_RESULT_EVENT_PREFIX,
   assertChromeAvailable,

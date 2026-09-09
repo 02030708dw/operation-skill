@@ -820,7 +820,15 @@ def state_segment(value: object) -> str:
 
 def job_r2_prefix(job: dict[str, Any], fallback: str = "") -> str:
     prefix = str(job.get("r2Prefix") or fallback or "").strip().strip("/")
-    parts = prefix.split("/")
+    namespace = os.getenv("HM_R2_KEY_PREFIX", "").strip("/")
+    if namespace:
+        if not prefix.startswith(namespace + "/"):
+            raise PipelineError("R2 path is outside the configured environment")
+        # Region-root deployments already include REGION in the catalog path.
+        relative = prefix if namespace in {"PH", "VN", "TH", "ID"} else prefix[len(namespace) + 1:]
+    else:
+        relative = prefix
+    parts = relative.split("/")
     if len(parts) != 4 or any(not part or part in {".", ".."} for part in parts):
         raise PipelineError(
             "backend job r2Prefix must use REGION/Category/yyyyMM/dd"
@@ -1038,6 +1046,8 @@ def drain_upload_jobs(
     worker_id: str,
     task_no: str = "",
 ) -> list[dict[str, Any]]:
+    if os.getenv("HM_SERVER_COMPONENT", "UPLOAD") != "UPLOAD":
+        return []
     results = replay_upload_cleanup_journals(
         args.state_dir, backend, token, worker_id
     )
@@ -1172,6 +1182,8 @@ def drain_local_delete_jobs(
     token: str,
     worker_id: str,
 ) -> list[dict[str, Any]]:
+    if os.getenv("HM_SERVER_COMPONENT", "DELETE") != "DELETE":
+        return []
     """Drain a bounded batch so a repeatedly failing job cannot spin forever."""
     results: list[dict[str, Any]] = []
     for _ in range(MAX_LOCAL_DELETE_JOBS_PER_POLL):
