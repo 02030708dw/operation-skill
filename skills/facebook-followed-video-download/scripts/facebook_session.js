@@ -29,7 +29,7 @@ async function inspect(ws) {
   const data=JSON.parse(page.result.result.value);
   const response=await engine.cdpCall(ws,{id:seq++,method:'Network.getCookies',params:{urls:['https://www.facebook.com/']}});
   const cookie=response.result.cookies.find(c=>c.name==='c_user');
-  if(data.challenge) return {state:'VERIFICATION_REQUIRED',reasonCode:'FACEBOOK_CHECKPOINT'};
+  if(data.challenge) return {state:'VERIFICATION_REQUIRED',reasonCode:'FACEBOOK_CHECKPOINT',errorText:data.text.slice(0,900)};
   if(data.login || /\/login/.test(new URL(data.url).pathname)) return {state:'LOGIN_REQUIRED',reasonCode:loginReason(data.text),errorText:data.errorText};
   if(data.loaded && cookie && new URL(data.url).hostname==='www.facebook.com') return {state:'AVAILABLE'};
   return {state:'COOLDOWN',reasonCode:'SESSION_CHECK_INCONCLUSIVE'};
