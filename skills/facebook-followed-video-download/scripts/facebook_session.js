@@ -73,9 +73,12 @@ async function main() {
       await waitForPage(browser.ws);
       if(input.twoFactorSecret) {
         const code=totp(input.twoFactorSecret);
-        const codeEntered=await enter('input[name="approvals_code"],input[autocomplete="one-time-code"]',code);
+        // Current Facebook uses an unnamed input on its authenticator-app page.
+        // Do not mistake another checkpoint (phone, identity, etc.) for a TOTP form.
+        await evaluate(`(()=>{if(!/authentication app|authenticator app|two-factor authentication app|身份验证器|身分驗證器/i.test(document.body?.innerText||''))return;const input=[...document.querySelectorAll('input')].find(e=>e.getClientRects().length && ['text','tel','number'].includes(e.type) && e.name!=='email');if(input)input.setAttribute('data-hermes-auth-code','true');})()`);
+        const codeEntered=await enter('input[name="approvals_code"],input[autocomplete="one-time-code"],input[data-hermes-auth-code="true"]',code);
         if(codeEntered) {
-          await evaluate(`(()=>{const button=[...document.querySelectorAll('button,input[type="submit"],[role="button"]')].find(b=>/^(continue|submit|confirm|next|继续|繼續|ยืนยัน|ดำเนินการต่อ)$/i.test((b.innerText||b.value||'').trim()));if(button)button.click();})()`);
+          await evaluate(`(()=>{const button=[...document.querySelectorAll('button,input[type="submit"],[role="button"]')].find(b=>b.getClientRects().length && /^(continue|submit|confirm|next|继续|繼續|ยืนยัน|ดำเนินการต่อ)$/i.test((b.innerText||b.value||'').trim()));if(button)button.click();})()`);
           await sleep(7000);
         }
       }
