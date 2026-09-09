@@ -99,7 +99,7 @@ def verify(config: dict, tenant: str, credentials: dict | None = None) -> dict:
     payload={'profile':str(profile),'action':'login' if credentials else 'verify'}
     payload.update(credentials or {})
     try:
-        result=subprocess.run(['node',str(script)],input=json.dumps(payload),text=True,capture_output=True,timeout=90)
+        result=subprocess.run(['node',str(script)],input=json.dumps(payload),text=True,capture_output=True,timeout=180 if credentials else 90)
         outcome=json.loads(result.stdout.strip().splitlines()[-1])
         state=outcome['state']
         reason=outcome.get('reasonCode') or outcome.get('reason')

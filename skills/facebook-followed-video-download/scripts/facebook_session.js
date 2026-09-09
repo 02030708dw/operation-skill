@@ -24,8 +24,19 @@ function loginReason(text) {
   if (/check your notifications|another device|其他设备/i.test(text)) return 'FACEBOOK_DEVICE_APPROVAL_REQUIRED';
   return 'FACEBOOK_LOGIN_NOT_COMPLETED';
 }
+async function waitForPage(ws) {
+  const deadline=Date.now()+30000;
+  while(Date.now()<deadline) {
+    try {
+      const page=await engine.cdpCall(ws,{id:seq++,method:'Runtime.evaluate',params:{expression:"!!document.body && document.readyState !== 'loading'",returnByValue:true}},5000);
+      if(page.result.result.value) return;
+    } catch (_) { /* Navigation can replace the execution context. */ }
+    await sleep(1000);
+  }
+}
 async function inspect(ws) {
-  const page=await engine.cdpCall(ws,{id:seq++,method:'Runtime.evaluate',params:{expression:`JSON.stringify({url:location.href, login:!!document.querySelector('input[name="pass"]'), challenge: /checkpoint|two_step_verification|recover|challenge/.test(location.pathname), loaded:document.readyState==='complete', text:document.body.innerText, errorText:[...document.querySelectorAll("#error_box,.login_error_box,[role=alert]")].map(e=>e.innerText).join(" ").slice(0,500)})`,returnByValue:true}});
+  await waitForPage(ws);
+  const page=await engine.cdpCall(ws,{id:seq++,method:'Runtime.evaluate',params:{expression:`JSON.stringify({url:location.href, login:!!document.querySelector('input[name="pass"]'), challenge: /checkpoint|two_step_verification|recover|challenge/.test(location.pathname), loaded:document.readyState==='complete' && !!document.body, text:document.body?.innerText||'', errorText:[...document.querySelectorAll("#error_box,.login_error_box,[role=alert]")].map(e=>e.innerText).join(" ").slice(0,500)})`,returnByValue:true}});
   const data=JSON.parse(page.result.result.value);
   const response=await engine.cdpCall(ws,{id:seq++,method:'Network.getCookies',params:{urls:['https://www.facebook.com/']}});
   const cookie=response.result.cookies.find(c=>c.name==='c_user');
@@ -42,6 +53,7 @@ async function main() {
   try {
     await call('Page.navigate',{url:input.action==='login'?'https://www.facebook.com/login/':'https://www.facebook.com/me/'});
     await sleep(6000);
+    await waitForPage(browser.ws);
     if(input.action==='login') {
       async function enter(selector,text) {
         const focused=await evaluate(`(()=>{const e=document.querySelector(${JSON.stringify(selector)});if(!e)return false;e.focus();e.select();return true;})()`);
@@ -53,11 +65,12 @@ async function main() {
       if(!emailEntered || !passwordEntered) {
         console.log(JSON.stringify(await inspect(browser.ws)));return;
       }
-      const submitted=await evaluate(`(()=>{const password=document.querySelector('input[name="pass"]');const form=password?.form;const submit=(form||document).querySelector('button[name="login"],input[name="login"],button[type="submit"],input[type="submit"]');if(submit){submit.click();return true;}if(form){form.requestSubmit();return true;}return false;})()`);
+      const submitted=await evaluate(`(()=>{const password=document.querySelector('input[name="pass"]');const form=password?.form;const visible=[...document.querySelectorAll('button,[role="button"],input[type="submit"]')].find(e=>e.getClientRects().length && /^(log in|login|登录|登入|เข้าสู่ระบบ)$/i.test((e.innerText||e.value||'').trim()));const submit=visible||(form||document).querySelector('button[name="login"],input[name="login"],button[type="submit"],input[type="submit"]');if(submit){submit.click();return true;}if(form){form.requestSubmit();return true;}return false;})()`);
       if(!submitted.result.result.value) {
         console.log(JSON.stringify({state:'LOGIN_REQUIRED',reasonCode:'FACEBOOK_LOGIN_NOT_COMPLETED',errorText:'Login form submit control was not found.'}));return;
       }
       await sleep(8000);
+      await waitForPage(browser.ws);
       if(input.twoFactorSecret) {
         const code=totp(input.twoFactorSecret);
         const codeEntered=await enter('input[name="approvals_code"],input[autocomplete="one-time-code"]',code);
@@ -73,4 +86,4 @@ async function main() {
   } finally { browser.ws.close(); await engine.stopChrome(browser.chrome); }
 }
 if(require.main===module) main().catch(error=>{console.log(JSON.stringify({state:'COOLDOWN',reasonCode:error.code||'SESSION_CHECK_FAILED',errorType:error.name}));process.exitCode=1;});
-module.exports={totp,loginReason};
+module.exports={totp,loginReason,waitForPage};
