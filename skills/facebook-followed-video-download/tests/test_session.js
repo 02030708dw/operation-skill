@@ -14,6 +14,10 @@ test('access checks and temporary failures have different retry policies',()=>{
 });
 
 test("login diagnostics return safe reason codes",()=>{ assert.equal(loginReason("The password is incorrect"),"FACEBOOK_PASSWORD_REJECTED"); assert.equal(loginReason("The email address isn’t public"),"FACEBOOK_LOGIN_NOT_COMPLETED"); });
+test('an explicitly suspended account is distinct from an ordinary checkpoint',()=>{
+  assert.equal(loginReason('We suspended your account. Suspended on August 26, 2026'),'FACEBOOK_ACCOUNT_SUSPENDED');
+  assert.equal(loginReason('Go to your authentication app'),'FACEBOOK_LOGIN_NOT_COMPLETED');
+});
 
 test('login waits through a replaced navigation context and an unloaded document',async()=>{
   const ws=new EventEmitter();let calls=0;

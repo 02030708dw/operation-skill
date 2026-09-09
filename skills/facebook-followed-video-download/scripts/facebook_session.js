@@ -18,6 +18,7 @@ function totp(secret, now = Date.now()) {
   return String((hash.readUInt32BE(hash[19]&15)&0x7fffffff)%1000000).padStart(6,'0');
 }
 function loginReason(text) {
+  if (/we suspended your account|your account (?:has been|is) suspended|你的帐户已暂停|你的帳號已停用/i.test(text)) return 'FACEBOOK_ACCOUNT_SUSPENDED';
   if (/can't find your account|couldn't find your account|isn't connected to an account|not connected to an account|找不到.*帐?账户|找不到.*帳號|没有.*关联|does not match an account/i.test(text)) return 'FACEBOOK_ACCOUNT_NOT_FOUND';
   if (/incorrect password|password.*incorrect|wrong password|密码.*错误|密碼.*錯誤/i.test(text)) return 'FACEBOOK_PASSWORD_REJECTED';
   if (/temporarily blocked|try again later|too many attempts|暂时.*封|稍后重试/i.test(text)) return 'FACEBOOK_LOGIN_RATE_LIMITED';
@@ -42,6 +43,7 @@ async function inspect(ws) {
   const data=JSON.parse(page.result.result.value);
   const response=await engine.cdpCall(ws,{id:seq++,method:'Network.getCookies',params:{urls:['https://www.facebook.com/']}});
   const cookie=response.result.cookies.find(c=>c.name==='c_user');
+  if(loginReason(data.text)==='FACEBOOK_ACCOUNT_SUSPENDED') return {state:'VERIFICATION_REQUIRED',reasonCode:'FACEBOOK_ACCOUNT_SUSPENDED',errorText:data.text.slice(0,900)};
   if(data.challenge) return {state:'VERIFICATION_REQUIRED',reasonCode:'FACEBOOK_CHECKPOINT',errorText:data.text.slice(0,900)};
   if(data.login || /\/login/.test(new URL(data.url).pathname)) return {state:'LOGIN_REQUIRED',reasonCode:loginReason(data.text),errorText:data.errorText};
   if(data.loaded && cookie && new URL(data.url).hostname==='www.facebook.com') return {state:'AVAILABLE'};
