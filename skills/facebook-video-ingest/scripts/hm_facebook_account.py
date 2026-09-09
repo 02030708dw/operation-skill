@@ -103,6 +103,7 @@ def verify(config: dict, tenant: str, credentials: dict | None = None) -> dict:
         outcome=json.loads(result.stdout.strip().splitlines()[-1])
         state=outcome['state']
         reason=outcome.get('reasonCode') or outcome.get('reason')
+        if credentials and outcome.get('errorText'): print(json.dumps({'loginDiagnostic':outcome['errorText']}),flush=True)
         if state not in {'AVAILABLE','LOGIN_REQUIRED','VERIFICATION_REQUIRED','COOLDOWN'}: raise ValueError('state')
     except (ValueError,IndexError,OSError,subprocess.TimeoutExpired):
         state='COOLDOWN'
