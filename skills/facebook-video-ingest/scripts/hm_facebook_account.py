@@ -68,15 +68,18 @@ def verify(config: dict, tenant: str, credentials: dict | None = None) -> dict:
     payload.update(credentials or {})
     try:
         result=subprocess.run(['node',str(script)],input=json.dumps(payload),text=True,capture_output=True,timeout=90)
-        state=json.loads(result.stdout.strip().splitlines()[-1])['state']
+        outcome=json.loads(result.stdout.strip().splitlines()[-1])
+        state=outcome['state']
+        reason=outcome.get('reasonCode')
         if state not in {'AVAILABLE','LOGIN_REQUIRED','VERIFICATION_REQUIRED','COOLDOWN'}: raise ValueError('state')
     except (ValueError,IndexError,OSError,subprocess.TimeoutExpired):
         state='COOLDOWN'
+        reason='SESSION_CHECK_FAILED'
     marker=profile/'.hermes-login-enabled'
     if state=='AVAILABLE': marker.write_text('Server-authorized session\n');marker.chmod(0o600)
     else: marker.unlink(missing_ok=True)
     old=read_state(account)
-    current={'state':state,'version':max(int(old.get('version',0))+1,time.time_ns()//1000000),
+    current={'state':state,'reasonCode':reason,'version':max(int(old.get('version',0))+1,time.time_ns()//1000000),
              'checkedAt':int(time.time()),'nextCheckAt':int(time.time())+300 if state=='COOLDOWN' else None}
     tmp=root/'state.tmp';tmp.write_text(json.dumps(current));tmp.chmod(0o600);tmp.replace(root/'state.json')
     report(config,tenant,current)
