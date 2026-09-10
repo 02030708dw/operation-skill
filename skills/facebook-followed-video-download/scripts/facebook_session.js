@@ -53,7 +53,7 @@ async function perform(browser,input) {
   const call=(method,params)=>engine.cdpCall(browser.ws,{id:seq++,method,params});
   const evaluate=async expression=>call('Runtime.evaluate',{expression,returnByValue:true});
     if(input.action==='check') await call('Page.reload',{});
-    else if(input.action!=='code') {
+    else if(input.action!=='code' && input.action!=='finish') {
     await call('Page.navigate',{url:input.action==='login'?'https://www.facebook.com/login/':'https://www.facebook.com/me/'});
     await sleep(6000);
     }

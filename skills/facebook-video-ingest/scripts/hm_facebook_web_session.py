@@ -91,8 +91,9 @@ def run(tenant):
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(InterruptedError()))
     try:
         initial = json.loads(sys.stdin.readline())
-        if initial.get('action') not in ('login', 'verify'): raise ValueError('Invalid initial action')
-        if initial['action'] == 'login':
+        if initial.get('action') not in ('login', 'verify', 'browser'): raise ValueError('Invalid initial action')
+        human = initial['action'] == 'browser'
+        if initial['action'] in ('login', 'browser'):
             staging = root / ('login.' + uuid.uuid4().hex); staging.mkdir(mode=0o700)
         profile = staging or root / 'profile'; profile.mkdir(exist_ok=True, mode=0o700)
         accounts.recover_profile(profile)
@@ -117,15 +118,21 @@ def run(tenant):
             if source == 'input':
                 command = json.loads(line)
                 if command.get('action') == 'close': return
-                if command.get('action') not in ('code', 'check'): raise ValueError('Invalid follow-up')
+                if command.get('action') not in ('code', 'check', 'finish', 'view'): raise ValueError('Invalid follow-up')
                 child.stdin.write(json.dumps(command) + '\n'); child.stdin.flush(); command = None
+            elif line.startswith('HM_BROWSER_RESULT '):
+                emit(browser=json.loads(line.removeprefix('HM_BROWSER_RESULT ')))
             elif line.startswith('HM_ACCOUNT_RESULT '):
                 result = json.loads(line.removeprefix('HM_ACCOUNT_RESULT '))
+                if result['state'] == 'BROWSER_READY':
+                    emit(phase='WAITING_BROWSER', reasonCode=None); continue
                 if result['state'] == 'AVAILABLE':
                     stop_child()
                     if staging: promote(root, staging); staging = None
                     save_result(config, tenant, result)
                     emit(phase='SUCCEEDED', state='AVAILABLE', reasonCode=None); return
+                if human:
+                    emit(phase='WAITING_BROWSER', reasonCode=result.get('reasonCode')); continue
                 if result['state'] == 'VERIFICATION_REQUIRED' and result.get('reasonCode') != 'FACEBOOK_ACCOUNT_SUSPENDED':
                     emit(phase='WAITING_CODE' if result.get('requiresCode') else 'WAITING_VERIFICATION',
                          state=result['state'], reasonCode=result.get('reasonCode')); continue

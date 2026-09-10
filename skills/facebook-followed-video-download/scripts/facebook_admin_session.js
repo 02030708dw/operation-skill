@@ -3,8 +3,10 @@
 const readline = require('readline');
 const engine = require('./facebook_followed_video_engine');
 const {perform} = require('./facebook_session');
+const interactive = require('./facebook_interactive_browser');
 const emit = value => console.log('HM_ACCOUNT_RESULT ' + JSON.stringify(value));
 async function main() {
+  interactive.privatePreferences(process.argv[2]);
   const browser = await engine.startBrowser(process.argv[2]);
   try {
     for await (const line of readline.createInterface({input: process.stdin})) {
@@ -12,7 +14,13 @@ async function main() {
       try {
         input = JSON.parse(line);
         if (input.action === 'close') break;
-        if (!['login', 'verify', 'code', 'check'].includes(input.action)) throw Error('Invalid action');
+        if(input.action==='browser'){await interactive.open(browser);emit({state:'BROWSER_READY'});continue;}
+        if(input.action==='view'){
+          try {console.log('HM_BROWSER_RESULT '+JSON.stringify({requestId:input.requestId,...await interactive.command(browser,input)}));}
+          catch(_){console.log('HM_BROWSER_RESULT '+JSON.stringify({requestId:input.requestId,error:'BROWSER_UNAVAILABLE'}));}
+          continue;
+        }
+        if (!['login', 'verify', 'code', 'check', 'finish'].includes(input.action)) throw Error('Invalid action');
         if (input.action === 'code' && !/^\d{6}$/.test(input.oneTimeCode || '')) throw Error('Invalid code');
         const result = await perform(browser, input);
         emit({state: result.state, reasonCode: result.reasonCode || null,
