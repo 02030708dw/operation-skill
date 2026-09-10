@@ -1145,8 +1145,12 @@ def drain_upload_jobs(
             payload = json.loads(pending.read_text(encoding="utf-8"))
             if payload.get("workerId") == worker_id:
                 results.append(process_upload_job(args, backend, token, worker_id, payload["job"]))
-    # Bound each server batch so a large regional migration releases the shared upload slot.
-    for _ in range(10 if os.getenv("HM_SERVER_COMPONENT") == "UPLOAD" else 10000):
+    # Amortize scheduler startup without monopolizing the shared regional slot.
+    # Finish the current durable operation, then yield after 30 seconds.
+    batch_deadline = time.monotonic() + 30 if os.getenv("HM_SERVER_COMPONENT") == "UPLOAD" else float("inf")
+    for _ in range(10000):
+        if time.monotonic() >= batch_deadline:
+            break
         import hm_review_storage
         review_processed = hm_review_storage.process_one(args, backend, token, worker_id, sys.modules[__name__])
         job = claim_upload(backend, token, worker_id, task_no)

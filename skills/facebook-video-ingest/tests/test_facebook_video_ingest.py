@@ -2,6 +2,7 @@ import importlib.util
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr
@@ -17,6 +18,8 @@ MODULE_PATH = (
 SPEC = importlib.util.spec_from_file_location("facebook_video_ingest", MODULE_PATH)
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
+sys.path.insert(0, str(MODULE_PATH.parent))
+sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
 RUNNER_PATH = MODULE_PATH.with_name("hermes_cron_runner.py")
@@ -1183,6 +1186,18 @@ class PipelineTests(unittest.TestCase):
                 result = MODULE.drain_upload_jobs(args, "http://backend", "token", "worker")
             run.assert_not_called(); self.assertEqual(len(result), 1); self.assertTrue(video.exists())
             self.assertFalse((folder / "pending.json").exists())
+
+    def test_storage_batch_uses_time_budget_and_releases_the_shared_slot(self):
+        import hm_review_storage
+        with tempfile.TemporaryDirectory() as temporary:
+            args = MODULE.build_parser().parse_args(["--check", "--state-dir", temporary])
+            with (mock.patch.dict(os.environ, {"HM_SERVER_COMPONENT": "UPLOAD"}),
+                  mock.patch.object(MODULE.time, "monotonic", side_effect=range(40)),
+                  mock.patch.object(MODULE, "replay_upload_cleanup_journals", return_value=[]),
+                  mock.patch.object(MODULE, "claim_upload", return_value=None),
+                  mock.patch.object(hm_review_storage, "process_one", return_value=True) as process):
+                MODULE.drain_upload_jobs(args, "http://backend", "token", "worker")
+            self.assertEqual(process.call_count, 29)
 
     def test_versioned_prefix_must_match_claim_identity(self):
         job = {"jobNo": "U-1", "executionVersion": 4, "r2Prefix": "PH/Sports/202609/10/U-1/a4"}
