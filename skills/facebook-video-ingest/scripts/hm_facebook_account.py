@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -31,16 +32,85 @@ def account_root(account: dict) -> Path:
     return root
 
 
-def acquire(account: dict):
+def acquire(account: dict, shared: bool = False):
     root = account_root(account)
     handle = (root / 'account.lock').open('a+')
     os.chmod(root / 'account.lock', 0o600)
     try:
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(handle, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
         return handle
     except BlockingIOError:
         handle.close()
         return None
+
+
+class CaptureLease:
+    def __init__(self, gate, lane, profile):
+        self.gate, self.lane, self.profile = gate, lane, profile
+
+    def filenos(self):
+        return (self.gate.fileno(), self.lane.fileno())
+
+    def close(self):
+        self.lane.close()
+        self.gate.close()
+
+
+def acquire_capture(account: dict):
+    """Capture readers exclude login maintenance; each reader owns a browser lane."""
+    count = account.get('concurrency', 1)
+    if type(count) is not int or count not in (1, 2):
+        raise ValueError('Invalid account concurrency')
+    gate = acquire(account, shared=True)
+    if gate is None:
+        return None
+    root = account_root(account)
+    for index in range(count):
+        path = root / f'capture-{index}.lock'
+        lane = path.open('a+'); path.chmod(0o600)
+        try:
+            fcntl.flock(lane, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lane.close()
+            continue
+        return CaptureLease(gate, lane, root / f'capture-profile-{index}')
+    gate.close()
+    return None
+
+
+def prepare_capture(config: dict, tenant: str, lease: CaptureLease) -> dict:
+    """Copy the stable login session; never open its directory from two processes."""
+    account = account_config(config)
+    root = account_root(account)
+    # Serialize state checks/reports so a later successful check cannot erase a
+    # concurrent login failure. Waiting here holds no global capture slot.
+    path = root / 'verify.lock'
+    with path.open('a+') as guard:
+        path.chmod(0o600)
+        try:
+            fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # Requeue instead of waiting beyond the dispatch lease while another
+            # lane performs its bounded network verification.
+            return {'state': 'BUSY'}
+        previous = read_state(account)
+        if previous['state'] != 'AVAILABLE' and not (
+                previous['state'] == 'COOLDOWN' and (previous.get('nextCheckAt') or 0) <= time.time()):
+            report(config, tenant, previous) if previous.get('version', 0) else None
+            return previous
+        recover_profile(lease.profile)
+        if lease.profile.exists():
+            shutil.rmtree(lease.profile)
+        source = root / 'profile'
+        if source.exists():
+            # Cache and Chromium process locks are not part of the login session.
+            shutil.copytree(source, lease.profile, ignore=shutil.ignore_patterns(
+                'Singleton*', 'DevToolsActivePort', 'Cache', 'Code Cache', 'GPUCache',
+                'ShaderCache', 'GrShaderCache', 'Crashpad'))
+        else:
+            lease.profile.mkdir(mode=0o700)
+        lease.profile.chmod(0o700)
+        return verify(config, tenant, profile=lease.profile)
 
 
 def read_state(account: dict) -> dict:
@@ -88,12 +158,12 @@ def recover_profile(profile: Path, proc_root: Path | None = None) -> None:
         if path.is_symlink() or path.is_file(): path.unlink(missing_ok=True)
 
 
-def verify(config: dict, tenant: str, credentials: dict | None = None) -> dict:
+def verify(config: dict, tenant: str, credentials: dict | None = None, profile: Path | None = None) -> dict:
     """Caller must hold account.lock throughout verification and capture."""
     os.umask(0o077)
     account=account_config(config)
     root=account_root(account)
-    profile=root/'profile'; profile.mkdir(exist_ok=True,mode=0o700)
+    profile=profile if profile is not None else root/'profile'; profile.mkdir(exist_ok=True,mode=0o700)
     recover_profile(profile)
     script=Path(__file__).resolve().parents[2]/'facebook-followed-video-download/scripts/facebook_session.js'
     payload={'profile':str(profile),'action':'login' if credentials else 'verify'}

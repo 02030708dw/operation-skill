@@ -144,13 +144,13 @@ def run(spec: dict) -> int:
     account = accounts.account_config(config) if spec["kind"] == "CAPTURE" else None
     account_lock = None
     if account:
-        account_lock = accounts.acquire(account)
+        account_lock = accounts.acquire_capture(account)
         if account_lock is None:
             os.environ.update(worker_environment(spec))
             status(spec, "RETRY")
             return 0
         try:
-            verified = accounts.verify(config, spec["tenant"])
+            verified = accounts.prepare_capture(config, spec["tenant"], account_lock)
             if verified["state"] != "AVAILABLE":
                 os.environ.update(worker_environment(spec))
                 status(spec, "RETRY")
@@ -170,7 +170,7 @@ def run(spec: dict) -> int:
             break
     environment = worker_environment(spec)
     if account:
-        environment["HM_FACEBOOK_PROFILE"] = str(accounts.account_root(account) / "profile")
+        environment["HM_FACEBOOK_PROFILE"] = str(account_lock.profile)
     Path(environment["TMPDIR"]).mkdir(parents=True, exist_ok=True)
     # The runner's status callbacks and the child use the same trusted registry.
     if spec.get("tenant"):
@@ -194,7 +194,9 @@ def run(spec: dict) -> int:
                 status(spec, "RETRY", "服务器剩余存储不足，已暂停新下载和生成")
                 return 0
         status(spec, "RUNNING")  # Reject stale attempts before claiming business work.
-        child = subprocess.Popen(command(spec), env=environment, start_new_session=True)
+        inherited_locks = tuple(handle.fileno() for handle in (slot_lock, execution_lock) if handle)
+        if account_lock: inherited_locks += account_lock.filenos()
+        child = subprocess.Popen(command(spec), env=environment, start_new_session=True, pass_fds=inherited_locks)
         last_ack = time.monotonic()
         while child.poll() is None:
             time.sleep(2)
