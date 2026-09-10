@@ -49,34 +49,35 @@ async function inspect(ws) {
   if(data.loaded && cookie && new URL(data.url).hostname==='www.facebook.com') return {state:'AVAILABLE'};
   return {state:'COOLDOWN',reasonCode:'SESSION_CHECK_INCONCLUSIVE'};
 }
-async function main() {
-  const input=JSON.parse(fs.readFileSync(0,'utf8'));
-  const browser=await engine.startBrowser(input.profile);
+async function perform(browser,input) {
   const call=(method,params)=>engine.cdpCall(browser.ws,{id:seq++,method,params});
   const evaluate=async expression=>call('Runtime.evaluate',{expression,returnByValue:true});
-  try {
+    if(input.action==='check') await call('Page.reload',{});
+    else if(input.action!=='code') {
     await call('Page.navigate',{url:input.action==='login'?'https://www.facebook.com/login/':'https://www.facebook.com/me/'});
     await sleep(6000);
+    }
     await waitForPage(browser.ws);
-    if(input.action==='login') {
       async function enter(selector,text) {
         const focused=await evaluate(`(()=>{const e=document.querySelector(${JSON.stringify(selector)});if(!e)return false;e.focus();e.select();return true;})()`);
         if(!focused.result.result.value) return false;
         await call('Input.insertText',{text});return true;
       }
+    if(input.action==='login') {
       const emailEntered=await enter('input[name="email"]',input.username);
       const passwordEntered=await enter('input[name="pass"]',input.password);
       if(!emailEntered || !passwordEntered) {
-        console.log(JSON.stringify(await inspect(browser.ws)));return;
+        return inspect(browser.ws);
       }
       const submitted=await evaluate(`(()=>{const password=document.querySelector('input[name="pass"]');const form=password?.form;const visible=[...document.querySelectorAll('button,[role="button"],input[type="submit"]')].find(e=>e.getClientRects().length && /^(log in|login|登录|登入|เข้าสู่ระบบ)$/i.test((e.innerText||e.value||'').trim()));const submit=visible||(form||document).querySelector('button[name="login"],input[name="login"],button[type="submit"],input[type="submit"]');if(submit){submit.click();return true;}if(form){form.requestSubmit();return true;}return false;})()`);
       if(!submitted.result.result.value) {
-        console.log(JSON.stringify({state:'LOGIN_REQUIRED',reasonCode:'FACEBOOK_LOGIN_NOT_COMPLETED',errorText:'Login form submit control was not found.'}));return;
+        return {state:'LOGIN_REQUIRED',reasonCode:'FACEBOOK_LOGIN_NOT_COMPLETED'};
       }
       await sleep(8000);
       await waitForPage(browser.ws);
-      if(input.twoFactorSecret) {
-        const code=totp(input.twoFactorSecret);
+    }
+      if(input.twoFactorSecret || input.oneTimeCode) {
+        const code=input.oneTimeCode || totp(input.twoFactorSecret);
         // Current Facebook uses an unnamed input on its authenticator-app page.
         // Do not mistake another checkpoint (phone, identity, etc.) for a TOTP form.
         await evaluate(`(()=>{if(!/authentication app|authenticator app|two-factor authentication app|身份验证器|身分驗證器/i.test(document.body?.innerText||''))return;const input=[...document.querySelectorAll('input')].find(e=>e.getClientRects().length && ['text','tel','number'].includes(e.type) && e.name!=='email');if(input)input.setAttribute('data-hermes-auth-code','true');})()`);
@@ -86,11 +87,15 @@ async function main() {
           await sleep(7000);
         }
       }
-    }
     const result=await inspect(browser.ws);
-    if(result.errorText){for(const secret of [input.username,input.password,input.twoFactorSecret])if(secret)result.errorText=result.errorText.split(secret).join('[hidden]');}
-    console.log(JSON.stringify(result));
+    if(result.errorText){for(const secret of [input.username,input.password,input.twoFactorSecret,input.oneTimeCode])if(secret)result.errorText=result.errorText.split(secret).join('[hidden]');}
+    return result;
+}
+async function main() {
+  const input=JSON.parse(fs.readFileSync(0,'utf8'));
+  const browser=await engine.startBrowser(input.profile);
+  try {console.log(JSON.stringify(await perform(browser,input)));
   } finally { browser.ws.close(); await engine.stopChrome(browser.chrome); }
 }
 if(require.main===module) main().catch(error=>{console.log(JSON.stringify({state:'COOLDOWN',reasonCode:error.code||'SESSION_CHECK_FAILED',errorType:error.name}));process.exitCode=1;});
-module.exports={totp,loginReason,waitForPage};
+module.exports={totp,loginReason,waitForPage,perform};
