@@ -332,21 +332,43 @@ def claim_upload(
     )
 
 
+def check_upload(backend: str, token: str, worker_id: str, job: dict[str, Any]) -> dict[str, Any]:
+    return api_call(backend, token, "POST", f"/api/internal/capture/uploads/{job['jobNo']}/check",
+                    {"workerId": worker_id, "executionVersion": job.get("executionVersion", 0),
+                     "r2ObjectKey": planned_upload_key(job)},
+                    retry_transient=True)
+
+
+def planned_upload_key(job: dict[str, Any]) -> str:
+    name = str(job.get("fileName") or Path(str(job["localPath"])).name).strip().replace("\\", "_").replace("/", "_")
+    name = "".join(c if c.isalnum() or c in {"-", "_", ".", " "} else "_" for c in name)
+    name = name.strip(" .")[:120] or Path(str(job["localPath"])).name
+    return job_r2_prefix(job) + "/" + name
+
+
+def upload_attempt_segment(job: dict[str, Any]) -> str:
+    segment = state_segment(job.get("jobNo"))
+    version = job.get("executionVersion")
+    return f"{segment}-a{int(version)}" if version is not None else segment
+
+
 def complete_upload(
     backend: str,
     token: str,
     worker_id: str,
     job_no: str,
     video: dict[str, Any],
-) -> None:
+    execution_version: int | None = None,
+) -> dict[str, Any] | None:
     upload_status = normalized_upload_status(video.get("status"))
-    api_call(
+    return api_call(
         backend,
         token,
         "POST",
         f"/api/internal/capture/uploads/{job_no}/complete",
         {
             "workerId": worker_id,
+            "executionVersion": execution_version,
             "status": upload_status,
             "r2Bucket": video.get("r2Bucket"),
             "r2ObjectKey": video.get("r2ObjectKey"),
@@ -714,6 +736,7 @@ def run_command(
     *,
     env: dict[str, str] | None = None,
     on_line: Callable[[str], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> tuple[int, str]:
     process = subprocess.Popen(
         command,
@@ -724,17 +747,38 @@ def run_command(
         errors="replace",
         env=env,
     )
+    stop_monitor = threading.Event()
+    def monitor() -> None:
+        while not stop_monitor.wait(3):
+            try:
+                if should_cancel and should_cancel():
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    return
+            except (PipelineError, OSError) as exc:
+                print(f"Upload lease check warning: {exc}", file=sys.stderr, flush=True)
+    thread = threading.Thread(target=monitor, daemon=True) if should_cancel else None
+    if thread:
+        thread.start()
     lines: list[str] = []
     assert process.stdout is not None
-    for line in process.stdout:
-        if on_line is not None:
-            on_line(line)
-        if line.startswith(VIDEO_RESULT_EVENT_PREFIX):
-            continue
-        print(line, end="", flush=True)
-        lines.append(line)
-    process.stdout.close()
-    return process.wait(), "".join(lines)
+    try:
+        for line in process.stdout:
+            if on_line is not None:
+                on_line(line)
+            if line.startswith(VIDEO_RESULT_EVENT_PREFIX):
+                continue
+            print(line, end="", flush=True)
+            lines.append(line)
+        return process.wait(), "".join(lines)
+    finally:
+        stop_monitor.set()
+        process.stdout.close()
+        if thread:
+            thread.join(timeout=1)
 
 
 def download_runtime_check() -> dict[str, Any]:
@@ -811,6 +855,7 @@ def normalized_upload_status(value: object) -> str:
         "conflict": "R2_CONFLICT",
         "failed": "UPLOAD_FAILED",
         "ready": "PENDING",
+        "cancelled": "CANCELLED",
     }
     return mapping.get(str(value or "").lower(), "UPLOAD_FAILED")
 
@@ -833,7 +878,10 @@ def job_r2_prefix(job: dict[str, Any], fallback: str = "") -> str:
     else:
         relative = prefix
     parts = relative.split("/")
-    if len(parts) != 4 or any(not part or part in {".", ".."} for part in parts):
+    versioned = (len(parts) == 6 and parts[-2] == str(job.get("jobNo"))
+                 and parts[-1] == "a" + str(job.get("executionVersion"))
+                 and isinstance(job.get("executionVersion"), int) and job["executionVersion"] > 0)
+    if (len(parts) != 4 and not versioned) or any(not part or part in {".", ".."} for part in parts):
         raise PipelineError(
             "backend job r2Prefix must use REGION/Category/yyyyMM/dd"
         )
@@ -931,13 +979,18 @@ def finish_upload_and_cleanup(
 ) -> dict[str, Any]:
     """Durably confirm the upload before deleting the source video."""
     job_no = str(job.get("jobNo") or "")
-    journal = upload_cleanup_journal_path(state_dir, job_no)
+    journal = upload_cleanup_journal_path(state_dir, upload_attempt_segment(job))
     write_upload_cleanup_journal(journal, worker_id, job, upload_video)
-    complete_upload(backend, token, worker_id, job_no, upload_video)
-    cleanup = cleanup_uploaded_local_file(job, upload_video)
+    receipt = complete_upload(backend, token, worker_id, job_no, upload_video, job.get("executionVersion"))
+    # Older servers return null; retain the file unless deletion was explicitly authorized.
+    cleanup = (cleanup_uploaded_local_file(job, upload_video)
+               if isinstance(receipt, dict) and receipt.get("cleanupAllowed") is True
+               else {"status": "retained", "reason": "backend-retain-source"})
     if cleanup.get("status") != "failed":
         try:
             journal.unlink()
+            pending = journal.with_name("pending.json")
+            pending.unlink(missing_ok=True)
         except FileNotFoundError:
             pass
     return cleanup
@@ -984,8 +1037,22 @@ def process_upload_job(
     job: dict[str, Any],
 ) -> dict[str, Any]:
     job_no = state_segment(job.get("jobNo"))
-    upload_dir = args.state_dir.expanduser().resolve() / "approved-uploads" / job_no
+    upload_dir = args.state_dir.expanduser().resolve() / "approved-uploads" / upload_attempt_segment(job)
     upload_dir.mkdir(parents=True, exist_ok=True)
+    pending = upload_dir / "pending.json"
+    temporary = pending.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"workerId": worker_id, "job": job}), encoding="utf-8")
+    temporary.replace(pending)
+    state = check_upload(backend, token, worker_id, job)
+    if not state.get("active"):
+        existing = upload_dir / "result.json"
+        upload_video = {"status": "cancelled", "r2ObjectKey": planned_upload_key(job)}
+        if existing.is_file():
+            payload = json.loads(existing.read_text(encoding="utf-8"))
+            if payload.get("videos"):
+                upload_video = payload["videos"][0]
+        cleanup = finish_upload_and_cleanup(args.state_dir, backend, token, worker_id, job, upload_video)
+        return {"cancelled": True, "localCleanup": cleanup}
     source_manifest = upload_dir / "source.json"
     result_manifest = upload_dir / "result.json"
     source_manifest.write_text(
@@ -1014,7 +1081,13 @@ def process_upload_job(
         "--prefix", job_r2_prefix(job), "--flatten", "--execute",
         "--execution-id", job_no, "--result-json", str(result_manifest),
     ]
-    exit_code, output = run_command(command)
+    cancelled = threading.Event()
+    def should_cancel() -> bool:
+        active = check_upload(backend, token, worker_id, job).get("active")
+        if not active:
+            cancelled.set()
+        return not active
+    exit_code, output = run_command(command, should_cancel=should_cancel)
     try:
         if not result_manifest.is_file():
             raise PipelineError("R2 skill did not write the approved-video result manifest")
@@ -1024,7 +1097,8 @@ def process_upload_job(
             raise PipelineError("R2 skill returned no approved-video result")
         upload_video = videos[0]
     except (OSError, PipelineError, json.JSONDecodeError, TypeError) as exc:
-        upload_video = {"status": "failed", "error": str(exc)[:500]}
+        upload_video = ({"status": "cancelled", "r2ObjectKey": planned_upload_key(job)}
+                        if cancelled.is_set() else {"status": "failed", "error": str(exc)[:500]})
         result = {"videos": [upload_video]}
     result["localCleanup"] = finish_upload_and_cleanup(
         args.state_dir,
@@ -1057,6 +1131,12 @@ def drain_upload_jobs(
     results = replay_upload_cleanup_journals(
         args.state_dir, backend, token, worker_id
     )
+    root = args.state_dir.expanduser().resolve() / "approved-uploads"
+    if root.is_dir():
+        for pending in sorted(root.glob("*/pending.json")):
+            payload = json.loads(pending.read_text(encoding="utf-8"))
+            if payload.get("workerId") == worker_id:
+                results.append(process_upload_job(args, backend, token, worker_id, payload["job"]))
     while True:
         job = claim_upload(backend, token, worker_id, task_no)
         if job is None:

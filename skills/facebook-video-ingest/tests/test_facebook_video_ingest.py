@@ -1002,7 +1002,7 @@ class PipelineTests(unittest.TestCase):
                 "r2Prefix": "PH/Sports/202608/27",
             }
 
-            def fake_run(command):
+            def fake_run(command, **kwargs):
                 result_path = Path(command[command.index("--result-json") + 1])
                 result_path.write_text(
                     json.dumps(
@@ -1021,8 +1021,9 @@ class PipelineTests(unittest.TestCase):
                 return 0, "uploaded\n"
 
             with (
+                mock.patch.object(MODULE, "check_upload", return_value={"active": True}),
                 mock.patch.object(MODULE, "run_command", side_effect=fake_run),
-                mock.patch.object(MODULE, "complete_upload") as complete_upload,
+                mock.patch.object(MODULE, "complete_upload", return_value={"cleanupAllowed": True}) as complete_upload,
             ):
                 result = MODULE.process_upload_job(
                     args,
@@ -1053,7 +1054,7 @@ class PipelineTests(unittest.TestCase):
                 "r2Prefix": "PH/Sports/202608/27",
             }
 
-            def fake_run(command):
+            def fake_run(command, **kwargs):
                 result_path = Path(command[command.index("--result-json") + 1])
                 result_path.write_text(
                     json.dumps(
@@ -1071,6 +1072,7 @@ class PipelineTests(unittest.TestCase):
                 return 0, "uploaded\n"
 
             with (
+                mock.patch.object(MODULE, "check_upload", return_value={"active": True}),
                 mock.patch.object(MODULE, "run_command", side_effect=fake_run),
                 mock.patch.object(
                     MODULE,
@@ -1093,7 +1095,7 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertTrue(journal.is_file())
 
-            with mock.patch.object(MODULE, "complete_upload") as complete_upload:
+            with mock.patch.object(MODULE, "complete_upload", return_value={"cleanupAllowed": True}) as complete_upload:
                 replayed = MODULE.replay_upload_cleanup_journals(
                     args.state_dir,
                     "https://backend.example.com",
@@ -1105,6 +1107,92 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(replayed[0]["localCleanup"]["status"], "deleted")
             self.assertFalse(local_video.exists())
             self.assertFalse(journal.exists())
+
+    def test_cancelled_claim_skips_upload_and_keeps_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            video = root / "video.mp4"
+            video.write_bytes(b"video")
+            args = MODULE.build_parser().parse_args(["--check", "--state-dir", str(root / "state")])
+            job = {"jobNo": "U-1", "executionVersion": 7, "localPath": str(video),
+                   "fileName": "video.mp4", "r2Prefix": "PH/Sports/202609/10/U-1/a7"}
+            with (mock.patch.object(MODULE, "check_upload", return_value={"active": False}),
+                  mock.patch.object(MODULE, "run_command") as run,
+                  mock.patch.object(MODULE, "complete_upload", return_value={"cleanupAllowed": False, "cancelled": True}) as complete):
+                result = MODULE.process_upload_job(args, "http://backend", "token", "worker", job)
+            run.assert_not_called()
+            self.assertTrue(video.exists())
+            self.assertEqual(result["localCleanup"]["status"], "retained")
+            self.assertEqual(complete.call_args.args[-1], 7)
+            self.assertEqual(complete.call_args.args[-2]["r2ObjectKey"], "PH/Sports/202609/10/U-1/a7/video.mp4")
+            self.assertFalse((args.state_dir / "approved-uploads/U-1-a7/pending.json").exists())
+
+    def test_uploaded_file_is_retained_when_backend_cancelled_in_flight(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); video = root / "video.mp4"; video.write_bytes(b"video")
+            job = {"jobNo": "U-1", "executionVersion": 2, "localPath": str(video)}
+            with mock.patch.object(MODULE, "complete_upload", return_value={"cleanupAllowed": False, "cancelled": True}):
+                result = MODULE.finish_upload_and_cleanup(root, "http://backend", "token", "worker", job,
+                                                         {"status": "uploaded", "r2ObjectKey": "PH/U-1/a2/video.mp4"})
+            self.assertEqual(result["status"], "retained"); self.assertTrue(video.exists())
+            self.assertFalse(MODULE.upload_cleanup_journal_path(root, "U-1-a2").exists())
+
+    def test_running_upload_cancellation_reports_target_and_retains_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); video = root / "video.mp4"; video.write_bytes(b"video")
+            args = MODULE.build_parser().parse_args(["--check", "--state-dir", str(root / "state")])
+            job = {"jobNo": "U-1", "executionVersion": 2, "localPath": str(video), "r2Prefix": "PH/Sports/202609/10/U-1/a2"}
+            def cancelled_run(command, **kwargs):
+                self.assertTrue(kwargs["should_cancel"]())
+                return -15, "terminated"
+            with (mock.patch.object(MODULE, "check_upload", side_effect=[{"active": True}, {"active": False}]),
+                  mock.patch.object(MODULE, "run_command", side_effect=cancelled_run),
+                  mock.patch.object(MODULE, "complete_upload", return_value={"cleanupAllowed": False, "cancelled": True}) as complete):
+                result = MODULE.process_upload_job(args, "http://backend", "token", "worker", job)
+            self.assertEqual(complete.call_args.args[-2]["status"], "cancelled")
+            self.assertEqual(complete.call_args.args[-2]["r2ObjectKey"], job["r2Prefix"] + "/video.mp4")
+            self.assertTrue(video.exists()); self.assertEqual(result["localCleanup"]["status"], "retained")
+
+    def test_upload_monitor_terminates_a_silent_running_process(self):
+        import sys
+        import time
+        started = time.monotonic()
+        code, output = MODULE.run_command([sys.executable, "-c", "import time; time.sleep(30)"], should_cancel=lambda: True)
+        self.assertNotEqual(code, 0)
+        self.assertLess(time.monotonic() - started, 12)
+
+    def test_legacy_or_unreadable_receipt_never_authorizes_local_deletion(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); video = root / "video.mp4"; video.write_bytes(b"video")
+            with mock.patch.object(MODULE, "complete_upload", return_value=None):
+                result = MODULE.finish_upload_and_cleanup(root, "http://backend", "token", "worker",
+                          {"jobNo": "U-1", "localPath": str(video)}, {"status": "uploaded"})
+            self.assertEqual(result["status"], "retained"); self.assertTrue(video.exists())
+
+    def test_pending_upload_survives_worker_restart_and_cancels_without_result(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); video = root / "video.mp4"; video.write_bytes(b"video")
+            args = MODULE.build_parser().parse_args(["--check", "--state-dir", str(root / "state")])
+            job = {"jobNo": "U-1", "executionVersion": 3, "localPath": str(video), "r2Prefix": "PH/Sports/202609/10/U-1/a3"}
+            folder = args.state_dir / "approved-uploads/U-1-a3"; folder.mkdir(parents=True)
+            (folder / "pending.json").write_text(json.dumps({"workerId": "worker", "job": job}))
+            with (mock.patch.object(MODULE, "check_upload", return_value={"active": False}),
+                  mock.patch.object(MODULE, "complete_upload", return_value={"cleanupAllowed": False}),
+                  mock.patch.object(MODULE, "claim_upload", return_value=None),
+                  mock.patch.object(MODULE, "run_command") as run):
+                result = MODULE.drain_upload_jobs(args, "http://backend", "token", "worker")
+            run.assert_not_called(); self.assertEqual(len(result), 1); self.assertTrue(video.exists())
+            self.assertFalse((folder / "pending.json").exists())
+
+    def test_versioned_prefix_must_match_claim_identity(self):
+        job = {"jobNo": "U-1", "executionVersion": 4, "r2Prefix": "PH/Sports/202609/10/U-1/a4"}
+        self.assertEqual(MODULE.job_r2_prefix(job), job["r2Prefix"])
+        with self.assertRaises(MODULE.PipelineError):
+            MODULE.job_r2_prefix({**job, "executionVersion": 5})
+
+    def test_upload_attempts_have_separate_recovery_directories(self):
+        self.assertNotEqual(MODULE.upload_attempt_segment({"jobNo": "U-1", "executionVersion": 1}),
+                            MODULE.upload_attempt_segment({"jobNo": "U-1", "executionVersion": 2}))
 
     def test_upload_complete_callback_enables_transient_retry(self):
         with mock.patch.object(MODULE, "api_call") as api_call:
@@ -1764,6 +1852,7 @@ class PipelineTests(unittest.TestCase):
                     },
                 ),
                 mock.patch.object(MODULE, "heartbeat"),
+                mock.patch.object(MODULE, "check_upload", return_value={"active": True}),
                 mock.patch.object(MODULE, "run_command", side_effect=fake_run),
                 mock.patch.object(MODULE, "record_video") as record_video,
                 mock.patch.object(MODULE, "complete") as complete,
@@ -1836,6 +1925,7 @@ class PipelineTests(unittest.TestCase):
                     },
                 ),
                 mock.patch.object(MODULE, "heartbeat"),
+                mock.patch.object(MODULE, "check_upload", return_value={"active": True}),
                 mock.patch.object(MODULE, "run_command", side_effect=fake_run),
                 mock.patch.object(MODULE, "record_video") as record_video,
                 mock.patch.object(MODULE, "complete") as complete,
@@ -1916,6 +2006,7 @@ class PipelineTests(unittest.TestCase):
                     },
                 ),
                 mock.patch.object(MODULE, "heartbeat"),
+                mock.patch.object(MODULE, "check_upload", return_value={"active": True}),
                 mock.patch.object(MODULE, "run_command", side_effect=fake_run),
                 mock.patch.object(
                     MODULE,
