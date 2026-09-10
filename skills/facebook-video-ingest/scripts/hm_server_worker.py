@@ -76,6 +76,9 @@ def worker_environment(spec: dict) -> dict:
                    HM_INGEST_STATE_DIR=str(media / "executions"),
                    FACEBOOK_FOLLOWED_OUTPUT=str(media / "downloads"),
                    FB_FOLLOWED_DESKTOP=str(media / "downloads"))
+    env.pop("HM_REVIEW_KEY_FILE", None)
+    if config.get("reviewKeyFile"):
+        env["HM_REVIEW_KEY_FILE"] = config["reviewKeyFile"]
     env["HM_SERVER_COMPONENT"] = spec["kind"]
     # This isolates both the downloader's global lock and its persistent browser profile.
     env["FACEBOOK_FOLLOWED_STATE_DIR"] = str(root / "slots" / str(spec["slot"]))

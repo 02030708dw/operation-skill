@@ -340,9 +340,9 @@ def check_upload(backend: str, token: str, worker_id: str, job: dict[str, Any]) 
 
 
 def planned_upload_key(job: dict[str, Any]) -> str:
-    name = str(job.get("fileName") or Path(str(job["localPath"])).name).strip().replace("\\", "_").replace("/", "_")
+    name = str(job.get("fileName") or Path(str(job.get("localPath") or "video.mp4")).name).strip().replace("\\", "_").replace("/", "_")
     name = "".join(c if c.isalnum() or c in {"-", "_", ".", " "} else "_" for c in name)
-    name = name.strip(" .")[:120] or Path(str(job["localPath"])).name
+    name = name.strip(" .")[:120] or Path(str(job.get("localPath") or "video.mp4")).name
     return job_r2_prefix(job) + "/" + name
 
 
@@ -984,7 +984,7 @@ def finish_upload_and_cleanup(
     receipt = complete_upload(backend, token, worker_id, job_no, upload_video, job.get("executionVersion"))
     # Older servers return null; retain the file unless deletion was explicitly authorized.
     cleanup = (cleanup_uploaded_local_file(job, upload_video)
-               if isinstance(receipt, dict) and receipt.get("cleanupAllowed") is True
+               if not job.get("reviewObjectKey") and isinstance(receipt, dict) and receipt.get("cleanupAllowed") is True
                else {"status": "retained", "reason": "backend-retain-source"})
     if cleanup.get("status") != "failed":
         try:
@@ -1053,6 +1053,14 @@ def process_upload_job(
                 upload_video = payload["videos"][0]
         cleanup = finish_upload_and_cleanup(args.state_dir, backend, token, worker_id, job, upload_video)
         return {"cancelled": True, "localCleanup": cleanup}
+    if job.get("reviewObjectKey"):
+        import hm_review_storage
+        try:
+            upload_video = hm_review_storage.promote(job, planned_upload_key(job),
+                lambda: check_upload(backend, token, worker_id, job))
+        except Exception:
+            upload_video = {"status": "failed", "error": "REVIEW_PROMOTION_FAILED"}
+        return {"localCleanup": finish_upload_and_cleanup(args.state_dir, backend, token, worker_id, job, upload_video)}
     source_manifest = upload_dir / "source.json"
     result_manifest = upload_dir / "result.json"
     source_manifest.write_text(
@@ -1138,8 +1146,12 @@ def drain_upload_jobs(
             if payload.get("workerId") == worker_id:
                 results.append(process_upload_job(args, backend, token, worker_id, payload["job"]))
     while True:
+        import hm_review_storage
+        review_processed = hm_review_storage.process_one(args, backend, token, worker_id, sys.modules[__name__])
         job = claim_upload(backend, token, worker_id, task_no)
         if job is None:
+            if review_processed:
+                continue
             break
         try:
             results.append(process_upload_job(args, backend, token, worker_id, job))
