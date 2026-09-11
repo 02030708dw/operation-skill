@@ -66,7 +66,7 @@ def run():
                 break
             time.sleep(1)
         if lost.is_set():return
-        result=json.loads(output_path.read_text()) if output_path.exists() else {'title':None,'titleSource':'NONE','titleStatus':'NETWORK_ERROR'}
+        result=json.loads(output_path.read_text()) if output_path.exists() else {'title':None,'titleSource':'NONE','titleStatus':'NETWORK_ERROR' if time.monotonic()>=deadline else 'EXTRACTION_FAILED'}
         result.update(jobNo=job['jobNo'],executionVersion=job['executionVersion'])
         receipt=root/(name+'.pending');atomic(receipt,result);deliver(receipt)
     finally:
