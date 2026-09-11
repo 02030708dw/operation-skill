@@ -823,8 +823,16 @@ function persistStatistics(item) {
   // Persist before emitting: callbacks and the final manifest may be interrupted.
   if (item.statistics && resultJsonPath) {
     fs.mkdirSync(path.dirname(resultJsonPath), { recursive: true });
-    const journal = fs.openSync(path.join(path.dirname(resultJsonPath), 'statistics.jsonl'), 'a', 0o600);
-    try { fs.writeSync(journal, JSON.stringify(item) + '\n'); fs.fsyncSync(journal); }
+    const journal = fs.openSync(path.join(path.dirname(resultJsonPath), 'statistics.jsonl'), 'a+', 0o600);
+    try {
+      const size = fs.fstatSync(journal).size;
+      if (size) {
+        const tail = Buffer.alloc(1);
+        fs.readSync(journal, tail, 0, 1, size - 1);
+        if (tail[0] !== 10) fs.writeSync(journal, '\n');
+      }
+      fs.writeSync(journal, JSON.stringify(item) + '\n'); fs.fsyncSync(journal);
+    }
     finally { fs.closeSync(journal); }
   }
 }
@@ -1177,6 +1185,7 @@ async function runMain() {
 if (require.main === module) runMain();
 
 module.exports = {
+  persistStatistics,
   cdpCall,
   classifyDownloadError,
   createTemporaryProfile,
