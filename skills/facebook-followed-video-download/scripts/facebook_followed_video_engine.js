@@ -813,6 +813,22 @@ function classifyDownloadError(output) {
   return 'FACEBOOK_DOWNLOAD_UNSUPPORTED';
 }
 
+function persistStatistics(item) {
+  if (!dryRun) item.statistics = {
+    attemptId: crypto.randomBytes(16).toString('hex'),
+    occurredAt: new Date().toISOString(),
+    outcome: item.cacheHit ? 'CACHE' : ({ downloaded: 'SUCCESS', 'download-failed': 'FAILURE',
+      'archived-existing': 'DUPLICATE', 'filtered-duration': 'FILTERED' }[item.status] || 'FAILURE'),
+  };
+  // Persist before emitting: callbacks and the final manifest may be interrupted.
+  if (item.statistics && resultJsonPath) {
+    fs.mkdirSync(path.dirname(resultJsonPath), { recursive: true });
+    const journal = fs.openSync(path.join(path.dirname(resultJsonPath), 'statistics.jsonl'), 'a', 0o600);
+    try { fs.writeSync(journal, JSON.stringify(item) + '\n'); fs.fsyncSync(journal); }
+    finally { fs.closeSync(journal); }
+  }
+}
+
 function downloadVideo(account, url, outputDir, archivePath) {
   const item = baseVideoResult(account, url);
   if (dryRun) {
@@ -840,6 +856,7 @@ function downloadVideo(account, url, outputDir, archivePath) {
   }
   if (existing && existing.status === 'local-existing') {
     appendArchiveOnce(archivePath, url);
+    item.cacheHit = true;
     console.log('    復用本地檔案');
     return completedVideoResult(item, existing.localPath);
   }
@@ -1073,6 +1090,7 @@ async function main() {
       for (const videoUrl of selected) {
         console.log(`  下載: ${videoUrl}`);
         const item = downloadVideo(account, videoUrl, outputDir, archivePath);
+        persistStatistics(item);
         sourceResult.videos.push(item);
         if (emitVideoResultEvents) {
           console.log(videoResultEventLine(
@@ -1086,6 +1104,15 @@ async function main() {
         else if (item.status === 'archived-existing') sourceResult.archivedExisting++;
         else if (item.status === 'downloaded' || item.status === 'preview') sourceResult.succeeded++;
         else sourceResult.failed++;
+      }
+      // Scanned known videos are duplicate skips, never new download successes.
+      if (!dryRun) for (const knownUrl of discovered) {
+        if (!existingKeys.has(videoKey(knownUrl)) || selected.includes(knownUrl)) continue;
+        const item = baseVideoResult(account, knownUrl);
+        item.status = 'archived-existing';
+        persistStatistics(item);
+        sourceResult.videos.push(item);
+        sourceResult.archivedExisting++;
       }
       if (dryRun) console.log(`  預演: ${selected.length} 個待下載，未寫入檔案`);
       else {

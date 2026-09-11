@@ -497,6 +497,7 @@ def record_video(
     if not original_url:
         raise PipelineError("video result is missing originalUrl")
     payload = {
+        "statistics": video.get("statistics"),
         "platformVideoId": video.get("platformVideoId"),
         "sourceName": video.get("source"),
         "title": bounded_backend_text(
@@ -529,6 +530,26 @@ def record_video(
         worker_id=worker_id,
         retry_transient=True,
     )
+
+
+def replay_statistics(backend: str, token: str, worker_id: str, execution_id: str, journal: Path) -> None:
+    """Replay immutable attempt observations, including runs without a final manifest."""
+    if not journal.is_file():
+        return
+    for line in journal.read_text(encoding="utf-8").splitlines():
+        try:
+            video = json.loads(line)
+        except json.JSONDecodeError:
+            # A killed writer can leave the final record truncated; complete records survive.
+            continue
+        if not isinstance(video, dict) or not video.get("statistics"):
+            continue
+        status = capture_download_status(video)
+        api_call(backend, token, "POST", f"/api/internal/capture/executions/{execution_id}/statistics",
+            {"statistics": video["statistics"], "originalUrl": video.get("originalUrl") or video.get("canonicalUrl"),
+             "canonicalUrl": video.get("canonicalUrl"), "platformVideoId": video.get("platformVideoId"),
+             "downloadStatus": status, "errorCode": video.get("errorCode")},
+            worker_id=worker_id, retry_transient=True)
 
 
 def status_error_code(download_status: str, upload_status: str) -> str | None:
@@ -624,8 +645,7 @@ class IncrementalVideoRecorder:
         if event is None or self._stopped:
             return
         video = event["video"]
-        if capture_download_status(video) is not None:
-            self._queue.put(video)
+        self._queue.put(video)
         try:
             completed = int(event.get("completed") or 0)
             total = int(event.get("total") or 0)
@@ -639,8 +659,6 @@ class IncrementalVideoRecorder:
         """Drain streamed callbacks, then retry every missing final result."""
         self.stop()
         for video in videos:
-            if capture_download_status(video) is None:
-                continue
             identity = video_result_identity(video)
             if identity in self.recorded:
                 continue
@@ -688,6 +706,13 @@ class IncrementalVideoRecorder:
         identity = video_result_identity(video)
         download_status = capture_download_status(video)
         if download_status is None:
+            if video.get("statistics"):
+                api_call(self.backend, self.token, "POST",
+                    f"/api/internal/capture/executions/{self.execution_id}/statistics",
+                    {"statistics": video["statistics"], "originalUrl": video.get("originalUrl") or video.get("canonicalUrl"),
+                     "canonicalUrl": video.get("canonicalUrl"), "platformVideoId": video.get("platformVideoId")},
+                    worker_id=self.worker_id, retry_transient=True)
+            self.recorded.add(identity)
             return
         record_video(
             self.backend,
@@ -1499,6 +1524,7 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             / state_segment(execution_id)
         )
         execution_dir.mkdir(parents=True, exist_ok=True)
+        replay_statistics(backend, token, worker_id, execution_id, execution_dir / "statistics.jsonl")
         download_manifest = execution_dir / "download.json"
         download_result = reusable_download_result(download_manifest)
         if download_result is None:
@@ -1545,7 +1571,7 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             if str(video.get("status") or "").strip().lower()
             not in NON_ACTIONABLE_VIDEO_STATUSES
         ]
-        video_recorder.finish(videos)
+        video_recorder.finish(manifest_items)
 
         heartbeat_pump.update(90)
         heartbeat(backend, token, worker_id, execution_id, 90)
