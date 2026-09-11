@@ -10,7 +10,7 @@ function usable(value) {
   // Facebook often puts engagement counts before the actual caption.
   s = s.replace(/^(?:[\d.,KM]+\s*(?:views|reactions|likes|comments|shares)\s*[·|•-]?\s*)+/i, '').replace(/^\|\s*/, '');
   if (missing(s) || /^(?:facebook|log in|sign up|watch more|see more|videos|reels)$/i.test(s)) return null;
-  if (/log in to continue|confirm your identity|security check/i.test(s)) return null;
+  if (/log in to continue|log into facebook|log in or sign up|sign up for facebook|confirm your identity|security check/i.test(s)) return null;
   return Array.from(s).join('').slice(0, /[\uD800-\uDBFF]/.test(s.charAt(299)) ? 299 : 300);
 }
 function choose(metadata = {}, page = {}) {
