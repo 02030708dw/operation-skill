@@ -40,10 +40,18 @@ def encryption(config: dict, version: str, source: bool = False) -> dict:
 def client():
     import boto3
     from botocore.config import Config
-    return boto3.client("s3", endpoint_url="https://" + os.environ["CLOUDFLARE_R2_ACCOUNT_ID"] + ".r2.cloudflarestorage.com",
+    s3 = boto3.client("s3", endpoint_url="https://" + os.environ["CLOUDFLARE_R2_ACCOUNT_ID"] + ".r2.cloudflarestorage.com",
                         aws_access_key_id=os.environ["CLOUDFLARE_R2_ACCESS_KEY_ID"],
                         aws_secret_access_key=os.environ["CLOUDFLARE_R2_SECRET_ACCESS_KEY"], region_name="auto",
                         config=Config(signature_version="s3v4", retries={"max_attempts": 2, "mode": "standard"}, connect_timeout=15, read_timeout=60))
+    # R2 checks destination atomically, including a competing writer after our HEAD.
+    s3.meta.events.register('before-call.s3.CopyObject', protect_copy_destination)
+    return s3
+
+
+def protect_copy_destination(params, **kwargs):
+    params.setdefault('headers', {})['cf-copy-destination-if-none-match'] = '*'
+
 
 
 def require_review_key(region: str, key: str):

@@ -11,6 +11,12 @@ sys.path.insert(0,str(SCRIPTS))
 import hm_review_storage as storage
 
 class ReviewStorageTest(unittest.TestCase):
+    def test_copy_does_not_overwrite_a_racing_destination(self):
+        params={"headers":{"x-amz-copy-source":"bucket/review/PH/source"}}
+        storage.protect_copy_destination(params)
+        self.assertEqual(params["headers"]["cf-copy-destination-if-none-match"],"*")
+        self.assertEqual(params["headers"]["x-amz-copy-source"],"bucket/review/PH/source")
+
     def test_region_and_key_boundary(self):
         storage.require_review_key('TH','review/TH/V1/a1/video.mp4')
         for key in ['review/PH/V1/video.mp4','TH/video.mp4','review/TH/../PH/video.mp4','review/TH//a.mp4']:
