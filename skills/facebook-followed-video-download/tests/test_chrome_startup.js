@@ -52,6 +52,7 @@ function loadEngine(t, options = {}) {
         ...(options.execute ? [] : ['--dry-run'])],
     },
     require(name) {
+      if (name === './facebook_video_titles') return require('../scripts/facebook_video_titles');
       if (name === 'child_process') return processes;
       if (name === 'os') return { ...os, tmpdir: () => temporary };
       if (name === 'ws') return require('../scripts/node_modules/ws');

@@ -13,6 +13,7 @@ const os = require('os');
 const path = require('path');
 const WebSocket = require('ws');
 const { spawn, spawnSync } = require('child_process');
+const videoTitles = require('./facebook_video_titles');
 
 const HOME = process.env.HOME || os.homedir() || process.cwd();
 const HERMES_HOME = process.env.HERMES_HOME || path.join(HOME, '.hermes');
@@ -454,6 +455,7 @@ async function discoverOnPage(ws, url, stopKeys = new Set(), minimumItems = 0) {
   console.log(`  掃描: ${url}`);
   const extractExpression = discoveryExpression();
   const collected = new Set();
+  const titleCandidates = {};
   let lastCount = 0;
   let stagnantRounds = 0;
   let reachedKnownVideo = false;
@@ -474,6 +476,8 @@ async function discoverOnPage(ws, url, stopKeys = new Set(), minimumItems = 0) {
     const snapshot = JSON.parse(
       (result.result && result.result.result && result.result.result.value) || '{}'
     );
+    const captionResult = await cdpCall(ws, {id: nextCdpId(), method: 'Runtime.evaluate', params: {returnByValue: true, expression: '('+videoTitles.pageSnapshot.toString()+')(null)'}}, 10000).catch(() => null);
+    Object.assign(titleCandidates, captionResult?.result?.result?.value?.candidates || {});
     const accessText = `${snapshot.finalUrl || ''} ${snapshot.title || ''} ${snapshot.bodyText || ''}`;
     if (
       /facebook\.com\/(?:login|checkpoint|challenge|recover|two_factor)/i.test(accessText)
@@ -523,7 +527,7 @@ async function discoverOnPage(ws, url, stopKeys = new Set(), minimumItems = 0) {
   }
   return {
     urls: Array.from(collected).filter(isSupportedVideoUrl),
-    layoutUnsupported
+    layoutUnsupported, titleCandidates
   };
 }
 
@@ -782,7 +786,7 @@ function probeVideoMetadata(url) {
     '--force-ipv4', '--socket-timeout', '60', '--retries', '0', '--fragment-retries', '0', '--extractor-retries', '0',
     '--no-warnings', '--no-playlist', '--skip-download',
     '--dump-single-json', url
-  ], { encoding: 'utf8' });
+  ], { encoding: 'utf8', timeout: 75000, maxBuffer: 8*1024*1024 });
   try {
     const metadata = JSON.parse(String(result.stdout || '').trim());
     const duration = Number(metadata.duration);
@@ -790,10 +794,10 @@ function probeVideoMetadata(url) {
     return {
       durationSeconds: Number.isFinite(duration) && duration >= 0 ? Math.round(duration) : null,
       ...publishTime,
-      title: metadata.title || null
+      title: metadata.title || null, description: metadata.description || null
     };
   } catch {
-    return {};
+    return { titleError: /timed? out|timeout|HTTP Error (429|5[0-9]+)/i.test(String(result.stderr || '')) || result.error?.code === 'ETIMEDOUT' ? 'NETWORK_ERROR' : 'EXTRACTION_FAILED' };
   }
 }
 
@@ -804,6 +808,7 @@ function completedVideoResult(item, downloadedPath) {
   item.fileSize = stat.size;
   item.sha256 = sha256File(downloadedPath);
   item.status = 'downloaded';
+  item.downloadCompletedAt = new Date().toISOString();
   return item;
 }
 
@@ -816,7 +821,7 @@ function classifyDownloadError(output) {
 function persistStatistics(item) {
   if (!dryRun) item.statistics = {
     attemptId: crypto.randomBytes(16).toString('hex'),
-    occurredAt: new Date().toISOString(),
+    occurredAt: item.downloadCompletedAt || new Date().toISOString(),
     outcome: item.cacheHit ? 'CACHE' : ({ downloaded: 'SUCCESS', 'download-failed': 'FAILURE',
       'archived-existing': 'DUPLICATE', 'filtered-duration': 'FILTERED' }[item.status] || 'FAILURE'),
   };
@@ -854,7 +859,8 @@ function downloadVideo(account, url, outputDir, archivePath) {
   item.durationSeconds = metadata.durationSeconds === undefined ? null : metadata.durationSeconds;
   item.publishedAt = metadata.publishedAt === undefined ? null : metadata.publishedAt;
   item.publishedAtPrecision = metadata.publishedAtPrecision === undefined ? null : metadata.publishedAtPrecision;
-  item.title = metadata.title === undefined ? null : metadata.title;
+  Object.assign(item, videoTitles.choose(metadata));
+  item.description = metadata.description || null;
   if (maxDurationSeconds && item.durationSeconds !== null && item.durationSeconds > maxDurationSeconds) {
     appendArchiveOnce(archivePath, url);
     item.status = 'filtered-duration';
@@ -884,6 +890,7 @@ function downloadVideo(account, url, outputDir, archivePath) {
     '-f', 'hd/best',
     '--merge-output-format', 'mp4',
     '--print', 'after_move:__HERMES_FILE__:%(filepath)s',
+    '--print', 'after_move:__HERMES_META__:%(.{title,description})j',
     '-o', path.join(outputDir, '%(upload_date)s_%(id)s_%(title).120B.%(ext)s'),
     url
   );
@@ -891,6 +898,10 @@ function downloadVideo(account, url, outputDir, archivePath) {
   const output = `${result.stdout || ''}${result.stderr || ''}`.trim();
   const downloadedPath = findDownloadedFile(outputDir, item.platformVideoId, output);
   if ((result.status === 0 || output.includes('100%')) && downloadedPath) {
+    const line = String(result.stdout || '').split(/\r?\n/).find(v => v.startsWith('__HERMES_META__:'));
+    if (line) { try { const final = JSON.parse(line.slice('__HERMES_META__:'.length));
+      const selected = videoTitles.choose(final); if (selected.title) Object.assign(item, selected);
+    } catch {} }
     appendArchiveOnce(archivePath, url);
     console.log('    完成');
     return completedVideoResult(item, downloadedPath);
@@ -1009,7 +1020,47 @@ function createTemporaryProfile() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'hermes_facebook_followed_'));
 }
 
+
+async function resolveVideoTitle(ws, url, metadata = {}) {
+  const initial = videoTitles.choose(metadata); if(initial.title) return initial;
+  try {
+    await cdpCall(ws, {id:nextCdpId(),method:'Page.navigate',params:{url}},10000);
+    await sleep(3500);
+    let last = {};
+    for(let attempt=0;attempt<3;attempt++) {
+      const result=await cdpCall(ws,{id:nextCdpId(),method:'Runtime.evaluate',params:{returnByValue:true,
+        expression:'('+videoTitles.pageSnapshot.toString()+')('+JSON.stringify(videoKey(url))+')'}},10000);
+      last=result?.result?.result?.value || {};
+      if(last.blocked) return {title:null,titleSource:'NONE',titleStatus:'ACCESS_REQUIRED'};
+      const selected=videoTitles.choose({},{...(last.candidates?.[videoKey(url)] || {}),...(last.matched?last:{})});
+      if(selected.title || selected.titleStatus==='NO_TEXT') return selected;
+      if(attempt<2) await sleep(2500);
+    }
+    return {title:null,titleSource:'NONE',titleStatus:'EXTRACTION_FAILED'};
+  } catch(e) {return {title:null,titleSource:'NONE',titleStatus:/timeout|timed out/i.test(String(e))?'NETWORK_ERROR':'EXTRACTION_FAILED'};}
+}
+async function metadataOnly() {
+  const input=JSON.parse(fs.readFileSync(argValue('--metadata-only-json'),'utf8'));
+  const parsedUrl=new URL(input.originalUrl);
+  if(!['https:','http:'].includes(parsedUrl.protocol) || !/^(?:(?:www|m|web)\.)?facebook\.com$|^(?:www\.)?fb\.watch$/.test(parsedUrl.hostname) || !isSupportedVideoUrl(input.originalUrl)) throw new Error('Unsupported metadata video URL');
+  let result=videoTitles.choose(input.metadata || {});
+  if(!result.title) {
+    const metadata=probeVideoMetadata(input.originalUrl);result=videoTitles.choose(metadata);
+    if(!result.title) {
+      const profile=browserProfileDir || createTemporaryProfile();let browser;
+      try {browser=await startBrowser(profile,assertChromeAvailable(chromePath));
+        process.once('SIGTERM',async()=>{browser.ws.close();await stopChrome(browser.chrome);process.exit(143);});
+        await injectCookies(browser.ws);
+        result=await resolveVideoTitle(browser.ws,input.originalUrl,{});
+        if(!result.title && result.titleStatus==='EXTRACTION_FAILED' && metadata.titleError==='NETWORK_ERROR') result.titleStatus='NETWORK_ERROR';
+      } finally {if(browser) {browser.ws.close();await stopChrome(browser.chrome);}if(!browserProfileDir) fs.rmSync(profile,{recursive:true,force:true});}
+    }
+  }
+  const target=argValue('--title-output');fs.writeFileSync(target+'.next',JSON.stringify(result),{mode:0o600});fs.renameSync(target+'.next',target);
+}
+
 async function main() {
+  if(hasFlag('--metadata-only-json')) return metadataOnly();
   if (!fs.existsSync(accountsFile)) throw new Error(`Missing accounts file: ${accountsFile}`);
   const executable = assertChromeAvailable(chromePath);
   if (!dryRun) assertRunnable(ytdlpPath, 'yt-dlp');
@@ -1046,6 +1097,7 @@ async function main() {
       const existingKeys = readArchiveKeys(archivePath, path.join(outputDir, '.yt-dlp-archive.txt'));
       const discovered = new Set();
       const discoveredPages = [];
+      const titleCandidates = {};
       const scanErrors = [];
       let layoutUnsupported = false;
       const firstDailyRun = mode === 'daily' && existingKeys.size === 0;
@@ -1060,6 +1112,7 @@ async function main() {
             firstDailyRun ? firstRunLimit : 0
           );
           discoveredPages.push(discovery.urls);
+          Object.assign(titleCandidates, discovery.titleCandidates || {});
           discovery.urls.forEach(videoUrl => discovered.add(videoUrl));
           layoutUnsupported = layoutUnsupported || discovery.layoutUnsupported;
         } catch (err) {
@@ -1098,6 +1151,10 @@ async function main() {
       for (const videoUrl of selected) {
         console.log(`  下載: ${videoUrl}`);
         const item = downloadVideo(account, videoUrl, outputDir, archivePath);
+        if (item.status === 'downloaded') {
+          if (!item.title) Object.assign(item, videoTitles.choose({}, titleCandidates[item.platformVideoId] || {}));
+          if (!item.title) Object.assign(item, await resolveVideoTitle(browser.ws, videoUrl, {}));
+        }
         persistStatistics(item);
         sourceResult.videos.push(item);
         if (emitVideoResultEvents) {
@@ -1157,7 +1214,7 @@ async function main() {
 async function runMain() {
   try {
     const result = await main();
-    if (result.status === 'failed') process.exitCode = 1;
+    if (result && result.status === 'failed') process.exitCode = 1;
   } catch (err) {
     console.error(`錯誤: [${err.code || 'PIPELINE_ERROR'}] ${err.message}`);
     if (resultJsonPath) {

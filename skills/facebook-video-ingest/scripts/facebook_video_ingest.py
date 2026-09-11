@@ -340,6 +340,8 @@ def check_upload(backend: str, token: str, worker_id: str, job: dict[str, Any]) 
 
 
 def planned_upload_key(job: dict[str, Any]) -> str:
+    if job.get("objectKey"):
+        return str(job["objectKey"])
     name = str(job.get("fileName") or Path(str(job.get("localPath") or "video.mp4")).name).strip().replace("\\", "_").replace("/", "_")
     name = "".join(c if c.isalnum() or c in {"-", "_", ".", " "} else "_" for c in name)
     name = name.strip(" .")[:120] or Path(str(job.get("localPath") or "video.mp4")).name
@@ -497,6 +499,8 @@ def record_video(
     if not original_url:
         raise PipelineError("video result is missing originalUrl")
     payload = {
+        "titleSource": video.get("titleSource"),
+        "titleStatus": video.get("titleStatus"),
         "statistics": video.get("statistics"),
         "platformVideoId": video.get("platformVideoId"),
         "sourceName": video.get("source"),
@@ -1100,6 +1104,7 @@ def process_upload_job(
                     "canonicalUrl": job.get("canonicalUrl"),
                     "localPath": job.get("localPath"),
                     "fileName": job.get("fileName"),
+                    "objectKey": job.get("objectKey"),
                     "fileSize": job.get("fileSize"),
                     "sha256": job.get("fileSha256"),
                 }],
@@ -1111,7 +1116,7 @@ def process_upload_job(
     )
     command = [
         sys.executable, str(R2_SCRIPT), "--manifest", str(source_manifest),
-        "--prefix", job_r2_prefix(job), "--flatten", "--execute",
+        "--prefix", "" if job.get("objectKey") else job_r2_prefix(job), "--flatten", "--execute",
         "--execution-id", job_no, "--result-json", str(result_manifest),
     ]
     cancelled = threading.Event()

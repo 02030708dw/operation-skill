@@ -109,7 +109,10 @@ def execute(job: dict, args, pipeline, guard):
     s3 = client()
     guard()
     if job["kind"] == "UPLOAD":
-        expected = f"review/{region}/{job['videoNo']}/{job['jobNo']}/a{job['executionVersion']}/video.mp4"
+        name = job.get("fileName") or "video.mp4"
+        if "/" in name or "\\" in name or not name.endswith(".mp4"):
+            raise StorageFailure("CLAIM_KEY_MISMATCH")
+        expected = f"review/{region}/{job['videoNo']}/{job['jobNo']}/a{job['executionVersion']}/{name}"
         if expected != key:
             raise StorageFailure("CLAIM_KEY_MISMATCH")
         existing = head(s3, bucket, key, extra)

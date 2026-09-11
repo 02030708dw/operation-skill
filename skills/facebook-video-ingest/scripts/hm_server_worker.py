@@ -31,7 +31,7 @@ def validate_spec(spec: dict) -> dict:
     for key in ("dispatchId", "attempt", "slot"):
         if type(result[key]) is not int or result[key] < 1:
             raise ValueError(f"Invalid {key}")
-    if result["kind"] not in {"CAPTURE", "UPLOAD", "DELETE", "GENERATION"}:
+    if result["kind"] not in {"CAPTURE", "UPLOAD", "DELETE", "GENERATION", "TITLE"}:
         raise ValueError("Invalid server work kind")
     limit = int(os.getenv("HM_CAPTURE_SLOTS", "8")) if result["kind"] == "CAPTURE" else 1
     if result["slot"] > limit:
@@ -128,6 +128,8 @@ def launch(spec: dict) -> None:
 
 def command(spec: dict) -> list[str]:
     scripts = Path(__file__).resolve().parent
+    if spec["kind"] == "TITLE":
+        return [sys.executable, str(scripts / "hm_video_title_worker.py")]
     if spec["kind"] == "GENERATION":
         return [sys.executable, str(scripts / "hm_lottery_generation_worker.py")]
     if spec["kind"] == "DELETE":
@@ -144,7 +146,7 @@ def run(spec: dict) -> int:
     execution_root = tenant_root(spec)
     import hm_facebook_account as accounts
     config = tenant_config(spec)
-    account = accounts.account_config(config) if spec["kind"] == "CAPTURE" else None
+    account = accounts.account_config(config) if spec["kind"] in {"CAPTURE", "TITLE"} else None
     account_lock = None
     if account:
         account_lock = accounts.acquire_capture(account)
@@ -163,11 +165,11 @@ def run(spec: dict) -> int:
             account_lock.close()
             raise
     slots = [spec["slot"]]
-    if spec.get("tenant") and spec["kind"] == "CAPTURE":
+    if spec.get("tenant") and spec["kind"] in {"CAPTURE", "TITLE"}:
         slots += [slot for slot in range(1, int(os.getenv("HM_CAPTURE_SLOTS", "8")) + 1) if slot != spec["slot"]]
     slot_lock = None
     for slot in slots:
-        slot_lock = lock_file(root / "locks" / f'{spec["kind"]}-{slot}.lock')
+        slot_lock = lock_file(root / "locks" / f'{"CAPTURE" if spec["kind"] == "TITLE" else spec["kind"]}-{slot}.lock')
         if slot_lock:
             spec = dict(spec, slot=slot)
             break
