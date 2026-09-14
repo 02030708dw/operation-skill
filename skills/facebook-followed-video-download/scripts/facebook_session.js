@@ -3,6 +3,7 @@
 const fs = require('fs');
 const crypto = require('crypto');
 const engine = require('./facebook_followed_video_engine.js');
+const {closeBrowser} = require('./facebook_browser_shutdown');
 let seq = 90000;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 function totp(secret, now = Date.now()) {
@@ -94,8 +95,10 @@ async function perform(browser,input) {
 async function main() {
   const input=JSON.parse(fs.readFileSync(0,'utf8'));
   const browser=await engine.startBrowser(input.profile);
-  try {console.log(JSON.stringify(await perform(browser,input)));
-  } finally { browser.ws.close(); await engine.stopChrome(browser.chrome); }
+  let result;
+  try {result=await perform(browser,input);}
+  finally {await closeBrowser(browser);}
+  console.log(JSON.stringify(result));
 }
 if(require.main===module) main().catch(error=>{console.log(JSON.stringify({state:'COOLDOWN',reasonCode:error.code||'SESSION_CHECK_FAILED',errorType:error.name}));process.exitCode=1;});
 module.exports={totp,loginReason,waitForPage,perform};
