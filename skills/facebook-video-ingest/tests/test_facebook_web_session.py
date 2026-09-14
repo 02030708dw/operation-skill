@@ -24,7 +24,7 @@ class WebSessionTests(unittest.TestCase):
             def log_message(self,*_):pass
         server=HTTPServer(('127.0.0.1',0),Handler);threading.Thread(target=server.serve_forever,daemon=True).start()
         try:
-            for mode,cancel in [('login',False),('login',True),('browser',False),('browser',True)]:
+            for mode,cancel in [('login',False),('login',True),('browser',False),('browser',True),('cookies',False),('cookies',True)]:
                 with self.subTest(mode=mode,cancel=cancel),tempfile.TemporaryDirectory() as folder:
                     root=Path(folder);bin_dir=root/'bin';bin_dir.mkdir()
                     node=bin_dir/'node'
@@ -33,7 +33,7 @@ from pathlib import Path
 for line in sys.stdin:
  command=json.loads(line)
  if command['action']=='close':break
- if command['action']=='browser':
+ if command['action'] in ('browser','cookies'):
   print('HM_ACCOUNT_RESULT '+json.dumps({'state':'BROWSER_READY'}),flush=True)
  elif command['action']=='view':
   print('HM_BROWSER_RESULT '+json.dumps({'requestId':command['requestId'],'image':'YQ==','width':1100,'height':700}),flush=True)
@@ -51,12 +51,12 @@ for line in sys.stdin:
                     threading.Thread(target=lambda:[output.put(line) for line in process.stdout],daemon=True).start()
                     try:
                         process.stdin.write(json.dumps({'action':mode,'username':'test-user','password':'must-not-be-persisted'})+'\n');process.stdin.flush()
-                        first=json.loads(output.get(timeout=10));self.assertEqual(first['phase'],'WAITING_BROWSER' if mode=='browser' else 'WAITING_CODE')
-                        if mode=='browser':
+                        first=json.loads(output.get(timeout=10));self.assertEqual(first['phase'],'WAITING_BROWSER' if mode in ('browser','cookies') else 'WAITING_CODE')
+                        if mode in ('browser','cookies'):
                             process.stdin.write(json.dumps({'action':'view','op':'snapshot','requestId':'frame-1'})+'\n');process.stdin.flush()
                             self.assertEqual(json.loads(output.get(timeout=10))['browser']['requestId'],'frame-1')
                         self.assertEqual((profile/'Cookies').read_text(),'original-session')
-                        process.stdin.write(json.dumps({'action':'close'} if cancel else {'action':'finish'} if mode=='browser' else {'action':'code','oneTimeCode':'123456'})+'\n');process.stdin.flush()
+                        process.stdin.write(json.dumps({'action':'close'} if cancel else {'action':'finish'} if mode in ('browser','cookies') else {'action':'code','oneTimeCode':'123456'})+'\n');process.stdin.flush()
                         if not cancel:self.assertEqual(json.loads(output.get(timeout=10))['phase'],'SUCCEEDED')
                         self.assertEqual(process.wait(timeout=15),0)
                         self.assertEqual((profile/'Cookies').read_text(),'original-session' if cancel else 'verified-session')
@@ -66,7 +66,7 @@ for line in sys.stdin:
                     finally:
                         if process.poll() is None:process.terminate();process.wait(timeout=15)
                         process.stdin.close();process.stdout.close();process.stderr.close()
-            self.assertEqual(len(reports),2);self.assertEqual(reports[0]['state'],'AVAILABLE')
+            self.assertEqual(len(reports),3);self.assertEqual(reports[0]['state'],'AVAILABLE')
         finally:server.shutdown();server.server_close()
 
     def test_restart_guard_holds_all_slots_and_login_maintenance_lock(self):

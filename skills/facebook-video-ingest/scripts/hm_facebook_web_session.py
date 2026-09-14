@@ -91,9 +91,10 @@ def run(tenant):
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(InterruptedError()))
     try:
         initial = json.loads(sys.stdin.readline())
-        if initial.get('action') not in ('login', 'verify', 'browser'): raise ValueError('Invalid initial action')
-        human = initial['action'] == 'browser'
-        if initial['action'] in ('login', 'browser'):
+        if initial.get('action') not in ('login', 'verify', 'browser', 'cookies'): raise ValueError('Invalid initial action')
+        initial_action = initial['action']
+        human = initial_action == 'browser'
+        if initial['action'] in ('login', 'browser', 'cookies'):
             staging = root / ('login.' + uuid.uuid4().hex); staging.mkdir(mode=0o700)
         profile = staging or root / 'profile'; profile.mkdir(exist_ok=True, mode=0o700)
         accounts.recover_profile(profile)
@@ -131,6 +132,8 @@ def run(tenant):
                     if staging: promote(root, staging); staging = None
                     save_result(config, tenant, result)
                     emit(phase='SUCCEEDED', state='AVAILABLE', reasonCode=None); return
+                if initial_action == 'cookies' and result['state'] == 'VERIFICATION_REQUIRED' and result.get('reasonCode') != 'FACEBOOK_ACCOUNT_SUSPENDED':
+                    human = True
                 if human:
                     emit(phase='WAITING_BROWSER', reasonCode=result.get('reasonCode')); continue
                 if result['state'] == 'VERIFICATION_REQUIRED' and result.get('reasonCode') != 'FACEBOOK_ACCOUNT_SUSPENDED':
