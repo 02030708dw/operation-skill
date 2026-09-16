@@ -2,7 +2,7 @@
 name: youtube-video-downloader
 description: Download YouTube videos and Shorts locally from individual links, playlists, or channel Shorts pages, with bounded batches, resumable downloads, deduplication and JSON reports. Use for YouTube 视频下载、频道首页批量下载、Shorts 抓取; not metadata-only analytics or publishing.
 metadata:
-  version: "1.1.0"
+  version: "1.1.1"
   platforms:
     - linux
     - macos

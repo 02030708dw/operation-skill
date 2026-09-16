@@ -66,7 +66,7 @@ chmod 600 "$HOME/.config/youtube/cookies.txt"
 - `<output>/.tools/`：需要时放置 FFmpeg 入口。
 - 退出码 `0`：本次处理无下载失败（也可能全部跳过或列表为空）；`1`：下载/列表失败；`2`：参数或依赖配置错误；`130`：手动中断。
 
-安装依赖、输出目录和 Cookie 应属于实际运行任务的用户。不要将 `.venv`、媒体或 Cookie 放入托管技能目录。该技能可独立运行，尚未接入 HM 后台的任务认领、上传和执行回写接口。
+安装依赖、输出目录和 Cookie 应属于实际运行任务的用户。不要将 `.venv`、媒体或 Cookie 放入托管技能目录。该技能也可脱离 HM 独立运行。
 
 ## HM VN 后台集成
 
@@ -75,3 +75,16 @@ VN 开启 `HM_YOUTUBE_ENABLED` 并配置区域 `googleAccount` 后，由既有 `
 运营人员在后台 Google 登录弹窗内完成官方页面登录。服务器在独立 Google 账号目录保存会话，登录维护与下载互斥，并发为 1；不会读取本机 Chrome。`LOGGED_IN` 表示已验证登录，只有真实文件下载成功才标记 `AVAILABLE / PASSED`。重新登录需重新验证下载；Cookie 存在本身不构成成功证据。
 
 后台默认取频道返回的前 10 条（不是 10 条新增视频），过滤超过 20 分钟的内容，竖屏最大高度 1920。下载结果逐条回传，固定报告及每视频回执用于回传失败恢复，视频 ID 用于去重。认证或限流失败停止本轮，页面显示原因；不自动审核发布。
+
+### 经授权从独立 Chrome 资料迁移
+
+Google 拒绝服务器浏览器登录时，管理员可在用户明确同意后，从仅登录目标账号的独立 Chrome 资料导出 Google / YouTube Netscape Cookie，并通过私有传输送入 VN。不要使用含其他账号的常用资料。导出文件不能包含其他域名，权限必须为 `0600`，不进入 Git 或日志。
+
+在配置了 `HM_TENANT_CONFIG` 的 HM Worker 内，以 `hermes` 用户执行：
+
+```bash
+python /opt/data/skills/youtube-video-downloader/scripts/import_google_session.py \
+  --cookies /opt/data/private-import/google-vn.txt
+```
+
+导入命令仅接受 VN，持有区域账号维护锁，使用临时资料验证 YouTube 登录并关闭、重新打开浏览器复验。成功后替换 VN 会话，保留原资料备份；下载仍为 `NOT_TESTED`。需要验证、失败或超时会停止，原会话不被覆盖。处理完应删除传输用的临时文件；实际运行会话留在私有区域目录。

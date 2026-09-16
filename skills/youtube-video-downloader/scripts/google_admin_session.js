@@ -5,6 +5,7 @@ const shared=path.resolve(__dirname,'../../facebook-followed-video-download/scri
 const engine=require(path.join(shared,'facebook_followed_video_engine'));
 const interactive=require(path.join(shared,'facebook_interactive_browser'));
 const {closeBrowser,confirmPersistedSession}=require(path.join(shared,'facebook_browser_shutdown'));
+const {parseCookies}=require('./google_cookie_import');
 const hosts=['accounts.google.com','www.youtube.com','youtube.com','consent.youtube.com','consent.google.com'];
 let seq=940000;
 const call=(b,method,params)=>engine.cdpCall(b.ws,{id:seq++,method,params},10000);
@@ -44,7 +45,12 @@ async function main(){
      try{console.log('HM_BROWSER_RESULT '+JSON.stringify({requestId:input.requestId,...await interactive.command(browser,input,hosts)}));}
      catch(_){console.log('HM_BROWSER_RESULT '+JSON.stringify({requestId:input.requestId,error:'BROWSER_UNAVAILABLE'}));}continue;
     }
-    if(!['verify','check','finish'].includes(input.action))throw Error('INVALID_ACTION');
+    if(input.action==='cookies'){
+     try{await call(browser,'Network.setCookies',{cookies:parseCookies(input.cookies)});}
+     catch(_){emit({state:'LOGIN_REQUIRED',reasonCode:'INVALID_GOOGLE_COOKIE'});continue;}
+     finally{input.cookies=null;}
+    }
+    if(!['verify','check','finish','cookies'].includes(input.action))throw Error('INVALID_ACTION');
     let result=await inspect(browser,profile);
     if(result.state==='LOGGED_IN'){
      result=await confirmPersistedSession(browser,profile,reopened=>inspect(reopened,profile));emit(result);return;
