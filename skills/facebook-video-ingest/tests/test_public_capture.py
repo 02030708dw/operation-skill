@@ -42,6 +42,13 @@ class PublicCaptureTests(unittest.TestCase):
                 with self.assertRaises(public.Failure):public.attempt(Mock(side_effect=public.Failure(code)),{},'Facebook',[],'DOWNLOAD')
                 auth.assert_not_called()
 
+    def test_security_challenge_during_saved_session_check_stops_supplement(self):
+        config={'facebookAccount':{'key':'fb-vn'}};lease=Mock()
+        with patch.object(public.facebook,'read_state',return_value={'state':'AVAILABLE'}),patch.object(public.facebook,'acquire_capture',return_value=lease),patch.object(public.facebook,'prepare_capture',return_value={'state':'VERIFICATION_REQUIRED','reasonCode':'FACEBOOK_VERIFICATION_REQUIRED'}):
+            with self.assertRaises(public.Failure) as caught:
+                with public.authenticated_session(config,'Facebook'):self.fail('must not download')
+            self.assertEqual('VERIFICATION_REQUIRED',caught.exception.code);lease.close.assert_called_once()
+
     def test_missing_invalid_or_busy_account_is_finite(self):
         with self.assertRaisesRegex(public.Failure,'未配置'):
             with public.authenticated_session({},'Facebook'):pass

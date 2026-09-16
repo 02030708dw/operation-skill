@@ -72,7 +72,11 @@ def authenticated_session(config,platform):
     if lease is None: raise Failure('ACCOUNT_BUSY')
     try:
         verified=provider.prepare_capture(config,'vn',lease)
-        if verified.get('state')!='AVAILABLE': raise Failure('ACCOUNT_UNAVAILABLE')
+        if verified.get('state')!='AVAILABLE':
+            reason=str(verified.get('reasonCode','')).replace('FACEBOOK_','').replace('GOOGLE_','')
+            if reason in STOP:raise Failure(reason)
+            if verified.get('state')=='VERIFICATION_REQUIRED':raise Failure('VERIFICATION_REQUIRED')
+            raise Failure('ACCOUNT_UNAVAILABLE')
         yield ({'cookiefile':str(lease.profile/'youtube-cookies.txt')} if platform=='YouTube'
                else {'cookiesfrombrowser':('chrome',str(lease.profile),None,None)})
     finally: lease.close()
