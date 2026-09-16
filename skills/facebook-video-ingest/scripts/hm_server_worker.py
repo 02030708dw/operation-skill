@@ -28,8 +28,12 @@ def validate_spec(spec: dict) -> dict:
         result["tenant"] = tenant
     platform=spec.get("platform", "Facebook")
     if platform not in {"Facebook","YouTube"}:raise ValueError("Invalid capture platform")
-    if platform=="YouTube" and (tenant!="vn" or result["kind"]!="CAPTURE" or not tenant_config(result).get("googleAccount")):
+    if platform=="YouTube" and (tenant!="vn" or result["kind"]!="CAPTURE" or not (tenant_config(result).get("googleAccount") or tenant_config(result).get("capturePolicy")=="PUBLIC_FIRST")):
         raise ValueError("YouTube is not enabled for this tenant")
+    policy=tenant_config(result).get("capturePolicy","ACCOUNT_REQUIRED") if tenant else "ACCOUNT_REQUIRED"
+    if policy=="PUBLIC_FIRST" and tenant!="vn":raise ValueError("Public-first is VN only")
+    if spec.get("capturePolicy",policy)!=policy:raise ValueError("Capture policy mismatch")
+    result["capturePolicy"]=policy
     result["platform"]=platform
     if os.getenv("HM_TENANT_CONFIG"):
         tenant_config(result)  # Reject missing/unconfigured tenants before creating a script.
@@ -96,6 +100,10 @@ def worker_environment(spec: dict) -> dict:
     env["FACEBOOK_FOLLOWED_STATE_DIR"] = str(root / "slots" / str(spec["slot"]))
     env["TMPDIR"] = str(root / "slots" / str(spec["slot"]) / "tmp")
     env["FACEBOOK_FOLLOWED_REPORTS"] = str(root / "reports" / str(spec["dispatchId"]))
+    env["HM_CAPTURE_POLICY"]=config.get("capturePolicy","ACCOUNT_REQUIRED")
+    if env["HM_CAPTURE_POLICY"]=="PUBLIC_FIRST":
+        from hm_public_capture import clean_environment
+        env=clean_environment(env)
     return env
 
 
@@ -163,6 +171,11 @@ def run(spec: dict) -> int:
     config = tenant_config(spec)
     account = accounts.account_config(config) if spec["kind"] in {"CAPTURE", "TITLE"} else None
     account_lock = None
+    if config.get("capturePolicy")=="PUBLIC_FIRST":
+        account=None
+        gate=execution_root/"public-cooldown"/(spec.get("platform","Facebook")+".json")
+        if spec["kind"]=="CAPTURE" and gate.exists() and json.loads(gate.read_text()).get("until",0)>time.time():
+            os.environ.update(worker_environment(spec));status(spec,"RETRY");return 0
     if account:
         account_lock = accounts.acquire_capture(account)
         if account_lock is None:

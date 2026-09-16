@@ -146,7 +146,7 @@ function pageAccessEvidence(snapshot) {
   const gate = snapshot.gateText || '';
   const body = !(snapshot.urls || []).length && !snapshot.videoElements ? snapshot.bodyText || '' : '';
   const decision = accessEvidence(gate, 'PAGE_DIALOG') || accessEvidence(body, 'PAGE_BODY');
-  if (decision) return decision;
+  if (decision && !(process.env.HM_PUBLIC_CAPTURE === '1' && decision.code === 'FACEBOOK_LOGIN_REQUIRED' && ((snapshot.urls || []).length || snapshot.videoElements))) return decision;
   if (/try again later|something went wrong|稍后重试|出了点问题/i.test(gate || body))
     return {code:'FACEBOOK_NETWORK_ERROR', source:gate ? 'PAGE_DIALOG':'PAGE_BODY', signal:'GENERIC_RETRY'};
   return null;

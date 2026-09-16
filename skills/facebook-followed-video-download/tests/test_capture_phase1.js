@@ -118,3 +118,9 @@ test('metrics evidence rejects arbitrary values and strips extra properties',()=
  m.evidence({source:'EXTRACTOR',signal:'HTTP_429',code:'FACEBOOK_RATE_LIMITED',cookie:'secret'});
  assert.equal(m.summary().accessEvidence.length,1);assert.equal(JSON.stringify(m.summary()).includes('secret'),false);
 });
+
+test('public discovery keeps available video links despite optional login dialog', t => {
+  const {engine}=load(t,{env:{HM_PUBLIC_CAPTURE:'1'}});
+  assert.equal(engine.pageAccessEvidence({finalUrl:'https://www.facebook.com/public',gateText:'Log into Facebook',urls:['https://www.facebook.com/reel/123'],videoElements:1}),null);
+  assert.equal(engine.pageAccessEvidence({finalUrl:'https://www.facebook.com/login',urls:[]}).code,'FACEBOOK_LOGIN_REQUIRED');
+});

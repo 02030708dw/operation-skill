@@ -61,3 +61,16 @@ For server installation, credentials and concrete commands, read [server-usage.m
 Optional: `--output DIR`, `--height 720`, `--browser chrome:Default`, `--cookies FILE`, `--subtitles`, `--sub-langs 'en.*,zh.*'`, `--thumbnail`, `--ffmpeg /usr/bin/ffmpeg`.
 
 MP4/H.264/AAC are preferred with other available codecs as fallback. Reports retain only selected metadata, never raw extraction JSON or signed media URLs. Do not schedule, deploy or publish unless asked.
+
+## VN public-first server policy
+
+When the trusted regional registry sets `capturePolicy: PUBLIC_FIRST` (VN only),
+`facebook-video-ingest/scripts/hm_public_capture.py` runs public discovery/download
+without cookies or saved browser profiles. A confirmed login requirement permits
+one supplement with an already available regional account. Missing/expired/busy
+accounts end that item rather than waiting. Rate limits or security challenges
+stop the batch; they never trigger an account switch. Public success does not
+prove account login. Durable item receipts precede callbacks, and execution logs
+include anonymous/authenticated attempts and separate downloaded/skipped/failed/
+unattempted counts (unknown when source enumeration failed). Other regions and
+standalone CLI behavior remain unchanged.

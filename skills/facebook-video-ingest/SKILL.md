@@ -273,3 +273,16 @@ Read [references/backend-api.md](references/backend-api.md) before changing the 
 `archived-existing` is an informational downloader result: yt-dlp previously completed the video, its archive still contains the stable ID, and the approved upload flow may already have removed the local file. Advance progress, record the count in the execution result, and do not create a failed HM video callback.
 
 Use the HM task detail API for per-video fields and the execution-history API for progress, terminal status, error, and combined result JSON.
+
+## VN public-first server policy
+
+When the trusted regional registry sets `capturePolicy: PUBLIC_FIRST` (VN only),
+`facebook-video-ingest/scripts/hm_public_capture.py` runs public discovery/download
+without cookies or saved browser profiles. A confirmed login requirement permits
+one supplement with an already available regional account. Missing/expired/busy
+accounts end that item rather than waiting. Rate limits or security challenges
+stop the batch; they never trigger an account switch. Public success does not
+prove account login. Durable item receipts precede callbacks, and execution logs
+include anonymous/authenticated attempts and separate downloaded/skipped/failed/
+unattempted counts (unknown when source enumeration failed). Other regions and
+standalone CLI behavior remain unchanged.

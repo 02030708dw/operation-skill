@@ -1511,6 +1511,9 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
 
     if job.get("platform","Facebook") != os.getenv("HM_CAPTURE_PLATFORM","Facebook"):
         raise PipelineError("Claimed platform does not match dispatch", "PLATFORM_MISMATCH")
+    if os.getenv("HM_CAPTURE_POLICY")=="PUBLIC_FIRST":
+        from hm_public_capture import execute
+        return execute(args,job)
     if job.get("platform")=="YouTube":
         sys.path.insert(0,str(SKILLS_DIR/"youtube-video-downloader/scripts"))
         from hm_youtube_ingest import execute
