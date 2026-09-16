@@ -244,13 +244,19 @@ def video_record(item):
     path=Path(item['path']) if item.get('path') else None
     good=item['status'] in ('downloaded','skipped') and path and path.is_file()
     if item['status']=='skipped' and not good:return None
+    digest=None
+    if good:
+        hasher=hashlib.sha256()
+        with path.open('rb') as media:
+            for chunk in iter(lambda:media.read(1024*1024),b''):hasher.update(chunk)
+        digest=hasher.hexdigest()
     published=None
     if item.get('upload_date'):
         try:published=dt.datetime.strptime(item['upload_date'],'%Y%m%d').strftime('%Y-%m-%dT00:00:00')
         except ValueError:pass
     return dict(platformVideoId=item['id'],originalUrl=item['url'],canonicalUrl=item['url'],title=item.get('title') or item['id'],
         titleSource='ORIGINAL' if item.get('title') else 'NONE',titleStatus='AVAILABLE' if item.get('title') else 'PENDING',
-        localPath=str(path) if good else None,fileName=path.name if good else None,fileSize=path.stat().st_size if good else None,
+        localPath=str(path) if good else None,fileName=path.name if good else None,fileSize=path.stat().st_size if good else None,sha256=digest,
         durationSeconds=round(item['duration']) if item.get('duration') else None,publishedAt=published,
         status='downloaded' if good else 'download-failed',errorCode=None if good else 'PUBLIC_'+item.get('errorCode','DOWNLOAD_FAILED'),
         error=None if good else MESSAGES.get(item.get('errorCode'),MESSAGES['DOWNLOAD_FAILED']),attempts=item.get('attempts',[]))

@@ -11,6 +11,17 @@ import hm_public_capture as public
 import hm_server_worker as worker
 
 class PublicCaptureTests(unittest.TestCase):
+    def test_download_and_recovered_receipt_include_preview_integrity(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'video.mp4';path.write_bytes(b'preview fixture')
+            for status in ('downloaded','skipped'):
+                record=public.video_record({'id':'video','url':'https://www.youtube.com/watch?v=video','path':str(path),'status':status})
+                self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(),record['sha256'])
+                with patch.object(public.ingest,'api_call') as request:
+                    public.ingest.record_video('http://localhost','token','worker','execution',record,download_status='DOWNLOADED',upload_status='PENDING')
+                    self.assertEqual(record['sha256'],request.call_args.args[4]['fileSha256'])
+
     def test_public_never_reads_account_or_inherited_credentials(self):
         for platform in ('Facebook','YouTube'):
             attempts=[]
