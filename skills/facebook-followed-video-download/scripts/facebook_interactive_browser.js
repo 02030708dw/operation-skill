@@ -22,14 +22,14 @@ function validate(command){
  return command;
 }
 async function call(browser,method,params){return engine.cdpCall(browser.ws,{id:seq++,method,params},10000)}
-async function open(browser){
+async function open(browser,url="https://www.facebook.com/login/"){
  await call(browser,'Emulation.setDeviceMetricsOverride',{width:WIDTH,height:HEIGHT,deviceScaleFactor:1,mobile:false});
- await call(browser,'Page.navigate',{url:'https://www.facebook.com/login/'});
+ await call(browser,'Page.navigate',{url});
 }
-async function command(browser,input){
+async function command(browser,input,hosts=["www.facebook.com","facebook.com"]){
  validate(input);
  const current=await call(browser,'Runtime.evaluate',{expression:'location.hostname',returnByValue:true});
- if(!['www.facebook.com','facebook.com'].includes(current.result.result.value))throw Error('UNSUPPORTED_LOGIN_PAGE');
+ if(!hosts.includes(current.result.result.value))throw Error('UNSUPPORTED_LOGIN_PAGE');
  if(input.op==='pointer')await call(browser,'Input.dispatchMouseEvent',{type:input.event,x:input.x,y:input.y,button:input.event==='mouseMoved'?'none':'left',buttons:input.event==='mousePressed'||input.drag?1:0,clickCount:input.event==='mouseMoved'?0:1});
  else if(input.op==='scroll')await call(browser,'Input.dispatchMouseEvent',{type:'mouseWheel',x:WIDTH/2,y:HEIGHT/2,deltaX:0,deltaY:input.deltaY});
  else if(input.op==='text')await call(browser,'Input.insertText',{text:input.text});

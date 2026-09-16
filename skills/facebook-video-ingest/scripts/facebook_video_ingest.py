@@ -1465,7 +1465,7 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         return 0, result
     # Refuse to claim durable backend work when an interrupted Skill update or
     # an unsupported Node runtime would make execution fail after assignment.
-    download_runtime_check()
+    if os.getenv("HM_CAPTURE_PLATFORM") != "YouTube": download_runtime_check()
     deadline = time.monotonic() + args.wait_for_work_seconds
     while True:
         job = claim(backend, token, worker_id, args.task_no, args.execution_no)
@@ -1509,6 +1509,12 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             print(f"No queued Facebook capture execution{target}.")
         return 0, result
 
+    if job.get("platform","Facebook") != os.getenv("HM_CAPTURE_PLATFORM","Facebook"):
+        raise PipelineError("Claimed platform does not match dispatch", "PLATFORM_MISMATCH")
+    if job.get("platform")=="YouTube":
+        sys.path.insert(0,str(SKILLS_DIR/"youtube-video-downloader/scripts"))
+        from hm_youtube_ingest import execute
+        return execute(args,job)
     execution_id = str(job["executionId"])
     raw_parts: list[str] = []
     heartbeat_pump = HeartbeatPump(

@@ -67,3 +67,11 @@ chmod 600 "$HOME/.config/youtube/cookies.txt"
 - 退出码 `0`：本次处理无下载失败（也可能全部跳过或列表为空）；`1`：下载/列表失败；`2`：参数或依赖配置错误；`130`：手动中断。
 
 安装依赖、输出目录和 Cookie 应属于实际运行任务的用户。不要将 `.venv`、媒体或 Cookie 放入托管技能目录。该技能可独立运行，尚未接入 HM 后台的任务认领、上传和执行回写接口。
+
+## HM VN 后台集成
+
+VN 开启 `HM_YOUTUBE_ENABLED` 并配置区域 `googleAccount` 后，由既有 `hm_server_worker.py` 领取 YouTube 任务。HM 适配器为 `scripts/hm_youtube_ingest.py`；依赖同一发布包中的 `facebook-video-ingest` 回传协议和浏览器公共模块。
+
+运营人员在后台 Google 登录弹窗内完成官方页面登录。服务器在独立 Google 账号目录保存会话，登录维护与下载互斥，并发为 1；不会读取本机 Chrome。`LOGGED_IN` 表示已验证登录，只有真实文件下载成功才标记 `AVAILABLE / PASSED`。重新登录需重新验证下载；Cookie 存在本身不构成成功证据。
+
+后台默认取频道返回的前 10 条（不是 10 条新增视频），过滤超过 20 分钟的内容，竖屏最大高度 1920。下载结果逐条回传，固定报告及每视频回执用于回传失败恢复，视频 ID 用于去重。认证或限流失败停止本轮，页面显示原因；不自动审核发布。

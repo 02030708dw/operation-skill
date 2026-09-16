@@ -26,6 +26,11 @@ def validate_spec(spec: dict) -> dict:
         if tenant not in {"ph", "th", "vn", "id"}:
             raise ValueError("Invalid execution tenant")
         result["tenant"] = tenant
+    platform=spec.get("platform", "Facebook")
+    if platform not in {"Facebook","YouTube"}:raise ValueError("Invalid capture platform")
+    if platform=="YouTube" and (tenant!="vn" or result["kind"]!="CAPTURE" or not tenant_config(result).get("googleAccount")):
+        raise ValueError("YouTube is not enabled for this tenant")
+    result["platform"]=platform
     if os.getenv("HM_TENANT_CONFIG"):
         tenant_config(result)  # Reject missing/unconfigured tenants before creating a script.
     for key in ("dispatchId", "attempt", "slot"):
@@ -81,6 +86,8 @@ def worker_environment(spec: dict) -> dict:
         env["HM_REVIEW_KEY_FILE"] = config["reviewKeyFile"]
     env["HM_SERVER_COMPONENT"] = spec["kind"]
     env["HM_CAPTURE_TENANT"] = spec.get("tenant", "")
+    env["HM_CAPTURE_PLATFORM"] = spec.get("platform", "Facebook")
+    env.pop("HM_GOOGLE_COOKIES", None)
     account = config.get("facebookAccount")
     env.pop("HM_FACEBOOK_ACCOUNT_STATE", None)
     if account:
@@ -150,6 +157,9 @@ def run(spec: dict) -> int:
     root = state_root()
     execution_root = tenant_root(spec)
     import hm_facebook_account as accounts
+    if spec.get("platform")=="YouTube":
+        sys.path.insert(0,str(Path(__file__).resolve().parents[2]/"youtube-video-downloader/scripts"))
+        import hm_google_account as accounts
     config = tenant_config(spec)
     account = accounts.account_config(config) if spec["kind"] in {"CAPTURE", "TITLE"} else None
     account_lock = None
@@ -180,7 +190,8 @@ def run(spec: dict) -> int:
             break
     environment = worker_environment(spec)
     if account:
-        environment["HM_FACEBOOK_PROFILE"] = str(account_lock.profile)
+        if spec.get("platform")=="YouTube": environment["HM_GOOGLE_COOKIES"]=str(account_lock.profile/"youtube-cookies.txt")
+        else: environment["HM_FACEBOOK_PROFILE"] = str(account_lock.profile)
     Path(environment["TMPDIR"]).mkdir(parents=True, exist_ok=True)
     # The runner's status callbacks and the child use the same trusted registry.
     if spec.get("tenant"):

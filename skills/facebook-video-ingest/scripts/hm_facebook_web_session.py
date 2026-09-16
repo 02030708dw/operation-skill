@@ -37,6 +37,16 @@ def maintenance_locks():
                 handle = accounts.acquire(account)
                 if handle is None: raise RuntimeError('Busy')
                 handles.append(handle)
+        sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'youtube-video-downloader/scripts'))
+        try: import hm_google_account as google
+        except ImportError: google=None
+        if google:
+            for config in json.loads(Path(os.environ['HM_TENANT_CONFIG']).read_text()).values():
+                account=google.account_config(config)
+                if account:
+                    handle=google.acquire(account)
+                    if handle is None:raise RuntimeError('Busy')
+                    handles.append(handle)
         return handles
     except Exception:
         for handle in handles: handle.close()
@@ -60,6 +70,7 @@ def promote(root, staging):
 
 
 def save_result(config, tenant, result):
+    if hasattr(accounts, 'save_result'): return accounts.save_result(config, tenant, result)
     account = accounts.account_config(config); root = accounts.account_root(account)
     old = accounts.read_state(account)
     current = dict(state=result['state'], reasonCode=result.get('reasonCode'),
@@ -98,7 +109,7 @@ def run(tenant):
             staging = root / ('login.' + uuid.uuid4().hex); staging.mkdir(mode=0o700)
         profile = staging or root / 'profile'; profile.mkdir(exist_ok=True, mode=0o700)
         accounts.recover_profile(profile)
-        script = Path(__file__).resolve().parents[2] / 'facebook-followed-video-download/scripts/facebook_admin_session.js'
+        script = Path(__file__).resolve().parents[2] / ('youtube-video-downloader/scripts/google_admin_session.js' if accounts.__name__=='hm_google_account' else 'facebook-followed-video-download/scripts/facebook_admin_session.js')
         child = subprocess.Popen(['node', str(script), str(profile)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.DEVNULL, text=True, bufsize=1, start_new_session=True)
         child.stdin.write(json.dumps(initial) + '\n'); child.stdin.flush(); initial = None
@@ -127,11 +138,11 @@ def run(tenant):
                 result = json.loads(line.removeprefix('HM_ACCOUNT_RESULT '))
                 if result['state'] == 'BROWSER_READY':
                     emit(phase='WAITING_BROWSER', reasonCode=None); continue
-                if result['state'] == 'AVAILABLE':
+                if result['state'] in ('AVAILABLE','LOGGED_IN'):
                     stop_child()
                     if staging: promote(root, staging); staging = None
                     save_result(config, tenant, result)
-                    emit(phase='SUCCEEDED', state='AVAILABLE', reasonCode=None); return
+                    emit(phase='SUCCEEDED', state=result['state'], reasonCode=None); return
                 if initial_action == 'cookies' and result['state'] == 'VERIFICATION_REQUIRED' and result.get('reasonCode') != 'FACEBOOK_ACCOUNT_SUSPENDED':
                     human = True
                 if human:
@@ -153,6 +164,11 @@ def run(tenant):
 
 
 if __name__ == '__main__':
+    if len(sys.argv)==3 and sys.argv[2]=='google':
+        if sys.argv[1]!='vn':raise SystemExit(2)
+        sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'youtube-video-downloader/scripts'))
+        import hm_google_account as accounts
+        run(sys.argv[1]);raise SystemExit(0)
     if sys.argv[1:] == ['busy']: emit(busy=busy())
     elif sys.argv[1:] == ['restart-guard']:
         handles = maintenance_locks()

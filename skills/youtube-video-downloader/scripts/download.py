@@ -111,6 +111,8 @@ def main():
     parser.add_argument("--subtitles", action="store_true")
     parser.add_argument("--sub-langs", default="en.*,zh.*")
     parser.add_argument("--thumbnail", action="store_true")
+    parser.add_argument("--report", type=Path, help="持久化报告路径（服务器恢复用）")
+    parser.add_argument("--max-duration-seconds", type=int, default=0)
     parser.add_argument("--ffmpeg", help="服务器 FFmpeg 可执行文件路径；默认优先使用 PATH")
     args = parser.parse_args()
     if args.height < 1 or args.limit < 1:
@@ -154,7 +156,9 @@ def main():
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     reports = output / ".reports"
     reports.mkdir(exist_ok=True)
-    report_path = reports / (stamp + ".json")
+    report_path = args.report.resolve() if args.report else reports / (stamp + ".json")
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    receipts=output / ".items"; receipts.mkdir(exist_ok=True)
     report = {"source": url, "mode": "list" if args.list_only else "download", "started_at": stamp,
               "scope": 1 if single else ("all" if args.all else args.limit), "output": str(output), "results": []}
     entries = [{"id": single, "title": None}] if single else []
@@ -200,9 +204,10 @@ def main():
             path = Path(info["filepath"])
             if not path.is_file() or not path.stat().st_size:
                 raise yt_dlp.utils.PostProcessingError("输出文件为空或不存在")
-            captured.append({"id": info["id"], "title": info.get("title"), "path": str(path),
+            captured.append({"upload_date":info.get("upload_date"), "id": info["id"], "title": info.get("title"), "path": str(path),
                              "bytes": path.stat().st_size, "duration": info.get("duration"),
                              "width": info.get("width"), "height": info.get("height")})
+            save(receipts / (info["id"] + ".json"), captured[-1])
             return [], info
 
     attempted = 0
@@ -210,13 +215,20 @@ def main():
         ydl.add_post_processor(CaptureFile(ydl), when="after_move")
         for item in entries:
             if not args.redownload and "youtube " + item["id"] in completed:
-                report["results"].append(dict(item, status="skipped"))
+                receipt=receipts / (item["id"] + ".json")
+                previous=json.loads(receipt.read_text()) if receipt.is_file() else item
+                report["results"].append(dict(previous, status="skipped"))
+                save(report_path, report)
                 continue
             if attempted:
                 time.sleep(5)
             attempted += 1
             captured.clear()
             try:
+                if args.max_duration_seconds:
+                    info=ydl.extract_info("https://www.youtube.com/watch?v=" + item["id"], download=False)
+                    if (info.get("duration") or 0)>args.max_duration_seconds:
+                        report["results"].append(dict(item,status="filtered-duration"));save(report_path,report);continue
                 ydl.extract_info("https://www.youtube.com/watch?v=" + item["id"], download=True)
                 if not captured:
                     raise yt_dlp.utils.DownloadError("未生成可验证的视频文件")
@@ -229,7 +241,7 @@ def main():
             if record.get("kind") in {"authentication_required", "rate_limited"}:
                 report["stopped_reason"] = record["kind"]
                 break
-    report["counts"] = {key: sum(r["status"] == key for r in report["results"]) for key in ("downloaded", "skipped", "failed")}
+    report["counts"] = {key: sum(r["status"] == key for r in report["results"]) for key in ("downloaded", "skipped", "failed", "filtered-duration")}
     report["counts"]["unattempted"] = len(entries) - len(report["results"])
     report["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
     save(report_path, report)
