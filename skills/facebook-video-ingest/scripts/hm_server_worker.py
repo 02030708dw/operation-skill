@@ -80,6 +80,11 @@ def worker_environment(spec: dict) -> dict:
     if config.get("reviewKeyFile"):
         env["HM_REVIEW_KEY_FILE"] = config["reviewKeyFile"]
     env["HM_SERVER_COMPONENT"] = spec["kind"]
+    env["HM_CAPTURE_TENANT"] = spec.get("tenant", "")
+    account = config.get("facebookAccount")
+    env.pop("HM_FACEBOOK_ACCOUNT_STATE", None)
+    if account:
+        env["HM_FACEBOOK_ACCOUNT_STATE"] = str(Path(os.getenv("HM_FACEBOOK_ACCOUNT_ROOT", "/opt/data/facebook-accounts")) / account["key"] / "state.json")
     # This isolates both the downloader's global lock and its persistent browser profile.
     env["FACEBOOK_FOLLOWED_STATE_DIR"] = str(root / "slots" / str(spec["slot"]))
     env["TMPDIR"] = str(root / "slots" / str(spec["slot"]) / "tmp")

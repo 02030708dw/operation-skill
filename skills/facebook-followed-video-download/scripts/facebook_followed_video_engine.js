@@ -22,7 +22,7 @@ const DEFAULT_COOKIES = process.env.FACEBOOK_FOLLOWED_COOKIES || process.env.FB_
 const DEFAULT_DESKTOP = process.env.FACEBOOK_FOLLOWED_OUTPUT || process.env.FB_FOLLOWED_DESKTOP || path.join(HOME, 'Desktop', 'Facebook');
 const DEFAULT_YTDLP = process.env.FACEBOOK_FOLLOWED_YTDLP || process.env.FB_FOLLOWED_YTDLP || process.env.YTDLP || 'yt-dlp';
 const CONFIGURED_CDP_PORT = Number(process.env.FACEBOOK_FOLLOWED_CDP_PORT || process.env.FB_CDP_PORT || '0');
-const SKILL_VERSION = '1.7.3';
+const SKILL_VERSION = '1.8.0';
 const VIDEO_RESULT_EVENT_PREFIX = '__HM_VIDEO_RESULT__:';
 const ERROR_CODES = {
   CHROME_START: 'CHROME_CDP_START_FAILED',
@@ -87,6 +87,81 @@ const resultJsonPath = argValue('--result-json', '');
 const browserProfileDir = argValue('--browser-profile', '');
 const emitVideoResultEvents = process.env.HM_VIDEO_RESULT_EVENTS === '1';
 let cdpId = 10;
+
+const metrics = require('./capture_observability').createMetrics(resultJsonPath);
+let stoppedCode = null;
+const ACCOUNT_STOPS = new Set(['FACEBOOK_RATE_LIMITED', 'FACEBOOK_LOGIN_REQUIRED',
+  'FACEBOOK_VERIFICATION_REQUIRED', 'FACEBOOK_ACCOUNT_SUSPENDED']);
+function assertAccess() {
+  if (stoppedCode) throw codedError(stoppedCode, 'Facebook account access paused');
+  const statePath = process.env.HM_FACEBOOK_ACCOUNT_STATE;
+  if (!statePath) return;
+  let state;
+  try { state = JSON.parse(fs.readFileSync(statePath, 'utf8')); }
+  catch { throw codedError('FACEBOOK_LOGIN_REQUIRED', 'Account state unavailable'); }
+  if (state.state !== 'AVAILABLE') {
+    const code = ACCOUNT_STOPS.has(state.reasonCode) ? state.reasonCode :
+      ({COOLDOWN:'FACEBOOK_RATE_LIMITED',VERIFICATION_REQUIRED:'FACEBOOK_VERIFICATION_REQUIRED'}[state.state] || 'FACEBOOK_LOGIN_REQUIRED');
+    throw codedError(code, 'Facebook account access paused');
+  }
+}
+function stopAccount(code, output = '') {
+  if (!ACCOUNT_STOPS.has(code)) return;
+  if (stoppedCode) return;
+  stoppedCode = code;
+  metrics.record('account_stop', 'failure', 0, code);
+  if (process.env.HM_FACEBOOK_ACCOUNT_STATE) {
+    const match = String(output).match(/retry-after\s*:\s*(\d+)/i);
+    const helper = path.resolve(__dirname, '../../facebook-video-ingest/scripts/hm_capture_restriction.py');
+    const result = spawnSync(process.env.HM_PYTHON || 'python3', [helper], {
+      input: JSON.stringify({code, retrySeconds: match ? Number(match[1]) : 1800}),
+      encoding:'utf8', timeout:20000
+    });
+    if (result.status !== 0) metrics.record('account_stop_persist', 'failure', 0, 'ACCOUNT_STATE_WRITE_FAILED');
+  }
+}
+function accessCode(text) {
+  if (/account (?:has been )?(?:suspended|disabled)|we suspended your account/i.test(text)) return 'FACEBOOK_ACCOUNT_SUSPENDED';
+  if (/HTTP(?: Error)? 429|too many requests|temporarily blocked|try again later|rate.limit|暂时被封锁|操作过于频繁/i.test(text)) return 'FACEBOOK_RATE_LIMITED';
+  if (/checkpoint|challenge|two_factor|confirm your identity|security check|verification required|驗證你的身份|確認你的身分|验证你的身份/i.test(text)) return 'FACEBOOK_VERIFICATION_REQUIRED';
+  if (/facebook\.com\/(?:login|recover)|login required|login to continue|log in to continue|log into facebook|only available for registered users|請登入|登录以继续/i.test(text)) return 'FACEBOOK_LOGIN_REQUIRED';
+  return null;
+}
+function assertPageAccess(text) {
+  const code = accessCode(text);
+  if (code) { stopAccount(code); throw codedError(code, 'Facebook requires account attention'); }
+}
+async function cdpCall(ws, msg, timeoutMs = 20000) {
+  const stage = msg.method === 'Page.navigate' ? 'navigation' : msg.method === 'Page.reload' ? 'refresh' :
+    msg.method === 'Runtime.evaluate' && (msg.params?.expression || '').includes('window.scrollTo') ? 'scroll' : null;
+  if (!stage) return rawCdpCall(ws, msg, timeoutMs);
+  assertAccess();
+  return metrics.asyncCall(stage, () => rawCdpCall(ws, msg, timeoutMs));
+}
+function metadataCachePath(outputDir, id) {
+  return path.join(outputDir, '.hm-metadata', crypto.createHash('sha256').update(id).digest('hex')+'.json');
+}
+function readCachedVideo(outputDir, item, localPath) {
+  try {
+    const cached = JSON.parse(fs.readFileSync(metadataCachePath(outputDir, item.platformVideoId), 'utf8'));
+    if (cached.platformVideoId !== item.platformVideoId) return null;
+    if (cached.sha256 && (fs.statSync(localPath).size !== cached.fileSize || sha256File(localPath) !== cached.sha256))
+      throw codedError('LOCAL_MEDIA_INTEGRITY_FAILED', 'Local video no longer matches its verified copy');
+    if (!cached.title || !Number.isFinite(cached.durationSeconds) || !cached.publishedAt || !cached.sha256) return null;
+    return cached;
+  } catch (error) { if (error.code === 'LOCAL_MEDIA_INTEGRITY_FAILED') throw error; return null; }
+}
+function cacheVideo(outputDir, item) {
+  if (item.status !== 'downloaded') return;
+  const target = metadataCachePath(outputDir, item.platformVideoId);
+  fs.mkdirSync(path.dirname(target), {recursive:true,mode:0o700});
+  const next = target+'.'+process.pid+'.next';
+  // Whitelist media metadata only. Never serialize extractor responses/session data.
+  const cached = {};
+  for (const key of ['platformVideoId','title','titleSource','titleStatus','description','durationSeconds',
+    'publishedAt','publishedAtPrecision','fileSize','sha256']) cached[key] = item[key];
+  fs.writeFileSync(next, JSON.stringify(cached), {mode:0o600}); fs.renameSync(next,target);
+}
 
 function nextCdpId() {
   cdpId += 1;
@@ -285,7 +360,7 @@ async function waitForChrome(chrome, profile, stderrChunks, startupError = () =>
   );
 }
 
-async function cdpCall(ws, msg, timeoutMs = 20000) {
+async function rawCdpCall(ws, msg, timeoutMs = 20000) {
   return new Promise((resolve, reject) => {
     let timer;
     const cleanup = () => {
@@ -444,6 +519,7 @@ function discoveryExpression() {
         urls: Array.from(found).slice(0, 2000),
         finalUrl: location.href,
         title: String(document.title || '').slice(0, 500),
+        gateText: Array.from(document.querySelectorAll('[role="dialog"],[role="alert"],h1')).map(node => String(node.innerText || '')).join(' ').slice(0, 6000),
         bodyText: String(document.body ? document.body.innerText : '').slice(0, 6000),
         videoElements: document.querySelectorAll('video').length
       });
@@ -478,16 +554,9 @@ async function discoverOnPage(ws, url, stopKeys = new Set(), minimumItems = 0) {
     );
     const captionResult = await cdpCall(ws, {id: nextCdpId(), method: 'Runtime.evaluate', params: {returnByValue: true, expression: '('+videoTitles.pageSnapshot.toString()+')(null)'}}, 10000).catch(() => null);
     Object.assign(titleCandidates, captionResult?.result?.result?.value?.candidates || {});
-    const accessText = `${snapshot.finalUrl || ''} ${snapshot.title || ''} ${snapshot.bodyText || ''}`;
-    if (
-      /facebook\.com\/(?:login|checkpoint|challenge|recover|two_factor)/i.test(accessText)
-      || /(?:log in to continue|login to continue|confirm your identity|security check|temporarily blocked|請登入|登录以继续|確認你的身分|验证你的身份)/i.test(accessText)
-    ) {
-      throw codedError(
-        ERROR_CODES.ACCESS_REQUIRED,
-        'Facebook requires login, verification, or an access check for this page'
-      );
-    }
+    // Captions in a healthy feed are content, not account diagnostics.
+    const accessText = `${snapshot.finalUrl || ''} ${snapshot.gateText || ''} ${!(snapshot.urls || []).length ? snapshot.bodyText || '' : ''}`;
+    assertPageAccess(accessText);
     if (Number(snapshot.videoElements || 0) > 0 && !(snapshot.urls || []).length) {
       layoutUnsupported = true;
     }
@@ -508,12 +577,13 @@ async function discoverOnPage(ws, url, stopKeys = new Set(), minimumItems = 0) {
 
   try {
     await cdpCall(ws, { id: nextCdpId(), method: 'Page.navigate', params: { url } }, 8000);
-  } catch {
+  } catch (error) {
+    if (ACCOUNT_STOPS.has(error.code)) throw error;
     console.log('    導航較慢，繼續等待頁面內容');
   }
   await sleep(2500);
-  await cdpCall(ws, { id: nextCdpId(), method: 'Page.reload' }, 8000).catch(() => {});
-  await sleep(10000);
+  // Navigation already starts loading the page; a fixed refresh duplicates requests.
+  await sleep(7500);
   await collectVisibleLinks();
   for (let i = 0; i < scrollRounds; i++) {
     if (reachedKnownVideo || (minimumItems > 0 && collected.size >= minimumItems) || stagnantRounds >= 3) break;
@@ -521,7 +591,7 @@ async function discoverOnPage(ws, url, stopKeys = new Set(), minimumItems = 0) {
       id: nextCdpId(),
       method: 'Runtime.evaluate',
       params: { expression: 'window.scrollTo(0, document.body.scrollHeight); document.body.scrollHeight', returnByValue: true }
-    }, 10000).catch(() => {});
+    }, 10000).catch(error => { if (ACCOUNT_STOPS.has(error.code)) throw error; });
     await sleep(waitMs);
     await collectVisibleLinks();
   }
@@ -781,14 +851,19 @@ function publishedAtFromMetadata(metadata = {}) {
 
 function probeVideoMetadata(url) {
   if (dryRun) return {};
+  assertAccess();
+  const started = Date.now();
   const result = spawnSync(ytdlpPath, [
     ...ytdlpSessionArgs(),
     '--force-ipv4', '--socket-timeout', '60', '--retries', '0', '--fragment-retries', '0', '--extractor-retries', '0',
     '--no-warnings', '--no-playlist', '--skip-download',
     '--dump-single-json', url
   ], { encoding: 'utf8', timeout: 75000, maxBuffer: 8*1024*1024 });
+  const restriction = accessCode(String(result.stderr || ''));
+  if (restriction) { metrics.record('metadata', 'failure', Date.now()-started, restriction); stopAccount(restriction, result.stderr); throw codedError(restriction, 'Metadata access restricted'); }
   try {
     const metadata = JSON.parse(String(result.stdout || '').trim());
+    metrics.record('metadata', 'success', Date.now()-started);
     const duration = Number(metadata.duration);
     const publishTime = publishedAtFromMetadata(metadata);
     return {
@@ -797,7 +872,8 @@ function probeVideoMetadata(url) {
       title: metadata.title || null, description: metadata.description || null
     };
   } catch {
-    return { titleError: /timed? out|timeout|HTTP Error (429|5[0-9]+)/i.test(String(result.stderr || '')) || result.error?.code === 'ETIMEDOUT' ? 'NETWORK_ERROR' : 'EXTRACTION_FAILED' };
+    metrics.record('metadata', 'failure', Date.now()-started, classifyDownloadError(String(result.stderr || '')));
+    return { titleError: /timed? out|timeout|HTTP Error (5[0-9]+)/i.test(String(result.stderr || '')) || result.error?.code === 'ETIMEDOUT' ? 'NETWORK_ERROR' : 'EXTRACTION_FAILED' };
   }
 }
 
@@ -813,8 +889,11 @@ function completedVideoResult(item, downloadedPath) {
 }
 
 function classifyDownloadError(output) {
-  if (/only available for registered users|login required|log in|checkpoint|verification|HTTP Error 403/i.test(output)) return 'FACEBOOK_ACCESS_REQUIRED';
-  if (/timed? out|timeout|connection reset|connection refused|temporary failure|HTTP Error (429|5[0-9][0-9])|unable to download.*network/i.test(output)) return 'FACEBOOK_NETWORK_ERROR';
+  const restriction = accessCode(output);
+  if (restriction) return restriction;
+  // A single private/removed video or CDN 403 is not proof of an account restriction.
+  if (/HTTP Error 403|not available|private video|removed/i.test(output)) return 'FACEBOOK_ACCESS_REQUIRED';
+  if (/timed? out|timeout|connection reset|connection refused|temporary failure|HTTP Error 5[0-9][0-9]|unable to download.*network/i.test(output)) return 'FACEBOOK_NETWORK_ERROR';
   return 'FACEBOOK_DOWNLOAD_UNSUPPORTED';
 }
 
@@ -843,6 +922,14 @@ function persistStatistics(item) {
 }
 
 function downloadVideo(account, url, outputDir, archivePath) {
+  try { return downloadVideoImpl(account, url, outputDir, archivePath); }
+  catch (error) {
+    if (!ACCOUNT_STOPS.has(error.code) && error.code !== 'LOCAL_MEDIA_INTEGRITY_FAILED') throw error;
+    stopAccount(error.code);
+    return {...baseVideoResult(account, url), status:'download-failed', errorCode:error.code, error:error.code === 'LOCAL_MEDIA_INTEGRITY_FAILED' ? 'Local video integrity check failed' : 'Account access paused'};
+  }
+}
+function downloadVideoImpl(account, url, outputDir, archivePath) {
   const item = baseVideoResult(account, url);
   if (dryRun) {
     console.log(`  DRY-RUN: ${url}`);
@@ -852,8 +939,22 @@ function downloadVideo(account, url, outputDir, archivePath) {
   const existing = existingVideoState(outputDir, url, item.platformVideoId);
   if (existing && existing.status === 'archived-existing') {
     item.status = 'archived-existing';
+    metrics.record('duplicate_skip', 'count');
     console.log('    跳過: 已在下載歸檔中，本地檔案已清理');
     return item;
+  }
+  if (existing?.status === 'local-existing') {
+    const cached = readCachedVideo(outputDir, item, existing.localPath);
+    if (cached) {
+      Object.assign(item, cached); item.cacheHit = true;
+      metrics.record('cache_hit', 'count');
+      if (maxDurationSeconds && cached.durationSeconds > maxDurationSeconds) {
+        item.status='filtered-duration'; item.cacheHit=false;
+        metrics.record('duration_filtered', 'count'); return item;
+      }
+      appendArchiveOnce(archivePath, url);
+      return completedVideoResult(item, existing.localPath);
+    }
   }
   const metadata = probeVideoMetadata(url);
   item.durationSeconds = metadata.durationSeconds === undefined ? null : metadata.durationSeconds;
@@ -864,6 +965,7 @@ function downloadVideo(account, url, outputDir, archivePath) {
   if (maxDurationSeconds && item.durationSeconds !== null && item.durationSeconds > maxDurationSeconds) {
     appendArchiveOnce(archivePath, url);
     item.status = 'filtered-duration';
+    metrics.record('duration_filtered', 'count');
     item.error = `duration ${item.durationSeconds}s exceeds ${maxDurationSeconds}s limit`;
     console.log(`    跳過: 時長 ${item.durationSeconds}s 超過 ${maxDurationSeconds}s`);
     return item;
@@ -871,6 +973,7 @@ function downloadVideo(account, url, outputDir, archivePath) {
   if (existing && existing.status === 'local-existing') {
     appendArchiveOnce(archivePath, url);
     item.cacheHit = true;
+    metrics.record('cache_hit', 'count');
     console.log('    復用本地檔案');
     return completedVideoResult(item, existing.localPath);
   }
@@ -894,10 +997,16 @@ function downloadVideo(account, url, outputDir, archivePath) {
     '-o', path.join(outputDir, '%(upload_date)s_%(id)s_%(title).120B.%(ext)s'),
     url
   );
+  assertAccess();
+  const started = Date.now();
   const result = spawnSync(ytdlpPath, args, { encoding: 'utf8' });
   const output = `${result.stdout || ''}${result.stderr || ''}`.trim();
+  const diagnostic = String(result.stderr || '') + '\n' + String(result.stdout || '').split(/\r?\n/).filter(line => /^ERROR:/.test(line)).join('\n');
+  const restriction = accessCode(diagnostic);
+  if (restriction) { metrics.record('download', 'failure', Date.now()-started, restriction); stopAccount(restriction, diagnostic); throw codedError(restriction, 'Download access restricted'); }
   const downloadedPath = findDownloadedFile(outputDir, item.platformVideoId, output);
   if ((result.status === 0 || output.includes('100%')) && downloadedPath) {
+    metrics.record('download', 'success', Date.now()-started);
     const line = String(result.stdout || '').split(/\r?\n/).find(v => v.startsWith('__HERMES_META__:'));
     if (line) { try { const final = JSON.parse(line.slice('__HERMES_META__:'.length));
       const selected = videoTitles.choose(final); if (selected.title) Object.assign(item, selected);
@@ -910,6 +1019,7 @@ function downloadVideo(account, url, outputDir, archivePath) {
   if (/does not pass filter|duration.*(?:larger|greater|longer)/i.test(output)) {
     appendArchiveOnce(archivePath, url);
     item.status = 'filtered-duration';
+    metrics.record('duration_filtered', 'count');
     item.error = `video exceeds ${maxDurationSeconds}s duration limit`;
     console.log(`    跳過: 時長超過 ${maxDurationSeconds}s`);
     return item;
@@ -918,6 +1028,7 @@ function downloadVideo(account, url, outputDir, archivePath) {
   item.status = 'download-failed';
   item.error = errorLine.slice(0, 500);
   item.errorCode = classifyDownloadError(output);
+  metrics.record('download', 'failure', Date.now()-started, item.errorCode);
   return item;
 }
 
@@ -999,7 +1110,7 @@ async function startBrowser(profile, executable = chromePath) {
 }
 
 function classifyDiscoveryFailure(scanErrors, layoutUnsupported) {
-  const priorities = [ERROR_CODES.ACCESS_REQUIRED, ERROR_CODES.CDP_TIMEOUT];
+  const priorities = [...ACCOUNT_STOPS, ERROR_CODES.ACCESS_REQUIRED, ERROR_CODES.CDP_TIMEOUT];
   for (const code of priorities) {
     const match = scanErrors.find(item => item.code === code);
     if (match) return match;
@@ -1031,7 +1142,7 @@ async function resolveVideoTitle(ws, url, metadata = {}) {
       const result=await cdpCall(ws,{id:nextCdpId(),method:'Runtime.evaluate',params:{returnByValue:true,
         expression:'('+videoTitles.pageSnapshot.toString()+')('+JSON.stringify(videoKey(url))+')'}},10000);
       last=result?.result?.result?.value || {};
-      if(last.blocked) return {title:null,titleSource:'NONE',titleStatus:'ACCESS_REQUIRED'};
+      if(last.blocked) { stopAccount('FACEBOOK_VERIFICATION_REQUIRED'); return {title:null,titleSource:'NONE',titleStatus:'ACCESS_REQUIRED'}; }
       const selected=videoTitles.choose({},{...(last.candidates?.[videoKey(url)] || {}),...(last.matched?last:{})});
       if(selected.title || selected.titleStatus==='NO_TEXT') return selected;
       if(attempt<2) await sleep(2500);
@@ -1105,12 +1216,12 @@ async function main() {
       console.log(`\n=== ${account.folder} ===`);
       for (const page of pageCandidates(account.url)) {
         try {
-          const discovery = await discoverWithRecovery(
+          const discovery = await metrics.asyncCall('discovery', () => discoverWithRecovery(
             browser,
             page,
             firstDailyRun ? new Set() : existingKeys,
             firstDailyRun ? firstRunLimit : 0
-          );
+          ));
           discoveredPages.push(discovery.urls);
           Object.assign(titleCandidates, discovery.titleCandidates || {});
           discovery.urls.forEach(videoUrl => discovered.add(videoUrl));
@@ -1119,15 +1230,21 @@ async function main() {
           const code = err.code || 'FACEBOOK_SCAN_FAILED';
           scanErrors.push({ code, message: String(err.message || err) });
           console.log(`  掃描失敗 [${code}]: ${err.message}`);
+          if (ACCOUNT_STOPS.has(code)) { stopAccount(code); break; }
         }
       }
 
-      const selected = mode === 'daily'
+      const selected = stoppedCode ? [] : mode === 'daily'
         ? selectDailyVideoUrls(discoveredPages, existingKeys, firstRunLimit)
         : selectVideoUrls(Array.from(discovered), existingKeys, mode, firstRunLimit);
       console.log(`  找到影片: ${discovered.size}，本次選取: ${selected.length}`);
 
-      const discoveryFailure = discovered.size === 0
+      metrics.record('discovered', 'count', 0, null, discovered.size);
+      const newCount = [...discovered].filter(url => !existingKeys.has(videoKey(url))).length;
+      metrics.record('new_candidates', 'count', 0, null, newCount);
+      if (!newCount && !scanErrors.length) metrics.record('no_new_check', 'count');
+      if (!discovered.size && !scanErrors.length) metrics.record('empty_check', 'count');
+      const discoveryFailure = stoppedCode || discovered.size === 0
         ? classifyDiscoveryFailure(scanErrors, layoutUnsupported)
         : null;
       if (discoveryFailure) {
@@ -1153,7 +1270,8 @@ async function main() {
         const item = downloadVideo(account, videoUrl, outputDir, archivePath);
         if (item.status === 'downloaded') {
           if (!item.title) Object.assign(item, videoTitles.choose({}, titleCandidates[item.platformVideoId] || {}));
-          if (!item.title) Object.assign(item, await resolveVideoTitle(browser.ws, videoUrl, {}));
+          // Missing titles are repaired by the existing dedicated title worker.
+          try { cacheVideo(outputDir, item); } catch { metrics.record('cache_write', 'failure', 0, 'CACHE_WRITE_FAILED'); }
         }
         persistStatistics(item);
         sourceResult.videos.push(item);
@@ -1169,12 +1287,14 @@ async function main() {
         else if (item.status === 'archived-existing') sourceResult.archivedExisting++;
         else if (item.status === 'downloaded' || item.status === 'preview') sourceResult.succeeded++;
         else sourceResult.failed++;
+        if (ACCOUNT_STOPS.has(item.errorCode)) { sourceResult.errorCode=item.errorCode; sourceResult.error='Account access paused'; break; }
       }
       // Scanned known videos are duplicate skips, never new download successes.
       if (!dryRun) for (const knownUrl of discovered) {
         if (!existingKeys.has(videoKey(knownUrl)) || selected.includes(knownUrl)) continue;
         const item = baseVideoResult(account, knownUrl);
         item.status = 'archived-existing';
+        metrics.record('duplicate_skip', 'count');
         persistStatistics(item);
         sourceResult.videos.push(item);
         sourceResult.archivedExisting++;
@@ -1190,11 +1310,13 @@ async function main() {
         console.log(`  成功: ${sourceResult.succeeded}/${actionable}`);
       }
       runResult.sources.push(sourceResult);
+      if (stoppedCode) { runResult.errorCode=stoppedCode; break; }
     }
     const failures = runResult.sources.reduce((sum, source) => sum + source.failed, 0);
     const successes = runResult.sources.reduce((sum, source) => sum + source.succeeded, 0);
     runResult.status = failures === 0 ? 'completed' : (successes > 0 ? 'partial' : 'failed');
     runResult.completedAt = new Date().toISOString();
+    runResult.processMetrics = metrics.summary();
     if (resultJsonPath) {
       fs.mkdirSync(path.dirname(resultJsonPath), { recursive: true });
       fs.writeFileSync(resultJsonPath, `${JSON.stringify(runResult, null, 2)}\n`, 'utf8');
@@ -1227,6 +1349,7 @@ async function runMain() {
         startedAt: null,
         completedAt: new Date().toISOString(),
         sources: [],
+        processMetrics: metrics.summary(),
         errorCode: err.code || null,
         error: String(err.message || err)
       };
@@ -1242,6 +1365,7 @@ async function runMain() {
 if (require.main === module) runMain();
 
 module.exports = {
+  accessCode, assertAccess, assertPageAccess, downloadVideo, readCachedVideo, cacheVideo, metadataCachePath,
   persistStatistics,
   cdpCall,
   classifyDownloadError,

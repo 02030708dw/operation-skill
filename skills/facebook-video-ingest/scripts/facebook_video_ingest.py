@@ -868,6 +868,10 @@ def manifest_error_code(payload: dict[str, Any]) -> str | None:
         codes.append(source.get("errorCode"))
     videos = manifest_videos(payload)
     codes.extend(video.get("errorCode") for video in videos)
+    # Account-wide restrictions must survive partial success and stop other work.
+    for code in ['FACEBOOK_ACCOUNT_SUSPENDED', 'FACEBOOK_VERIFICATION_REQUIRED', 'FACEBOOK_LOGIN_REQUIRED', 'FACEBOOK_RATE_LIMITED']:
+        if code in codes:
+            return code
     # A restricted item does not block the whole source when other items worked.
     if any(video.get("status") == "downloaded" for video in videos):
         return "FACEBOOK_NETWORK_ERROR" if "FACEBOOK_NETWORK_ERROR" in codes else "FACEBOOK_ITEM_FAILURE"
@@ -1604,7 +1608,7 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         }
         successes = sum(video.get("status") == "downloaded" for video in videos)
         failures = sum(video.get("status") != "downloaded" for video in videos)
-        if failures == 0 and download_exit == 0:
+        if failures == 0 and download_exit == 0 and download_result.get("status") not in {"partial", "failed"}:
             terminal_status = "COMPLETED"
         elif successes:
             terminal_status = "PARTIAL"

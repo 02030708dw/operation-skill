@@ -118,6 +118,44 @@ def read_state(account: dict) -> dict:
     return json.loads(path.read_text()) if path.exists() else {'state':'LOGIN_REQUIRED','version':0}
 
 
+
+def save_state(account: dict, state: str, reason: str | None, observed_version=None, retry_seconds=300) -> dict:
+    """Serialize short state writes; stale successful probes cannot erase a live restriction."""
+    root = account_root(account)
+    with (root / 'state-write.lock').open('a+') as guard:
+        fcntl.flock(guard, fcntl.LOCK_EX)
+        old = read_state(account)
+        if observed_version is not None and old.get('version', 0) != observed_version and old['state'] != 'AVAILABLE':
+            return old
+        # An item-level/temporary failure must not downgrade an existing login gate.
+        if observed_version is None and old['state'] in {'LOGIN_REQUIRED', 'VERIFICATION_REQUIRED'}:
+            return old
+        current = {'state': state, 'reasonCode': reason,
+                   'version': max(int(old.get('version', 0))+1, time.time_ns()//1000000),
+                   'checkedAt': int(time.time()),
+                   'nextCheckAt': int(time.time())+retry_seconds if state == 'COOLDOWN' else None}
+        if state == 'COOLDOWN' and old.get('state') == 'COOLDOWN':
+            current['nextCheckAt'] = max(current['nextCheckAt'], old.get('nextCheckAt') or 0)
+        tmp = root / 'state.next'
+        tmp.write_text(json.dumps(current)); tmp.chmod(0o600); tmp.replace(root / 'state.json')
+        return current
+
+
+def capture_restriction(config: dict, tenant: str, code: str, retry_seconds=1800) -> dict:
+    states = {'FACEBOOK_RATE_LIMITED': 'COOLDOWN', 'FACEBOOK_LOGIN_REQUIRED': 'LOGIN_REQUIRED',
+              'FACEBOOK_VERIFICATION_REQUIRED': 'VERIFICATION_REQUIRED',
+              'FACEBOOK_ACCOUNT_SUSPENDED': 'VERIFICATION_REQUIRED'}
+    if code not in states:
+        raise ValueError('Invalid account restriction')
+    current = save_state(account_config(config), states[code], code, retry_seconds=max(300, min(86400, retry_seconds)))
+    # Local state is authoritative even if the backend acknowledgement is unavailable.
+    try:
+        report(config, tenant, current)
+    except Exception:
+        pass
+    return current
+
+
 def report(config: dict, tenant: str, state: dict) -> None:
     account=account_config(config)
     request=urllib.request.Request(config['backendUrl'].rstrip('/')+'/api/internal/server/facebook-account/status',
@@ -165,6 +203,8 @@ def verify(config: dict, tenant: str, credentials: dict | None = None, profile: 
     root=account_root(account)
     profile=profile if profile is not None else root/'profile'; profile.mkdir(exist_ok=True,mode=0o700)
     recover_profile(profile)
+    observed_version = read_state(account).get('version', 0)
+    check_started = time.monotonic()
     script=Path(__file__).resolve().parents[2]/'facebook-followed-video-download/scripts/facebook_session.js'
     payload={'profile':str(profile),'action':'login' if credentials else 'verify'}
     payload.update(credentials or {})
@@ -179,13 +219,11 @@ def verify(config: dict, tenant: str, credentials: dict | None = None, profile: 
         state='COOLDOWN'
         reason='SESSION_CHECK_FAILED'
         recover_profile(profile)
+    current = save_state(account, state, reason, observed_version=observed_version)
     marker=profile/'.hermes-login-enabled'
-    if state=='AVAILABLE': marker.write_text('Server-authorized session\n');marker.chmod(0o600)
+    if current['state']=='AVAILABLE': marker.write_text('Server-authorized session\n');marker.chmod(0o600)
     else: marker.unlink(missing_ok=True)
-    old=read_state(account)
-    current={'state':state,'reasonCode':reason,'version':max(int(old.get('version',0))+1,time.time_ns()//1000000),
-             'checkedAt':int(time.time()),'nextCheckAt':int(time.time())+300 if state=='COOLDOWN' else None}
-    tmp=root/'state.tmp';tmp.write_text(json.dumps(current));tmp.chmod(0o600);tmp.replace(root/'state.json')
+    print('__HM_CAPTURE_PROCESS__:' + json.dumps({'stage': 'login_check', 'outcome': 'success' if current['state'] == 'AVAILABLE' else 'failure', 'state': current['state'], 'elapsedMs': round((time.monotonic()-check_started)*1000)}), flush=True)
     report(config,tenant,current)
     return current
 
