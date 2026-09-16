@@ -14,7 +14,7 @@ function parseCookies(text, now = Date.now() / 1000) {
     if (!/^(?:[a-z0-9-]+\.)*(?:google|youtube)\.com$/i.test(host)
         || !['TRUE', 'FALSE'].includes(subdomains) || !['TRUE', 'FALSE'].includes(secure)
         || !cookiePath.startsWith('/') || !/^[A-Za-z0-9_!#$%&'*+.^`|~-]+$/.test(name)
-        || !/^\d+$/.test(expiresText) || /[\x00-\x1f\x7f]/.test(value)) throw Error('INVALID_GOOGLE_COOKIE');
+        || !/^\d*$/.test(expiresText) || /[\x00-\x1f\x7f]/.test(value)) throw Error('INVALID_GOOGLE_COOKIE');
     const expires = Number(expiresText);
     if (expires && expires <= now) continue;
     cookies.push({domain, path: cookiePath, name, value, secure: secure === 'TRUE', httpOnly,

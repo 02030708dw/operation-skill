@@ -14,3 +14,7 @@ test('supports session cookies and Google subdomains', () => {
   const cookies=parseCookies(row('.accounts.google.com','0'),1000);
   assert.equal(cookies[0].expires,undefined);
 });
+test('accepts empty expiry emitted by Python MozillaCookieJar for session cookies', () => {
+  const cookies=parseCookies(row('.youtube.com',''),1000);
+  assert.equal(cookies.length,1);assert.equal(cookies[0].expires,undefined);
+});
