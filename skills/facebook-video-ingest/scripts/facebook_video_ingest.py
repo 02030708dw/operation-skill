@@ -869,7 +869,7 @@ def manifest_error_code(payload: dict[str, Any]) -> str | None:
     videos = manifest_videos(payload)
     codes.extend(video.get("errorCode") for video in videos)
     # Account-wide restrictions must survive partial success and stop other work.
-    for code in ['FACEBOOK_ACCOUNT_SUSPENDED', 'FACEBOOK_VERIFICATION_REQUIRED', 'FACEBOOK_LOGIN_REQUIRED', 'FACEBOOK_RATE_LIMITED']:
+    for code in ['FACEBOOK_ACCOUNT_SUSPENDED', 'FACEBOOK_VERIFICATION_REQUIRED', 'FACEBOOK_LOGIN_REQUIRED', 'FACEBOOK_RATE_LIMITED', 'FACEBOOK_ACCOUNT_COOLDOWN']:
         if code in codes:
             return code
     # A restricted item does not block the whole source when other items worked.

@@ -34,6 +34,13 @@ test('account state changed by another lane gates next navigation without sendin
  const {engine}=load(t,{env:{HM_FACEBOOK_ACCOUNT_STATE:state}});
  await assert.rejects(engine.cdpCall({send(){assert.fail('must not navigate');}},{method:'Page.navigate',params:{url:'https://www.facebook.com/'}}),e=>e.code==='FACEBOOK_RATE_LIMITED');
 });
+test('an existing session cooldown is not a new rate limit and does not extend the deadline',t=>{
+ const state=path.join(os.tmpdir(),'hm-existing-cooldown-'+process.pid+'.json');t.after(()=>fs.rmSync(state,{force:true}));
+ const original=JSON.stringify({state:'COOLDOWN',reasonCode:'SESSION_CHECK_INCONCLUSIVE',nextCheckAt:123456});fs.writeFileSync(state,original);
+ const {engine,dir,calls}=load(t,{env:{HM_FACEBOOK_ACCOUNT_STATE:state}});
+ const result=engine.downloadVideo({folder:'creator'},'https://www.facebook.com/reel/123',dir,path.join(dir,'.fb-video-urls.txt'));
+ assert.equal(result.errorCode,'FACEBOOK_ACCOUNT_COOLDOWN');assert.equal(calls.length,0);assert.equal(fs.readFileSync(state,'utf8'),original);
+});
 test('private video 403 remains item scoped; network errors retain retry classification',t=>{
  const {engine}=load(t);assert.equal(engine.classifyDownloadError('HTTP Error 403'),'FACEBOOK_ACCESS_REQUIRED');
  assert.equal(engine.classifyDownloadError('HTTP Error 503'),'FACEBOOK_NETWORK_ERROR');

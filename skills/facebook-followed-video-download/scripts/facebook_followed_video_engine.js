@@ -91,7 +91,7 @@ let cdpId = 10;
 const metrics = require('./capture_observability').createMetrics(resultJsonPath);
 let stoppedCode = null;
 const ACCOUNT_STOPS = new Set(['FACEBOOK_RATE_LIMITED', 'FACEBOOK_LOGIN_REQUIRED',
-  'FACEBOOK_VERIFICATION_REQUIRED', 'FACEBOOK_ACCOUNT_SUSPENDED']);
+  'FACEBOOK_VERIFICATION_REQUIRED', 'FACEBOOK_ACCOUNT_SUSPENDED', 'FACEBOOK_ACCOUNT_COOLDOWN']);
 function assertAccess() {
   if (stoppedCode) throw codedError(stoppedCode, 'Facebook account access paused');
   const statePath = process.env.HM_FACEBOOK_ACCOUNT_STATE;
@@ -101,7 +101,10 @@ function assertAccess() {
   catch { throw codedError('FACEBOOK_LOGIN_REQUIRED', 'Account state unavailable'); }
   if (state.state !== 'AVAILABLE') {
     const code = ACCOUNT_STOPS.has(state.reasonCode) ? state.reasonCode :
-      ({COOLDOWN:'FACEBOOK_RATE_LIMITED',VERIFICATION_REQUIRED:'FACEBOOK_VERIFICATION_REQUIRED'}[state.state] || 'FACEBOOK_LOGIN_REQUIRED');
+      ({COOLDOWN:'FACEBOOK_ACCOUNT_COOLDOWN',VERIFICATION_REQUIRED:'FACEBOOK_VERIFICATION_REQUIRED'}[state.state] || 'FACEBOOK_LOGIN_REQUIRED');
+    // This is an existing gate, not a newly observed restriction. Do not extend it.
+    stoppedCode = code;
+    metrics.record('account_gate', 'count', 0, code);
     throw codedError(code, 'Facebook account access paused');
   }
 }

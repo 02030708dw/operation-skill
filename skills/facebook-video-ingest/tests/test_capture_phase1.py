@@ -16,6 +16,10 @@ class PhaseOneTests(unittest.TestCase):
         payload['sources'][0]['errorCode'] = 'FACEBOOK_ACCESS_REQUIRED'
         self.assertEqual(manifest_error_code(payload), 'FACEBOOK_ITEM_FAILURE')
 
+    def test_existing_cooldown_survives_partial_success(self):
+        payload = {'sources': [{'errorCode': 'FACEBOOK_ACCOUNT_COOLDOWN', 'videos': [{'status': 'downloaded'}]}]}
+        self.assertEqual(manifest_error_code(payload), 'FACEBOOK_ACCOUNT_COOLDOWN')
+
     def test_restriction_is_durable_when_callback_fails_and_stale_probe_cannot_clear_it(self):
         with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {'HM_FACEBOOK_ACCOUNT_ROOT': temp}), patch.object(accounts, 'report', side_effect=OSError('offline')):
             config = {'facebookAccount': {'key': 'shared-account'}}
