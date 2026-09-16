@@ -1,0 +1,4 @@
+interface:
+  display_name: "YouTube 视频下载"
+  short_description: "下载单条视频或频道 Shorts，支持批量限额、断点续传和去重记录"
+  default_prompt: "使用 $youtube-video-downloader 下载指定 YouTube 视频或频道 Shorts。"

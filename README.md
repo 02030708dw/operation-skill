@@ -34,6 +34,11 @@ operation-skill/
 │   │   ├── scripts/
 │   │   ├── examples/
 │   │   └── references/
+│   ├── youtube-video-downloader/
+│   │   ├── SKILL.md
+│   │   ├── scripts/
+│   │   ├── tests/
+│   │   └── references/
 │   ├── cloudflare-r2-video-upload/
 │   │   ├── SKILL.md
 │   │   ├── scripts/
@@ -192,6 +197,7 @@ Windows 将上面两个路径分别替换为 `~\.hermes\hermes-agent\venv\Script
 | `facebook-daily-comment` | 2.8.0 | 通过 MYT HTTP API 并发操作云手机，为 Facebook 动态发表指定数量和内容的评论 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-daily-comment/SKILL.md) |
 | `facebook-post-publish` | 1.2.0 | 在 MYT 云手机的 Facebook 中发布纯文字、图片或视频帖子，并严格校验图库素材类型 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-post-publish/SKILL.md) |
 | `facebook-followed-video-download` | 1.7.3 | 扫描获准访问的 Facebook 来源，按来源下载新增视频、去重并输出可供后台消费的结果清单 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-followed-video-download/SKILL.md) |
+| `youtube-video-downloader` | 1.0.0 | 下载 YouTube 单条视频、Shorts 或频道批量视频，支持限额、续传、去重和结果报告 | Linux、macOS | [查看 SKILL.md](skills/youtube-video-downloader/SKILL.md) |
 | `cloudflare-r2-video-upload` | 1.1.0 | 将本地视频或下载结果清单安全上传到 Cloudflare R2，支持校验、去重、并发和结果清单 | Windows、Linux、macOS | [查看 SKILL.md](skills/cloudflare-r2-video-upload/SKILL.md) |
 | `facebook-video-ingest` | 1.2.3 | 按后台任务编号定向认领，串联 Facebook 下载、R2 上传，并回写逐视频和执行记录 | Windows、Linux、macOS | [查看 SKILL.md](skills/facebook-video-ingest/SKILL.md) |
 | `myt-cloud-phone-file-upload` | 2.0.0 | 将用户指定的单个文件或目录内全部文件并发上传到魔云腾云手机，保持相对子目录并验证每个文件 | Windows、Linux、macOS | [查看 SKILL.md](skills/myt-cloud-phone-file-upload/SKILL.md) |
@@ -336,6 +342,18 @@ Windows 将上面两个路径分别替换为 `~\.hermes\hermes-agent\venv\Script
 ```
 
 如果 `/sdcard/upload` 下存在多个同类型文件，应指定完整文件名、关键词，或明确要求最新文件。详细选择规则和风险控制请阅读 [`skills/facebook-post-publish/SKILL.md`](skills/facebook-post-publish/SKILL.md)。
+
+### `youtube-video-downloader`
+
+支持单条 YouTube/Shorts 链接、播放列表与频道 Shorts 页。频道批量默认检查前 10 条，复用同一下载目录可跳过已完成视频。媒体按频道 ID 归档，文件名为 `发布日期_标题_[视频ID].mp4`。
+
+Linux 服务器安装与运行见 [服务器使用说明](skills/youtube-video-downloader/references/server-usage.md)。首次运行 `scripts/setup.sh`，虚拟环境保存在源码目录之外。需要登录时使用服务器本机已授权的 Chrome 配置，或管理员提供的本地 Cookie 文件；本机电脑的登录状态不会随源码传到服务器。
+
+```text
+/youtube-video-downloader 下载 https://www.youtube.com/@Wimbledon/shorts 前 10 条，保存到我指定的服务器视频目录
+```
+
+此 Skill 会进入完整发布包；现有仅纳管 5 个核心 Skill 的客户端不会自动安装它，需单独安装或纳管。
 
 ### `facebook-followed-video-download`
 

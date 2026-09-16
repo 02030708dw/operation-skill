@@ -22,6 +22,20 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  youtube-skill-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.11"
+      - name: Validate YouTube Linux setup and runtime
+        run: |
+          bash -n skills/youtube-video-downloader/scripts/setup.sh
+          bash skills/youtube-video-downloader/scripts/setup.sh
+          "$HOME/.local/share/operation-skill/youtube-video-downloader/venv/bin/python" skills/youtube-video-downloader/scripts/download.py --help
+          python -m unittest discover -s skills/youtube-video-downloader/tests -p "test_*.py" -v
+
   test:
     strategy:
       fail-fast: false
@@ -108,7 +122,7 @@ jobs:
 
   publish:
     if: github.ref == 'refs/heads/main'
-    needs: [test, skill-tests]
+    needs: [test, skill-tests, youtube-skill-tests]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
