@@ -2,6 +2,9 @@ import importlib.util
 import json
 import tempfile
 import unittest
+import shutil
+import subprocess
+from unittest import mock
 from pathlib import Path
 
 
@@ -17,6 +20,29 @@ SPEC.loader.exec_module(MODULE)
 
 
 class EntryPointTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('node'), 'Node required for persistent metric integration')
+    def test_failed_engine_metrics_survive_temporary_result_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            accounts = root / 'accounts.txt'
+            accounts.write_text('creator\thttps://www.facebook.com/example/reels/\n')
+            result = root / 'execution/download.json'
+            args = MODULE.build_parser().parse_args(['--result-json', str(result), '--no-report'])
+            original_popen = subprocess.Popen
+            node = shutil.which('node')
+            temporary_results = []
+            helper = str(MODULE.SCRIPT_DIR / 'capture_observability.js')
+            def failed_engine(command, **kwargs):
+                temporary_results.append(Path(command[command.index('--result-json') + 1]))
+                script = "const args=process.argv; const target=args[args.indexOf('--metrics-result-json')+1]; require(" + json.dumps(helper) + ").createMetrics(target).record('navigation','failure',1,'NETWORK_ERROR'); process.exit(1);"
+                return original_popen([node, '-e', script, '--', *command[2:]], **kwargs)
+            with mock.patch.object(MODULE, 'dependency_status', return_value={'ready_for_preview': True, 'node': shutil.which('node')}), mock.patch.object(MODULE, 'enabled_browser_profile', return_value=None), mock.patch.dict(MODULE.os.environ, {}, clear=True), mock.patch.object(MODULE.subprocess, 'Popen', side_effect=failed_engine):
+                self.assertEqual(MODULE._run_download_with_accounts(args, accounts), 1)
+            self.assertFalse(temporary_results[0].parent.exists())
+            metric = json.loads((result.parent / 'process-metrics.jsonl').read_text())
+            self.assertEqual(metric['errorCode'], 'NETWORK_ERROR')
+            self.assertEqual(json.loads(result.read_text())['exitCode'], 1)
+
     def test_daily_recent_video_target_defaults_to_ten(self):
         self.assertEqual(MODULE.DEFAULT_DAILY_COUNT, 10)
 

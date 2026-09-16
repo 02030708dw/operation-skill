@@ -689,6 +689,8 @@ def _run_download_with_accounts(args: argparse.Namespace, accounts: Path) -> int
         str(args.max_duration_seconds),
         "--result-json",
         str(engine_result),
+        "--metrics-result-json",
+        str(requested_result or (reports / "latest-manifest.json")),
     ]
     if not args.execute:
         command.append("--dry-run")

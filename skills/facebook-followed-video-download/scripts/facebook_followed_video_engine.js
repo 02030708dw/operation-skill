@@ -88,7 +88,7 @@ const browserProfileDir = argValue('--browser-profile', '');
 const emitVideoResultEvents = process.env.HM_VIDEO_RESULT_EVENTS === '1';
 let cdpId = 10;
 
-const metrics = require('./capture_observability').createMetrics(resultJsonPath);
+const metrics = require('./capture_observability').createMetrics(argValue('--metrics-result-json', resultJsonPath));
 let stoppedCode = null;
 const ACCOUNT_STOPS = new Set(['FACEBOOK_RATE_LIMITED', 'FACEBOOK_LOGIN_REQUIRED',
   'FACEBOOK_VERIFICATION_REQUIRED', 'FACEBOOK_ACCOUNT_SUSPENDED', 'FACEBOOK_ACCOUNT_COOLDOWN']);
