@@ -85,3 +85,36 @@ test('process metrics survive truncated writes and omit untrusted errors',t=>{
  assert.equal(rows.length,2);assert.equal(rows[0].errorCode,null);assert.equal(metrics.summary().stages.metadata.failures,1);
  assert.equal(fs.readFileSync(journal,'utf8').includes('secret'),false);
 });
+
+test('generic retry is a page failure and cannot pause the account',t=>{
+ const {engine,calls,dir}=load(t);
+ assert.equal(engine.accessCode('Something went wrong. Please try again later.'),null);
+ assert.equal(engine.classifyDownloadError('ERROR: Please try again later'),'FACEBOOK_NETWORK_ERROR');
+ assert.throws(()=>engine.assertPageAccess({gateText:'Please try again later'}),e=>e.code==='FACEBOOK_NETWORK_ERROR');
+ assert.equal(calls.length,0);
+ assert.doesNotThrow(()=>engine.assertAccess());
+ const rows=fs.readFileSync(path.join(dir,'process-metrics.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+ assert.equal(rows[0].evidence.signal,'GENERIC_RETRY');
+});
+test('explicit restrictions still stop the account and persist only safe evidence',t=>{
+ const {engine,dir}=load(t);
+ assert.throws(()=>engine.assertPageAccess({gateText:"You're temporarily blocked from using this feature. Cookie: secret",urls:['video']}),e=>e.code==='FACEBOOK_RATE_LIMITED');
+ assert.throws(()=>engine.assertAccess(),e=>e.code==='FACEBOOK_RATE_LIMITED');
+ const raw=fs.readFileSync(path.join(dir,'process-metrics.jsonl'),'utf8');
+ assert.equal(raw.includes('secret'),false);assert.ok(raw.includes('EXPLICIT_RATE_LIMIT'));assert.ok(raw.includes('PAGE_DIALOG'));
+ assert.equal(engine.accessEvidence('HTTP Error 429').signal,'HTTP_429');
+});
+test('creator paths and healthy captions are not account restriction signals',t=>{
+ const {engine}=load(t);
+ assert.equal(engine.pageAccessEvidence({finalUrl:'https://www.facebook.com/challenge_creator/',bodyText:'we limit how often',urls:['video']}),null);
+ assert.equal(engine.pageAccessEvidence({bodyText:'Please log into Facebook',videoElements:1}),null);
+ assert.equal(engine.pageAccessEvidence({finalUrl:'https://www.facebook.com/checkpoint/123?secret=x'}).signal,'CHECKPOINT_PATH');
+ assert.equal(engine.pageAccessEvidence({finalUrl:'https://www.facebook.com/login.php'}).code,'FACEBOOK_LOGIN_REQUIRED');
+ assert.equal(engine.pageAccessEvidence({finalUrl:'https://other.example/checkpoint/'}),null);
+});
+test('metrics evidence rejects arbitrary values and strips extra properties',()=>{
+ const m=require('../scripts/capture_observability').createMetrics();
+ assert.throws(()=>m.evidence({source:'secret',signal:'HTTP_429',code:'FACEBOOK_RATE_LIMITED'}));
+ m.evidence({source:'EXTRACTOR',signal:'HTTP_429',code:'FACEBOOK_RATE_LIMITED',cookie:'secret'});
+ assert.equal(m.summary().accessEvidence.length,1);assert.equal(JSON.stringify(m.summary()).includes('secret'),false);
+});

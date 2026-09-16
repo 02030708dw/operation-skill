@@ -123,16 +123,41 @@ function stopAccount(code, output = '') {
     if (result.status !== 0) metrics.record('account_stop_persist', 'failure', 0, 'ACCOUNT_STATE_WRITE_FAILED');
   }
 }
-function accessCode(text) {
-  if (/account (?:has been )?(?:suspended|disabled)|we suspended your account/i.test(text)) return 'FACEBOOK_ACCOUNT_SUSPENDED';
-  if (/HTTP(?: Error)? 429|too many requests|temporarily blocked|try again later|rate.limit|暂时被封锁|操作过于频繁/i.test(text)) return 'FACEBOOK_RATE_LIMITED';
-  if (/checkpoint|challenge|two_factor|confirm your identity|security check|verification required|驗證你的身份|確認你的身分|验证你的身份/i.test(text)) return 'FACEBOOK_VERIFICATION_REQUIRED';
-  if (/facebook\.com\/(?:login|recover)|login required|login to continue|log in to continue|log into facebook|only available for registered users|請登入|登录以继续/i.test(text)) return 'FACEBOOK_LOGIN_REQUIRED';
+// Generic retry prompts are page failures, not evidence of an account-wide limit.
+function accessEvidence(text, source = 'EXTRACTOR') {
+  const rules = [
+    ['FACEBOOK_ACCOUNT_SUSPENDED', 'ACCOUNT_SUSPENDED', /account (?:has been )?(?:suspended|disabled)|we suspended your account/i],
+    ['FACEBOOK_RATE_LIMITED', 'HTTP_429', /HTTP(?: Error)?\s*429\b|too many requests/i],
+    ['FACEBOOK_RATE_LIMITED', 'EXPLICIT_RATE_LIMIT', /rate[ -]limit(?:ed|ing)?|we limit how often|you(?:'re| are) temporarily blocked|temporarily blocked from|操作过于频繁|暂时被封锁/i],
+    ['FACEBOOK_VERIFICATION_REQUIRED', 'IDENTITY_CHECK', /facebook\.com\/(?:checkpoint|challenge|two_step_verification)(?:\/|\?|\s|$)|confirm your identity|security check|verification required|驗證你的身份|確認你的身分|验证你的身份/i],
+    ['FACEBOOK_LOGIN_REQUIRED', 'LOGIN_REQUIRED', /facebook\.com\/(?:login|recover)(?:\/|\.php|\?|\s|$)|login required|login to continue|log in to continue|log into facebook|only available for registered users|請登入|登录以继续/i]
+  ];
+  for (const [code, signal, pattern] of rules) if (pattern.test(String(text || ''))) return {code, source, signal};
   return null;
 }
-function assertPageAccess(text) {
-  const code = accessCode(text);
-  if (code) { stopAccount(code); throw codedError(code, 'Facebook requires account attention'); }
+function accessCode(text) { return accessEvidence(text)?.code || null; }
+function pageAccessEvidence(snapshot) {
+  let pathname = '';
+  try { const url = new URL(snapshot.finalUrl); if (/(^|\.)facebook\.com$/i.test(url.hostname)) pathname = url.pathname; } catch (_) {}
+  if (/^\/(?:checkpoint|challenge|two_step_verification)(?:\/|$)/i.test(pathname))
+    return {code:'FACEBOOK_VERIFICATION_REQUIRED', source:'PAGE_URL', signal:'CHECKPOINT_PATH'};
+  if (/^\/(?:login|recover)(?:\/|\.php|$)/i.test(pathname))
+    return {code:'FACEBOOK_LOGIN_REQUIRED', source:'PAGE_URL', signal:'LOGIN_PATH'};
+  const gate = snapshot.gateText || '';
+  const body = !(snapshot.urls || []).length && !snapshot.videoElements ? snapshot.bodyText || '' : '';
+  const decision = accessEvidence(gate, 'PAGE_DIALOG') || accessEvidence(body, 'PAGE_BODY');
+  if (decision) return decision;
+  if (/try again later|something went wrong|稍后重试|出了点问题/i.test(gate || body))
+    return {code:'FACEBOOK_NETWORK_ERROR', source:gate ? 'PAGE_DIALOG':'PAGE_BODY', signal:'GENERIC_RETRY'};
+  return null;
+}
+function assertPageAccess(snapshot) {
+  const evidence = typeof snapshot === 'string' ? accessEvidence(snapshot, 'PAGE_DIALOG') : pageAccessEvidence(snapshot);
+  if (evidence) {
+    metrics.evidence(evidence);
+    stopAccount(evidence.code);
+    throw codedError(evidence.code, `Facebook access check: ${evidence.source} / ${evidence.signal}`);
+  }
 }
 async function cdpCall(ws, msg, timeoutMs = 20000) {
   const stage = msg.method === 'Page.navigate' ? 'navigation' : msg.method === 'Page.reload' ? 'refresh' :
@@ -522,7 +547,7 @@ function discoveryExpression() {
         urls: Array.from(found).slice(0, 2000),
         finalUrl: location.href,
         title: String(document.title || '').slice(0, 500),
-        gateText: Array.from(document.querySelectorAll('[role="dialog"],[role="alert"],h1')).map(node => String(node.innerText || '')).join(' ').slice(0, 6000),
+        gateText: Array.from(document.querySelectorAll('[role="dialog"],[role="alert"]')).filter(node => node.getClientRects().length && getComputedStyle(node).visibility !== 'hidden' && getComputedStyle(node).display !== 'none' && node.getAttribute('aria-hidden') !== 'true').map(node => String(node.innerText || '')).join(' ').slice(0, 6000),
         bodyText: String(document.body ? document.body.innerText : '').slice(0, 6000),
         videoElements: document.querySelectorAll('video').length
       });
@@ -558,8 +583,7 @@ async function discoverOnPage(ws, url, stopKeys = new Set(), minimumItems = 0) {
     const captionResult = await cdpCall(ws, {id: nextCdpId(), method: 'Runtime.evaluate', params: {returnByValue: true, expression: '('+videoTitles.pageSnapshot.toString()+')(null)'}}, 10000).catch(() => null);
     Object.assign(titleCandidates, captionResult?.result?.result?.value?.candidates || {});
     // Captions in a healthy feed are content, not account diagnostics.
-    const accessText = `${snapshot.finalUrl || ''} ${snapshot.gateText || ''} ${!(snapshot.urls || []).length ? snapshot.bodyText || '' : ''}`;
-    assertPageAccess(accessText);
+    assertPageAccess(snapshot);
     if (Number(snapshot.videoElements || 0) > 0 && !(snapshot.urls || []).length) {
       layoutUnsupported = true;
     }
@@ -863,7 +887,7 @@ function probeVideoMetadata(url) {
     '--dump-single-json', url
   ], { encoding: 'utf8', timeout: 75000, maxBuffer: 8*1024*1024 });
   const restriction = accessCode(String(result.stderr || ''));
-  if (restriction) { metrics.record('metadata', 'failure', Date.now()-started, restriction); stopAccount(restriction, result.stderr); throw codedError(restriction, 'Metadata access restricted'); }
+  if (restriction) { metrics.evidence(accessEvidence(result.stderr)); metrics.record('metadata', 'failure', Date.now()-started, restriction); stopAccount(restriction, result.stderr); throw codedError(restriction, 'Metadata access restricted'); }
   try {
     const metadata = JSON.parse(String(result.stdout || '').trim());
     metrics.record('metadata', 'success', Date.now()-started);
@@ -896,7 +920,7 @@ function classifyDownloadError(output) {
   if (restriction) return restriction;
   // A single private/removed video or CDN 403 is not proof of an account restriction.
   if (/HTTP Error 403|not available|private video|removed/i.test(output)) return 'FACEBOOK_ACCESS_REQUIRED';
-  if (/timed? out|timeout|connection reset|connection refused|temporary failure|HTTP Error 5[0-9][0-9]|unable to download.*network/i.test(output)) return 'FACEBOOK_NETWORK_ERROR';
+  if (/try again later|something went wrong|timed? out|timeout|connection reset|connection refused|temporary failure|HTTP Error 5[0-9][0-9]|unable to download.*network/i.test(output)) return 'FACEBOOK_NETWORK_ERROR';
   return 'FACEBOOK_DOWNLOAD_UNSUPPORTED';
 }
 
@@ -1006,7 +1030,7 @@ function downloadVideoImpl(account, url, outputDir, archivePath) {
   const output = `${result.stdout || ''}${result.stderr || ''}`.trim();
   const diagnostic = String(result.stderr || '') + '\n' + String(result.stdout || '').split(/\r?\n/).filter(line => /^ERROR:/.test(line)).join('\n');
   const restriction = accessCode(diagnostic);
-  if (restriction) { metrics.record('download', 'failure', Date.now()-started, restriction); stopAccount(restriction, diagnostic); throw codedError(restriction, 'Download access restricted'); }
+  if (restriction) { metrics.evidence(accessEvidence(diagnostic)); metrics.record('download', 'failure', Date.now()-started, restriction); stopAccount(restriction, diagnostic); throw codedError(restriction, 'Download access restricted'); }
   const downloadedPath = findDownloadedFile(outputDir, item.platformVideoId, output);
   if ((result.status === 0 || output.includes('100%')) && downloadedPath) {
     metrics.record('download', 'success', Date.now()-started);
@@ -1113,7 +1137,7 @@ async function startBrowser(profile, executable = chromePath) {
 }
 
 function classifyDiscoveryFailure(scanErrors, layoutUnsupported) {
-  const priorities = [...ACCOUNT_STOPS, ERROR_CODES.ACCESS_REQUIRED, ERROR_CODES.CDP_TIMEOUT];
+  const priorities = [...ACCOUNT_STOPS, 'FACEBOOK_NETWORK_ERROR', ERROR_CODES.ACCESS_REQUIRED, ERROR_CODES.CDP_TIMEOUT];
   for (const code of priorities) {
     const match = scanErrors.find(item => item.code === code);
     if (match) return match;
@@ -1368,7 +1392,7 @@ async function runMain() {
 if (require.main === module) runMain();
 
 module.exports = {
-  accessCode, assertAccess, assertPageAccess, downloadVideo, readCachedVideo, cacheVideo, metadataCachePath,
+  accessCode, accessEvidence, pageAccessEvidence, assertAccess, assertPageAccess, downloadVideo, readCachedVideo, cacheVideo, metadataCachePath,
   persistStatistics,
   cdpCall,
   classifyDownloadError,
