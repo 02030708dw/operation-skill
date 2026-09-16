@@ -112,7 +112,9 @@ def attempt(operation,config,platform,attempts,stage):
             except Exception as error:
                 code=classify(error);auth.update(result='FAILED',reasonCode=code)
                 account_outcome(config,platform,code);raise Failure(code)
-            auth['result']='PASSED';account_outcome(config,platform,None);return result
+            auth['result']='PASSED'
+            if stage=='DOWNLOAD' and isinstance(result,dict) and result.get('status')=='downloaded':account_outcome(config,platform,None)
+            return result
     except Exception as error:
         code=classify(error);auth.setdefault('reasonCode',code)
         raise Failure(code) from None

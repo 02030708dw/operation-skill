@@ -36,6 +36,14 @@ class PublicCaptureTests(unittest.TestCase):
                 else:self.assertEqual('ok',public.attempt(operation,{},'YouTube',attempts,'DOWNLOAD'))
             self.assertEqual([False,True],calls)
 
+    def test_authenticated_discovery_does_not_claim_download_validation(self):
+        @contextlib.contextmanager
+        def session(*_):yield {'cookiefile':'private'}
+        operation=Mock(side_effect=[public.Failure('LOGIN_REQUIRED'),[{'id':'video'}]])
+        with patch.object(public,'authenticated_session',session),patch.object(public,'account_outcome') as state:
+            self.assertEqual([{'id':'video'}],public.attempt(operation,{},'YouTube',[],'DISCOVERY'))
+            state.assert_not_called()
+
     def test_rate_limit_and_verification_never_switch_accounts(self):
         for code in ('RATE_LIMITED','VERIFICATION_REQUIRED','ACCOUNT_SUSPENDED','NETWORK_ERROR'):
             with patch.object(public,'authenticated_session') as auth:
