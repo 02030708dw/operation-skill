@@ -165,7 +165,7 @@ def run(tenant):
 
 if __name__ == '__main__':
     if len(sys.argv)==3 and sys.argv[2]=='google':
-        if sys.argv[1]!='vn':raise SystemExit(2)
+        if sys.argv[1] not in ('ph', 'th', 'vn', 'id'):raise SystemExit(2)
         sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'youtube-video-downloader/scripts'))
         import hm_google_account as accounts
         run(sys.argv[1]);raise SystemExit(0)

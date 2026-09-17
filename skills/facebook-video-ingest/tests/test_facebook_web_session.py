@@ -15,6 +15,18 @@ import hm_facebook_account as accounts
 import hm_server_worker as worker
 
 class WebSessionTests(unittest.TestCase):
+    def test_google_entrypoint_accepts_each_region_and_rejects_unknown_region(self):
+        with tempfile.TemporaryDirectory() as folder:
+            registry=Path(folder)/'tenants.json'
+            registry.write_text(json.dumps({r:{} for r in ('ph','th','vn','id')}))
+            env=dict(os.environ,HM_TENANT_CONFIG=str(registry))
+            for region in ('ph','th','vn','id'):
+                result=subprocess.run([sys.executable,web.__file__,region,'google'],env=env,capture_output=True,text=True,timeout=10)
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(json.loads(result.stdout)['reasonCode'],'ACCOUNT_NOT_CONFIGURED')
+            result=subprocess.run([sys.executable,web.__file__,'other','google'],env=env,capture_output=True,text=True,timeout=10)
+            self.assertEqual(result.returncode,2)
+
     def test_two_step_login_promotes_only_after_code_and_cancellation_keeps_old_session(self):
         reports=[]
         class Handler(BaseHTTPRequestHandler):
