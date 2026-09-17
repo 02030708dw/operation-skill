@@ -1,4 +1,4 @@
-"""VN Google session storage. Credentials remain in the regional private volume."""
+"""Regional Google session storage. Credentials remain in the regional private volume."""
 import fcntl
 import json
 import os

@@ -62,9 +62,9 @@ Optional: `--output DIR`, `--height 720`, `--browser chrome:Default`, `--cookies
 
 MP4/H.264/AAC are preferred with other available codecs as fallback. Reports retain only selected metadata, never raw extraction JSON or signed media URLs. Do not schedule, deploy or publish unless asked.
 
-## VN public-first server policy
+## Regional public-first server policy
 
-When the trusted regional registry sets `capturePolicy: PUBLIC_FIRST` (VN only),
+When the trusted regional registry sets `capturePolicy: PUBLIC_FIRST` (PH, TH, VN or ID),
 `facebook-video-ingest/scripts/hm_public_capture.py` runs public discovery/download
 without cookies or saved browser profiles. A confirmed login requirement permits
 one supplement with an already available regional account. Missing/expired/busy

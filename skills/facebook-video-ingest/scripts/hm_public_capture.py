@@ -1,4 +1,4 @@
-"""VN public-first capture. Durable per-item receipts precede backend callbacks."""
+"""Regional public-first capture. Durable per-item receipts precede backend callbacks."""
 import contextlib
 import datetime as dt
 import fcntl
@@ -37,6 +37,12 @@ MESSAGES = {
 }
 
 
+def current_tenant():
+    tenant=os.environ.get('HM_CAPTURE_TENANT')
+    if tenant not in ('ph','th','vn','id'):raise ingest.PipelineError('Invalid execution tenant')
+    return tenant
+
+
 class Failure(Exception):
     def __init__(self, code):
         self.code=code
@@ -71,7 +77,7 @@ def authenticated_session(config,platform):
     lease=provider.acquire_capture(account)
     if lease is None: raise Failure('ACCOUNT_BUSY')
     try:
-        verified=provider.prepare_capture(config,'vn',lease)
+        verified=provider.prepare_capture(config,current_tenant(),lease)
         if verified.get('state')!='AVAILABLE':
             reason=str(verified.get('reasonCode','')).replace('FACEBOOK_','').replace('GOOGLE_','')
             if reason in STOP:raise Failure(reason)
@@ -89,9 +95,9 @@ def account_outcome(config,platform,code):
     try:
         if platform=='YouTube':
             if code is None or code in ('LOGIN_REQUIRED','VERIFICATION_REQUIRED','RATE_LIMITED'):
-                google.download_result(config,'vn',prefix+code if code else None)
+                google.download_result(config,current_tenant(),prefix+code if code else None)
         elif code in ('LOGIN_REQUIRED','VERIFICATION_REQUIRED','RATE_LIMITED','ACCOUNT_SUSPENDED'):
-            facebook.capture_restriction(config,'vn',prefix+code)
+            facebook.capture_restriction(config,current_tenant(),prefix+code)
     except Exception: pass  # Durable account state is reconciled by later account checks.
 
 
@@ -276,8 +282,8 @@ def log_text(report):
 
 def execute(args,job):
     platform=job.get('platform','Facebook');execution=str(job['executionId'])
-    if os.environ.get('HM_CAPTURE_TENANT')!='vn':raise ingest.PipelineError('Public-first is VN only')
-    config=json.loads(Path(os.environ['HM_TENANT_CONFIG']).read_text())['vn']
+    tenant=current_tenant()
+    config=json.loads(Path(os.environ['HM_TENANT_CONFIG']).read_text())[tenant]
     if config.get('capturePolicy')!='PUBLIC_FIRST':raise ingest.PipelineError('Capture policy mismatch')
     folder=args.state_dir.expanduser().resolve()/ingest.state_segment(execution);folder.mkdir(parents=True,exist_ok=True)
     output=Path(os.environ['FACEBOOK_FOLLOWED_OUTPUT'])/platform

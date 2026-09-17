@@ -62,12 +62,13 @@ class GoogleTests(unittest.TestCase):
                 self.assertEqual('DOWNLOADED',record.call_args.kwargs['download_status'])
                 self.assertEqual('COMPLETED',complete.call_args.args[4])
 
-    def test_worker_rejects_youtube_outside_vn(self):
+    def test_worker_requires_regional_youtube_configuration(self):
         spec=dict(dispatchId=1,attempt=1,kind='CAPTURE',slot=1,taskNo='C-TEST',executionNo='E-TEST',platform='YouTube',tenant='ph')
         with self.assertRaises(ValueError):worker.validate_spec(spec)
-        spec['tenant']='vn'
-        with patch.object(worker,'tenant_config',return_value={'googleAccount':{'key':'vn'}}):
-            self.assertEqual('YouTube',worker.validate_spec(spec)['platform'])
+        for region in ('ph','th','vn','id'):
+            spec['tenant']=region
+            with patch.object(worker,'tenant_config',return_value={'googleAccount':{'key':region}}):
+                self.assertEqual('YouTube',worker.validate_spec(spec)['platform'])
 
     def test_account_restriction_survives_partial_success(self):
         self.assertEqual('GOOGLE_LOGIN_REQUIRED',adapter.report_code({'results':[{'id':'a','status':'downloaded'},{'id':'b','status':'failed','kind':'authentication_required'}]}))

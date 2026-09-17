@@ -37,12 +37,13 @@ def report_code(report):
 
 
 def execute(args,job):
-    if os.getenv('HM_CAPTURE_TENANT')!='vn':raise ingest.PipelineError('YouTube is only enabled in VN')
+    tenant=os.getenv('HM_CAPTURE_TENANT')
+    if tenant not in ('ph','th','vn','id'):raise ingest.PipelineError('Invalid execution tenant')
     backend=ingest.normalize_backend(args.backend);execution=str(job['executionId'])
     folder=args.state_dir.expanduser().resolve()/ingest.state_segment(execution);folder.mkdir(parents=True,exist_ok=True)
     report_path=folder/'youtube-download.json'
     output=Path(os.environ['FACEBOOK_FOLLOWED_OUTPUT'])/'YouTube'
-    config=json.loads(Path(os.environ['HM_TENANT_CONFIG']).read_text())['vn']
+    config=json.loads(Path(os.environ['HM_TENANT_CONFIG']).read_text())[tenant]
     pump=ingest.HeartbeatPump(backend,args.worker_token,args.worker_id,execution,args.heartbeat_seconds)
     child=None
     try:
@@ -75,8 +76,8 @@ def execute(args,job):
         for video in records:
             ingest.record_video(backend,args.worker_token,args.worker_id,execution,video,download_status='DOWNLOADED' if video['status']=='downloaded' else 'DOWNLOAD_FAILED',upload_status='PENDING')
         code=report_code(report)
-        if code:accounts.download_result(config,'vn',code)
-        elif any(item.get('status')=='downloaded' for item in report.get('results',[])):accounts.download_result(config,'vn')
+        if code:accounts.download_result(config,tenant,code)
+        elif any(item.get('status')=='downloaded' for item in report.get('results',[])):accounts.download_result(config,tenant)
         counts=report.get('counts') or {key:sum(i.get('status')==key for i in report.get('results',[])) for key in ('downloaded','skipped','failed')}
         counts.setdefault('unattempted',max(0,report.get('discovered',0)-len(report.get('results',[]))))
         status='COMPLETED' if not code else 'PARTIAL' if counts.get('downloaded') else 'FAILED'

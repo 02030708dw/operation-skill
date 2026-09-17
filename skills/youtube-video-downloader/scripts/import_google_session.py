@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Import an explicitly authorized private cookie file into VN only.
+"""Import an explicitly authorized private cookie file into a selected region.
 
 Keep credentials in private stdin, verify the persisted browser session, and let
 the existing regional maintenance lease protect downloads and login replacement.
@@ -17,13 +17,14 @@ import time
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cookies', type=Path, required=True)
+    parser.add_argument('--tenant', choices=['ph','th','vn','id'], default='vn')
     args = parser.parse_args()
     os.umask(0o077)
     source = args.cookies.resolve()
     if not source.is_file() or source.stat().st_mode & 0o077 or source.stat().st_size > 1024 * 1024:
         parser.error('Cookie input must be a private file (0600), at most 1 MiB')
     script = Path(__file__).resolve().parents[2] / 'facebook-video-ingest/scripts/hm_facebook_web_session.py'
-    child = subprocess.Popen([sys.executable, str(script), 'vn', 'google'],
+    child = subprocess.Popen([sys.executable, str(script), args.tenant, 'google'],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=subprocess.DEVNULL, text=True)
     try:

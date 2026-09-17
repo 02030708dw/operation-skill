@@ -11,6 +11,17 @@ import hm_public_capture as public
 import hm_server_worker as worker
 
 class PublicCaptureTests(unittest.TestCase):
+    def setUp(self):
+        env=patch.dict(os.environ,{"HM_CAPTURE_TENANT":"vn"});env.start();self.addCleanup(env.stop)
+
+    def test_account_callbacks_use_current_region(self):
+        for region in ('ph','th','vn','id'):
+            with patch.dict(os.environ,{'HM_CAPTURE_TENANT':region}),patch.object(public.google,'download_result') as report:
+                public.account_outcome({'googleAccount':{'key':'google-'+region}},'YouTube',None)
+                self.assertEqual(region,report.call_args.args[1])
+        with patch.dict(os.environ,{'HM_CAPTURE_TENANT':'unknown'}):
+            with self.assertRaises(public.ingest.PipelineError):public.current_tenant()
+
     def test_download_and_recovered_receipt_include_preview_integrity(self):
         import hashlib
         with tempfile.TemporaryDirectory() as tmp:
@@ -125,8 +136,9 @@ class PublicCaptureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{'HM_SERVER_STATE_DIR':tmp,'HM_MIN_FREE_DISK_BYTES':'0'}),patch.object(worker,'tenant_config',return_value=config),patch.object(worker,'status'),patch.object(worker,'worker_environment',return_value=dict(os.environ,TMPDIR=tmp)),patch.object(public.facebook,'acquire_capture') as account,patch.object(worker.subprocess,'Popen',return_value=Mock(poll=Mock(return_value=0),returncode=0)):
             worker.run(spec);account.assert_not_called()
         with patch.object(worker,'tenant_config',return_value=config):
-            spec['tenant']='ph'
-            with self.assertRaises(ValueError):worker.validate_spec(spec)
+            for region in ('ph','th','vn','id'):
+                spec['tenant']=region
+                self.assertEqual(region,worker.validate_spec(spec)['tenant'])
             spec['tenant']='vn';spec['capturePolicy']='ACCOUNT_REQUIRED'
             with self.assertRaises(ValueError):worker.validate_spec(spec)
 

@@ -274,9 +274,9 @@ Read [references/backend-api.md](references/backend-api.md) before changing the 
 
 Use the HM task detail API for per-video fields and the execution-history API for progress, terminal status, error, and combined result JSON.
 
-## VN public-first server policy
+## Regional public-first server policy
 
-When the trusted regional registry sets `capturePolicy: PUBLIC_FIRST` (VN only),
+When the trusted regional registry sets `capturePolicy: PUBLIC_FIRST` (PH, TH, VN or ID),
 `facebook-video-ingest/scripts/hm_public_capture.py` runs public discovery/download
 without cookies or saved browser profiles. A confirmed login requirement permits
 one supplement with an already available regional account. Missing/expired/busy

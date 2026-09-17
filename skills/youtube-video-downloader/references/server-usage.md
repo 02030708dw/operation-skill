@@ -68,9 +68,9 @@ chmod 600 "$HOME/.config/youtube/cookies.txt"
 
 安装依赖、输出目录和 Cookie 应属于实际运行任务的用户。不要将 `.venv`、媒体或 Cookie 放入托管技能目录。该技能也可脱离 HM 独立运行。
 
-## HM VN 后台集成
+## HM 四地区后台集成
 
-VN 开启 `HM_YOUTUBE_ENABLED` 并配置区域 `googleAccount` 后，由既有 `hm_server_worker.py` 领取 YouTube 任务。HM 适配器为 `scripts/hm_youtube_ingest.py`；依赖同一发布包中的 `facebook-video-ingest` 回传协议和浏览器公共模块。
+各地区分别开启 `HM_YOUTUBE_ENABLED` 并配置区域 `googleAccount` 后，由既有 `hm_server_worker.py` 领取 YouTube 任务。HM 适配器为 `scripts/hm_youtube_ingest.py`；依赖同一发布包中的 `facebook-video-ingest` 回传协议和浏览器公共模块。
 
 运营人员在后台 Google 登录弹窗内完成官方页面登录。服务器在独立 Google 账号目录保存会话，登录维护与下载互斥，并发为 1；不会读取本机 Chrome。`LOGGED_IN` 表示已验证登录，只有真实文件下载成功才标记 `AVAILABLE / PASSED`。重新登录需重新验证下载；Cookie 存在本身不构成成功证据。
 
@@ -78,7 +78,7 @@ VN 开启 `HM_YOUTUBE_ENABLED` 并配置区域 `googleAccount` 后，由既有 `
 
 ### 经授权从独立 Chrome 资料迁移
 
-Google 拒绝服务器浏览器登录时，管理员可在用户明确同意后，从仅登录目标账号的独立 Chrome 资料导出 Google / YouTube Netscape Cookie，并通过私有传输送入 VN。不要使用含其他账号的常用资料。导出文件不能包含其他域名，权限必须为 `0600`，不进入 Git 或日志。
+Google 拒绝服务器浏览器登录时，管理员可在用户明确同意后，从仅登录目标账号的独立 Chrome 资料导出 Google / YouTube Netscape Cookie，并通过私有传输送入指定地区。不要使用含其他账号的常用资料。导出文件不能包含其他域名，权限必须为 `0600`，不进入 Git 或日志。
 
 在配置了 `HM_TENANT_CONFIG` 的 HM Worker 内，以 `hermes` 用户执行：
 
@@ -87,4 +87,4 @@ python /opt/data/skills/youtube-video-downloader/scripts/import_google_session.p
   --cookies /opt/data/private-import/google-vn.txt
 ```
 
-导入命令仅接受 VN，持有区域账号维护锁，使用临时资料验证 YouTube 登录并关闭、重新打开浏览器复验。成功后替换 VN 会话，保留原资料备份；下载仍为 `NOT_TESTED`。需要验证、失败或超时会停止，原会话不被覆盖。处理完应删除传输用的临时文件；实际运行会话留在私有区域目录。
+导入命令通过 `--tenant ph|th|vn|id` 选择地区（兼容默认 VN），持有区域账号维护锁，使用临时资料验证 YouTube 登录并关闭、重新打开浏览器复验。成功后替换所选地区会话，保留原资料备份；下载仍为 `NOT_TESTED`。需要验证、失败或超时会停止，原会话不被覆盖。处理完应删除传输用的临时文件；实际运行会话留在私有区域目录。

@@ -28,10 +28,10 @@ def validate_spec(spec: dict) -> dict:
         result["tenant"] = tenant
     platform=spec.get("platform", "Facebook")
     if platform not in {"Facebook","YouTube"}:raise ValueError("Invalid capture platform")
-    if platform=="YouTube" and (tenant!="vn" or result["kind"]!="CAPTURE" or not (tenant_config(result).get("googleAccount") or tenant_config(result).get("capturePolicy")=="PUBLIC_FIRST")):
+    if platform=="YouTube" and (not tenant or result["kind"]!="CAPTURE" or not (tenant_config(result).get("googleAccount") or tenant_config(result).get("capturePolicy")=="PUBLIC_FIRST")):
         raise ValueError("YouTube is not enabled for this tenant")
     policy=tenant_config(result).get("capturePolicy","ACCOUNT_REQUIRED") if tenant else "ACCOUNT_REQUIRED"
-    if policy=="PUBLIC_FIRST" and tenant!="vn":raise ValueError("Public-first is VN only")
+    if policy=="PUBLIC_FIRST" and not tenant:raise ValueError("Public-first requires a configured tenant")
     if spec.get("capturePolicy",policy)!=policy:raise ValueError("Capture policy mismatch")
     result["capturePolicy"]=policy
     result["platform"]=platform
