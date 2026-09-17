@@ -258,7 +258,7 @@ completion.
     so a backend retry policy cannot make one Cron invocation loop forever. A
     missing or incompatible local-delete API must be reported in
     `localDeleteError` without preventing approved uploads in the same poll.
-11. Complete every claimed execution as `COMPLETED`, `PARTIAL`, or `FAILED`. Report explicit, non-transient callback parameter rejections as `FAILED`. For network errors, server failures, or transient 4xx responses (408/425/429), leave the execution running for lease retry and do not claim that HM recorded completion. An uncertain completion response must never trigger a replacement `FAILED` callback.
+11. Complete every claimed execution as `COMPLETED`, `PARTIAL`, `LOGIN_REQUIRED`, or `FAILED`. Report explicit, non-transient callback parameter rejections as `FAILED`. For network errors, server failures, or transient 4xx responses (408/425/429), leave the execution running for lease retry and do not claim that HM recorded completion. An uncertain completion response must never trigger a replacement `FAILED` callback.
 12. Do not impose a short overall timeout. Monitor the same active process rather than starting a duplicate.
 
 Read [references/backend-api.md](references/backend-api.md) before changing the backend contract or diagnosing claim, heartbeat, callback, or lease behavior.
@@ -286,3 +286,15 @@ prove account login. Durable item receipts precede callbacks, and execution logs
 include anonymous/authenticated attempts and separate downloaded/skipped/failed/
 unattempted counts (unknown when source enumeration failed). Other regions and
 standalone CLI behavior remain unchanged.
+
+### Login-required classification
+
+Regional public-first runs report `LOGIN_REQUIRED` when all actionable work is
+blocked by explicit login requirements. Missing, expired, or busy regional
+sessions are not download failures. Mixed batches continue public work and
+report `loginRestriction.scope=PARTIAL`; true network/parser/access errors remain
+failures. A discovery page with no links is still `DISCOVERY_EMPTY`, never inferred
+as a login wall. Authenticated content permission failures are `ACCESS_DENIED`
+and do not invalidate the browser session. Per-video login receipts skip known
+restricted items while the regional session is unavailable; these are separate
+from download archives and never count as successful downloads.

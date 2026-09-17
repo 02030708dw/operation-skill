@@ -602,7 +602,7 @@ def capture_download_status(video: dict[str, Any]) -> str | None:
     status = str(video.get("status") or "").strip().lower()
     if status in NON_ACTIONABLE_VIDEO_STATUSES:
         return None
-    return "DOWNLOADED" if status == "downloaded" else "DOWNLOAD_FAILED"
+    return "DOWNLOADED" if status == "downloaded" else "LOGIN_REQUIRED" if status == "login-required" else "DOWNLOAD_FAILED"
 
 
 class IncrementalVideoRecorder:

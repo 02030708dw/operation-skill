@@ -259,3 +259,14 @@ Authenticated HM users can inspect:
 
 - `GET /api/capture/tasks/{taskNo}` for task configuration and per-video download/R2 fields.
 - `GET /api/capture/tasks/{taskNo}/executions` for execution status, progress, timestamps, error, and result JSON.
+
+## Regional login-required results
+
+`downloadStatus` and execution completion accept `LOGIN_REQUIRED`. The Worker
+reports `counts.login-required` separately from `failed`; failed source enumeration
+keeps `discovered` and `unattempted` unknown. `loginRestriction` contains `scope`
+(`NONE`, `FULL`, `PARTIAL`) and a safe `reasonCode`. A mixed batch with only login
+restrictions completes as `PARTIAL`; one with no public results completes as
+`LOGIN_REQUIRED`. Backend scheduling skips known `FULL` restrictions while the
+corresponding regional browser session is unavailable; public and mixed tasks
+remain eligible. Callback recovery reuses the saved report and video identities.

@@ -21,8 +21,10 @@ from download import Logger, save, resolve_ffmpeg, normalize_url
 
 AUTH_ENV = ('HM_GOOGLE_COOKIES','HM_FACEBOOK_PROFILE','HM_FACEBOOK_ACCOUNT_STATE',
             'FACEBOOK_FOLLOWED_COOKIES','FB_FOLLOWED_COOKIES','YTDLP_COOKIES','YTDLP_COOKIES_FROM_BROWSER')
+LOGIN_CODES = {'LOGIN_REQUIRED','ACCOUNT_NOT_CONFIGURED','ACCOUNT_UNAVAILABLE','ACCOUNT_BUSY'}
 STOP = {'RATE_LIMITED','VERIFICATION_REQUIRED','ACCOUNT_SUSPENDED'}
 MESSAGES = {
+    'ACCESS_DENIED':'当前账号已登录，但没有该内容的访问权限。',
     'LOGIN_REQUIRED':'该内容需要登录；没有可用登录会话时无法下载。',
     'ACCOUNT_NOT_CONFIGURED':'该内容需要登录，本地区未配置账号。',
     'ACCOUNT_UNAVAILABLE':'该内容需要登录，本地区账号未登录或会话已失效。',
@@ -88,6 +90,12 @@ def authenticated_session(config,platform):
     finally: lease.close()
 
 
+def saved_session_available(config,platform):
+    provider=google if platform=='YouTube' else facebook
+    account=provider.account_config(config)
+    return bool(account and provider.read_state(account).get('state') in ('AVAILABLE','LOGGED_IN'))
+
+
 def account_outcome(config,platform,code):
     provider=google if platform=='YouTube' else facebook
     if not provider.account_config(config):return
@@ -116,7 +124,10 @@ def attempt(operation,config,platform,attempts,stage):
             try:
                 result=operation(credentials)
             except Exception as error:
-                code=classify(error);auth.update(result='FAILED',reasonCode=code)
+                code=classify(error)
+                # Content permissions are not evidence that the browser session expired.
+                if code=='LOGIN_REQUIRED':code='ACCESS_DENIED'
+                auth.update(result='FAILED',reasonCode=code)
                 account_outcome(config,platform,code);raise Failure(code)
             auth['result']='PASSED'
             if stage=='DOWNLOAD' and isinstance(result,dict) and result.get('status')=='downloaded':account_outcome(config,platform,None)
@@ -124,6 +135,30 @@ def attempt(operation,config,platform,attempts,stage):
     except Exception as error:
         code=classify(error);auth.setdefault('reasonCode',code)
         raise Failure(code) from None
+
+
+def requires_login(code, attempts):
+    if code in LOGIN_CODES:return True
+    # A challenge while checking a saved account follows an explicit public login wall.
+    return code in ('VERIFICATION_REQUIRED','ACCOUNT_SUSPENDED') and any(
+        a.get('mode')=='AUTHENTICATED' and a.get('result')=='NOT_ATTEMPTED' for a in attempts)
+
+
+def finalize_report(report):
+    for item in report['results']:
+        if item.get('status')=='failed' and requires_login(item.get('errorCode'),item.get('attempts',[])):
+            item['status']='login-required'
+    counts={name:sum(x['status']==name for x in report['results']) for name in ('downloaded','skipped','failed','filtered-duration','login-required')}
+    counts['unattempted']=None if report['discovered'] is None else max(0,report['discovered']-len(report['results']))
+    discovery_login=requires_login(report.get('errorCode'),report.get('attempts',[])) or any(x['status']=='login-required' and x.get('errorCode')==report.get('errorCode') for x in report['results'])
+    restricted=discovery_login or counts['login-required']>0
+    real_error=bool(report.get('errorCode') and not discovery_login) or counts['failed']>0
+    public_results=counts['downloaded']+counts['skipped']+counts['filtered-duration']
+    scope='FULL' if restricted and not real_error and not public_results else 'PARTIAL' if restricted else 'NONE'
+    code=report.get('errorCode') if discovery_login else next((x.get('errorCode') for x in report['results'] if x['status']=='login-required'),None)
+    report.update(counts=counts,loginRestriction=dict(scope=scope,reasonCode=code),
+        status='LOGIN_REQUIRED' if scope=='FULL' else 'PARTIAL' if (real_error or restricted) and public_results else 'FAILED' if real_error else 'COMPLETED')
+    return report
 
 
 def common_options(credentials):
@@ -190,7 +225,7 @@ def download_item(platform,item,output,credentials):
 def run_download(platform,url,limit,output,report_path,config,on_item=lambda *_:None):
     output.mkdir(parents=True,exist_ok=True);receipts=output/'.public-items';receipts.mkdir(exist_ok=True)
     report=json.loads(report_path.read_text()) if report_path.exists() else dict(capturePolicy='PUBLIC_FIRST',platform=platform,attempts=[],results=[],discovered=None,startedAt=int(time.time()*1000))
-    if report.get('finishedAt'):return report
+    if report.get('finishedAt'):return finalize_report(report)
     # Partial manifests survive worker/acknowledgement failure; never replay completed items.
     entries=report.get('entries')
     if entries is None:
@@ -209,7 +244,7 @@ def run_download(platform,url,limit,output,report_path,config,on_item=lambda *_:
     for entry in entries:
         if entry['id'] in processed:continue
         if report['results']:time.sleep(5)
-        key=hashlib.sha256(entry['id'].encode()).hexdigest();receipt=receipts/(key+'.json')
+        key=hashlib.sha256(entry['id'].encode()).hexdigest();receipt=receipts/(key+'.json');login_receipt=receipts/(key+'.login.json')
         item=dict(entry,sourceId=entry['id'],attempts=[])
         with (receipts/(key+'.lock')).open('a') as lock:
             try:
@@ -220,19 +255,25 @@ def run_download(platform,url,limit,output,report_path,config,on_item=lambda *_:
                     previous=output/'.items'/(entry['id']+'.json')
                     if previous.is_file():item.update(json.loads(previous.read_text()))
                     item['status']='skipped'
+                elif login_receipt.exists() and not saved_session_available(config,platform):
+                    item.update(status='login-required',errorCode='ACCOUNT_UNAVAILABLE')
                 else:
                     item.update(attempt(lambda c:download_item(platform,entry,output,c),config,platform,item['attempts'],'DOWNLOAD'))
                     if item['status']=='downloaded':
                         save(receipt,item)
                         save(receipts/(hashlib.sha256(item['id'].encode()).hexdigest()+'.json'),item)
             except BlockingIOError:item.update(status='failed',errorCode='VIDEO_BUSY')
-            except Exception as error:item.update(status='failed',errorCode=classify(error))
+            except Exception as error:
+                code=classify(error)
+                item.update(status='login-required' if requires_login(code,item['attempts']) else 'failed',errorCode=code)
+        if item['status']=='login-required':save(login_receipt,{'reasonCode':item.get('errorCode')})
+        elif item['status'] in ('downloaded','skipped','filtered-duration'):login_receipt.unlink(missing_ok=True)
+        item['observedAt']=dt.datetime.now(dt.timezone.utc).isoformat()
         report['results'].append(item);save(report_path,report);on_item(item)
         if item.get('errorCode') in STOP:
             report['errorCode']=item['errorCode'];break
-    counts={name:sum(x['status']==name for x in report['results']) for name in ('downloaded','skipped','failed','filtered-duration')}
-    counts['unattempted']=None if report['discovered'] is None else max(0,report['discovered']-len(report['results']))
-    report.update(counts=counts,finishedAt=int(time.time()*1000))
+    finalize_report(report)
+    report['finishedAt']=int(time.time()*1000)
     public=[a for a in report['attempts']+sum((i.get('attempts',[]) for i in report['results']),[]) if a['mode']=='PUBLIC']
     rates=any(a.get('reasonCode')=='RATE_LIMITED' for a in public)
     passed=any(a.get('result')=='PASSED' and a.get('stage')=='DOWNLOAD' for a in public)
@@ -264,7 +305,8 @@ def video_record(item):
         titleSource='ORIGINAL' if item.get('title') else 'NONE',titleStatus='AVAILABLE' if item.get('title') else 'PENDING',
         localPath=str(path) if good else None,fileName=path.name if good else None,fileSize=path.stat().st_size if good else None,sha256=digest,
         durationSeconds=round(item['duration']) if item.get('duration') else None,publishedAt=published,
-        status='downloaded' if good else 'download-failed',errorCode=None if good else 'PUBLIC_'+item.get('errorCode','DOWNLOAD_FAILED'),
+        statistics=dict(attemptId=hashlib.sha256(item['id'].encode()).hexdigest()[:32],occurredAt=item['observedAt'],outcome='CACHE' if item['status']=='skipped' else 'SUCCESS' if good else 'LOGIN_REQUIRED' if item['status']=='login-required' else 'FAILURE') if item.get('observedAt') else None,
+        status='downloaded' if good else 'login-required' if item['status']=='login-required' else 'download-failed',errorCode=None if good else 'PUBLIC_'+item.get('errorCode','DOWNLOAD_FAILED'),
         error=None if good else MESSAGES.get(item.get('errorCode'),MESSAGES['DOWNLOAD_FAILED']),attempts=item.get('attempts',[]))
 
 
@@ -276,7 +318,7 @@ def log_text(report):
         lines.append(item['id']+' · '+item['status']+' '+MESSAGES.get(item.get('errorCode'),''))
         for a in item.get('attempts',[]):lines.append('  '+('匿名' if a['mode']=='PUBLIC' else '账号补试')+' · '+a['result']+' '+MESSAGES.get(a.get('reasonCode'),''))
     if report.get('errorCode'):lines.append(MESSAGES.get(report['errorCode'],MESSAGES['DOWNLOAD_FAILED']))
-    c=report['counts'];lines.append(f"成功 {c['downloaded']}；跳过 {c['skipped']}；失败 {c['failed']}；未尝试 "+('未知（未能枚举）' if c['unattempted'] is None else str(c['unattempted'])))
+    c=report['counts'];lines.append(f"成功 {c['downloaded']}；跳过 {c['skipped']}；需要登录 {c['login-required']}；失败 {c['failed']}；未尝试 "+('未知（未能枚举）' if c['unattempted'] is None else str(c['unattempted'])))
     return '\n'.join(lines)
 
 
@@ -291,15 +333,14 @@ def execute(args,job):
     pump=ingest.HeartbeatPump(backend,args.worker_token,args.worker_id,execution,args.heartbeat_seconds)
     def record(item):
         video=video_record(item)
-        if video:ingest.record_video(backend,args.worker_token,args.worker_id,execution,video,download_status='DOWNLOADED' if video['status']=='downloaded' else 'DOWNLOAD_FAILED',upload_status='PENDING')
+        if video:ingest.record_video(backend,args.worker_token,args.worker_id,execution,video,download_status='DOWNLOADED' if video['status']=='downloaded' else 'LOGIN_REQUIRED' if video['status']=='login-required' else 'DOWNLOAD_FAILED',upload_status='PENDING')
     try:
         ingest.heartbeat(backend,args.worker_token,args.worker_id,execution,5);pump.start()
         report=run_download(platform,job['sourceUrl'],args.count,output,folder/'public-download.json',config,record)
         for item in report['results']:record(item)
-        failed=report.get('errorCode') or report['counts']['failed']
-        state='PARTIAL' if failed and (report['counts']['downloaded'] or report['counts']['skipped']) else 'FAILED' if failed else 'COMPLETED'
-        report.update(status=state,executionId=execution,skill='public-first-capture')
-        code=report.get('errorCode') or next((x.get('errorCode') for x in report['results'] if x['status']=='failed'),None)
+        state=report['status']
+        report.update(executionId=execution,skill='public-first-capture')
+        code=report.get('errorCode') or next((x.get('errorCode') for x in report['results'] if x['status'] in ('failed','login-required')),None)
         log=log_text(report);save(folder/'result.json',report);(folder/'worker.log').write_text(log)
         ingest.complete(backend,args.worker_token,args.worker_id,execution,state,report,log,'PUBLIC_'+code if code else None,MESSAGES.get(code) if code else None)
         return 0,report

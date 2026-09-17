@@ -101,10 +101,10 @@ class PublicCaptureTests(unittest.TestCase):
                 return dict(item,status='downloaded',path=str(p))
             with patch.object(public,'discover',return_value=entries),patch.object(public,'download_item',side_effect=download) as dl,patch.object(public.time,'sleep'):
                 r=public.run_download('Facebook','https://www.facebook.com/page',3,out,report,{})
-                self.assertEqual({'downloaded':2,'skipped':0,'failed':1,'filtered-duration':0,'unattempted':0},r['counts'])
+                self.assertEqual({'downloaded':2,'skipped':0,'failed':0,'filtered-duration':0,'login-required':1,'unattempted':0},r['counts'])
                 self.assertEqual('PASSED',r['publicDownload']['status'])
                 r=public.run_download('Facebook','https://www.facebook.com/page',3,out,root/'again.json',{})
-                self.assertEqual(2,r['counts']['skipped']);self.assertEqual(4,dl.call_count)
+                self.assertEqual(2,r['counts']['skipped']);self.assertEqual(3,dl.call_count)
 
     def test_limit_stops_and_records_unattempted_without_account_mutation(self):
         with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{'HM_SERVER_STATE_DIR':tmp}):
@@ -153,3 +153,34 @@ class PublicCaptureTests(unittest.TestCase):
         self.assertIsNone(public.single_source('Facebook','https://www.facebook.com/example/videos'))
 
 if __name__=='__main__':unittest.main()
+
+class LoginClassificationTests(unittest.TestCase):
+    def test_final_states_keep_login_separate_from_real_failures(self):
+        cases=[([], 'ACCOUNT_NOT_CONFIGURED','FULL','LOGIN_REQUIRED',0),
+               ([], 'DISCOVERY_EMPTY','NONE','FAILED',0),
+               ([{'status':'login-required','errorCode':'ACCOUNT_UNAVAILABLE'}],None,'FULL','LOGIN_REQUIRED',0),
+               ([{'status':'downloaded'},{'status':'login-required','errorCode':'ACCOUNT_UNAVAILABLE'}],None,'PARTIAL','PARTIAL',0),
+               ([{'status':'failed','errorCode':'NETWORK_ERROR'},{'status':'login-required','errorCode':'ACCOUNT_BUSY'}],None,'PARTIAL','FAILED',1)]
+        for items,error,scope,status,failed in cases:
+            report={'results':items,'attempts':[],'discovered':len(items) if items else None,'errorCode':error}
+            public.finalize_report(report)
+            self.assertEqual(scope,report['loginRestriction']['scope']);self.assertEqual(status,report['status']);self.assertEqual(failed,report['counts']['failed'])
+
+    def test_authenticated_permission_failure_does_not_invalidate_session(self):
+        @contextlib.contextmanager
+        def session(*_):yield {'cookiefile':'private'}
+        with patch.object(public,'authenticated_session',session),patch.object(public.google,'download_result') as account:
+            with self.assertRaises(public.Failure) as failure:
+                public.attempt(Mock(side_effect=public.Failure('LOGIN_REQUIRED')),{'googleAccount':{'key':'google-vn'}},'YouTube',[],'DOWNLOAD')
+            self.assertEqual('ACCESS_DENIED',failure.exception.code);account.assert_not_called()
+
+    def test_login_record_is_not_failed_and_no_fake_file(self):
+        item={'id':'123','url':'https://www.facebook.com/reel/123','status':'login-required','errorCode':'ACCOUNT_BUSY'}
+        video=public.video_record(item)
+        self.assertEqual('login-required',video['status']);self.assertIsNone(video['localPath'])
+        self.assertEqual('LOGIN_REQUIRED',public.ingest.capture_download_status(video))
+
+    def test_checkpoint_during_account_check_keeps_public_success(self):
+        report={'results':[{'status':'downloaded'},{'status':'login-required','errorCode':'VERIFICATION_REQUIRED'}],'attempts':[],'discovered':3,'errorCode':'VERIFICATION_REQUIRED'}
+        public.finalize_report(report)
+        self.assertEqual('PARTIAL',report['loginRestriction']['scope']);self.assertEqual(0,report['counts']['failed']);self.assertEqual(1,report['counts']['unattempted'])
