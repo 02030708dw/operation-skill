@@ -84,6 +84,22 @@ class TikTokCaptureTests(unittest.TestCase):
             self.assertEqual('h264',preview['videoCodec']);self.assertEqual('aac',preview['audioCodec'])
             self.assertEqual(verified['sha256'],tiktok.downloader.digest(original));self.assertTrue(tiktok.receipt_valid(item))
 
+    def test_h264_preview_cleanup_keeps_original_and_recovery_is_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);raw=root/'originals';raw.mkdir()
+            original=raw/'20260918_test_[123].mp4';ffmpeg=tiktok.downloader.ffmpeg_binary()
+            subprocess.run([ffmpeg,'-nostdin','-v','error','-f','lavfi','-i','color=size=64x64:rate=10',
+                '-t','0.5','-c:v','libx264',str(original)],check=True)
+            saved=dict(tiktok.downloader.validate_file(original,ffmpeg,False),path=original.name,status='skipped')
+            engine=Mock(ffmpeg=ffmpeg,inspect=Mock(return_value={'formats':[{}],'duration':0.5}))
+            with patch.object(tiktok,'provider',return_value=engine),patch.object(tiktok.downloader,'download_one',return_value=saved):
+                item=tiktok.download({'id':'123','url':PROFILE+'/video/123'},root)
+                self.assertNotEqual(item['path'],str(original))
+                Path(item['path']).unlink()
+                self.assertTrue(original.is_file())
+                recovered=tiktok.download({'id':'123','url':PROFILE+'/video/123'},root)
+                self.assertEqual('skipped',recovered['status']);self.assertTrue(tiktok.receipt_valid(recovered))
+
     def test_platform_opt_in_and_locks_are_regional(self):
         spec=dict(dispatchId=1,attempt=1,kind='CAPTURE',slot=1,taskNo='C-X',executionNo='E-X',tenant='vn',platform='TikTok',capturePolicy='PUBLIC_FIRST')
         with patch.object(worker,'tenant_config',return_value={'capturePolicy':'PUBLIC_FIRST','enabledPlatforms':['Facebook']}):

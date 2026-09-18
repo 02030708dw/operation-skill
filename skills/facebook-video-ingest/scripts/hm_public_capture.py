@@ -286,7 +286,7 @@ def run_download(platform,url,limit,output,report_path,config,on_item=lambda *_:
                     item.update(status='login-required',errorCode='ACCOUNT_UNAVAILABLE')
                 else:
                     item.update(attempt(lambda c:download_item(platform,entry,output,c),config,platform,item['attempts'],'DOWNLOAD'))
-                    if item['status']=='downloaded':
+                    if item['status']=='downloaded' or platform=='TikTok' and item['status']=='skipped':
                         save(receipt,item)
                         save(receipts/(hashlib.sha256(item['id'].encode()).hexdigest()+'.json'),item)
             except BlockingIOError:item.update(status='failed',errorCode='VIDEO_BUSY')

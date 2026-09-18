@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import sys
 
 SCRIPTS = Path(__file__).resolve().parents[2] / 'tiktok-video-downloader/scripts'
@@ -54,12 +55,16 @@ def download(item, output):
             return dict(item, status='filtered-duration', duration=info['duration'])
     saved = downloader.download_one(current, raw, archive, engine, engine.ffmpeg)
     original = raw / saved['path']
+    preview = output / 'previews' / (current['id']+'.mp4')
+    preview.parent.mkdir(parents=True, exist_ok=True)
     if saved['videoCodec'] == 'h264' and saved.get('audioCodec') in (None, 'aac'):
-        preview = original
+        # 审核暂存会清理预览路径，必须与长期保留的原文件分开。
+        if not preview.is_file() or downloader.digest(preview) != saved['sha256']:
+            temporary = preview.with_suffix('.partial.mp4')
+            shutil.copy2(original, temporary)
+            temporary.replace(preview)
         verified = saved
     else:
-        preview = output / 'previews' / (current['id']+'.mp4')
-        preview.parent.mkdir(parents=True, exist_ok=True)
         if not preview.exists():
             temporary = preview.with_suffix('.partial.mp4')
             proc = subprocess.run([engine.ffmpeg, '-nostdin', '-v', 'error', '-y', '-i', str(original),
@@ -75,7 +80,7 @@ def download(item, output):
             preview.replace(preview.with_suffix('.invalid.mp4'))
             raise
     filename = original.name
-    return dict(item, status='downloaded', title=saved.get('title') or current['id'],
+    return dict(item, status=saved.get('status','downloaded'), title=saved.get('title') or current['id'],
         upload_date=filename[:8] if filename[:8].isdigit() else None,
         duration=saved['duration'], path=str(preview), bytes=verified['bytes'],
         sha256=verified['sha256'], decodePassed=True, originalPath=str(original),
