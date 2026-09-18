@@ -16,7 +16,7 @@ git archive --format=tar.gz --output=/tmp/tiktok-skill.tar.gz HEAD skills/tiktok
 docker build -t hm-tiktok-downloader:COMMIT .
 ```
 
-默认 Python 3.11-slim。`--build-arg BASE_IMAGE=...` 支持服务器已有、提供 Python 3.10+ 及 venv 的可信 Linux 镜像。它只作为独立新镜像的基础，不更新已有容器。依赖在 `/opt/tiktok/venv` 单独安装。FFmpeg 来自固定 imageio-ffmpeg wheel；有系统 FFmpeg 则优先使用。该基础镜像不得包含账号资料。
+默认 Python 3.11-slim。`--build-arg BASE_IMAGE=...` 支持服务器已有、提供 Python 3.10+ 及 venv 的可信 Linux 镜像。它只作为独立新镜像的基础，不更新已有容器。镜像安装独立 Chromium 和字体，依赖在 `/opt/tiktok/venv` 单独安装。匿名浏览器资料仅在专用数据目录中临时创建，结束清理。Docker 中以非 root、无额外 capabilities 运行；`TIKTOK_CHROMIUM_NO_SANDBOX=1` 仅用于容器中的 Chromium 启动，不应对本机 Chrome 默认启用。FFmpeg 来自固定 imageio-ffmpeg wheel；有系统 FFmpeg 则优先使用。该基础镜像不得包含账号资料。
 
 ## 非 root 运行与持久化
 
@@ -48,3 +48,5 @@ docker run --rm --name tiktok-batch-test --user 10001:10001 --cap-drop ALL --sec
 ```
 
 yt-dlp 官方依赖说明：https://github.com/yt-dlp/yt-dlp#dependencies
+
+主页枚举仍受平台阻断时，记录原因并停止上线验收，不能用本地枚举链接代替服务器主页验收。

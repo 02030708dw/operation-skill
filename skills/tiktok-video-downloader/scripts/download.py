@@ -31,6 +31,8 @@ MESSAGES = {
     'UNSUPPORTED_CONTENT': '没有可下载的视频流。',
     'VALIDATION_FAILED': '文件音视频校验未通过，不写入成功归档。',
     'INTERRUPTED': '执行被中断，分片已保留，可重新运行续传。',
+    'BROWSER_UNAVAILABLE': '匿名 Chromium 浏览器不可用，未读取其他账号资料。',
+    'DISCOVERY_INCOMPLETE': '主页发现达到时间或滚动上限，列表不完整，剩余数量未知。',
     'BUSY': '输出目录已有任务运行，请稍后重试。',
     'ENVIRONMENT_ERROR': '运行环境或持久化目录不可用。',
 }
@@ -144,7 +146,10 @@ def ffmpeg_binary():
 
 
 class Extractor:
-    def __init__(self, ffmpeg): self.ffmpeg = ffmpeg
+    def __init__(self, ffmpeg, browser_temp_root=None):
+        self.ffmpeg = ffmpeg
+        self.browser_temp_root = browser_temp_root
+        self.discovery = {'method':'YT_DLP'}
     def options(self):
         return {'logger': QuietLogger(), 'quiet': True, 'no_warnings': True, 'noprogress': True,
                 'cachedir': False, 'cookiefile': None, 'cookiesfrombrowser': None, 'usenetrc': False,
@@ -157,7 +162,21 @@ class Extractor:
                                       playlistend=limit, lazy_playlist=True)) as ydl:
                 info = ydl.extract_info(source['url'], download=False)
                 return list(itertools.islice(info.get('entries') or [], limit)) if info else []
-        return network_call(request)
+        self.discovery = {'method':'YT_DLP'}
+        try:
+            return network_call(request)
+        except Failure as error:
+            if error.code not in {'PROFILE_ID_UNAVAILABLE','EXTRACTION_ERROR'}: raise
+            self.discovery = {'method':'ANONYMOUS_CHROMIUM','fallbackReason':error.code}
+            import browser_discovery
+            if self.browser_temp_root: Path(self.browser_temp_root).mkdir(parents=True, exist_ok=True)
+            try:
+                result = browser_discovery.discover(source, limit, self.browser_temp_root)
+            except browser_discovery.BrowserFailure as blocked:
+                self.discovery['evidence'] = blocked.evidence
+                raise Failure(blocked.code) from None
+            self.discovery.update(evidence=result['evidence'], incomplete=not result['complete'])
+            return result['entries']
     def inspect(self, source):
         import yt_dlp
         def request():
@@ -236,12 +255,13 @@ def download_one(source, output, archive, extractor, ffmpeg, validator=validate_
 def finish(report):
     rows = report['results']
     report['counts'] = {key: sum(x['status'] == key for x in rows) for key in ('downloaded', 'skipped', 'login-required', 'failed', 'unsupported', 'listed')}
-    report['counts']['unattempted'] = None if report['discovered'] is None else report['discovered'] - len(rows)
+    report['counts']['unattempted'] = None if report['discovered'] is None or report['discovery'].get('incomplete') else report['discovered'] - len(rows)
     error = report.get('error', {}).get('code')
     if error: report['status'] = 'LOGIN_REQUIRED' if error == 'LOGIN_REQUIRED' else 'STOPPED' if error in STOP or error == 'INTERRUPTED' else 'FAILED'
     elif report['counts']['failed']: report['status'] = 'PARTIAL' if any(x['status'] in {'downloaded', 'skipped'} for x in rows) else 'FAILED'
     elif report['counts']['login-required']: report['status'] = 'PARTIAL' if any(x['status'] in {'downloaded', 'skipped'} for x in rows) else 'LOGIN_REQUIRED'
     elif report['counts']['unsupported'] and report['counts']['unsupported'] == len(rows): report['status'] = 'UNSUPPORTED'
+    elif report['discovery'].get('incomplete'): report['status'] = 'PARTIAL'
     else: report['status'] = 'LISTED' if report['mode'] == 'list' else 'COMPLETED'
     report['finishedAt'] = dt.datetime.now(dt.timezone.utc).isoformat()
     return report
@@ -259,7 +279,8 @@ def run(source, output, limit, list_only, extractor, ffmpeg, report_path, valida
             entries = extractor.discover(source, limit)
             if not entries: raise Failure('DISCOVERY_EMPTY')
             entries = entries[:limit]
-            report['discovery'] = {'status': 'COMPLETED'}
+            report['discovery'] = {**getattr(extractor, 'discovery', {}), 'status': 'COMPLETED'}
+            if report['discovery'].get('incomplete'): report['discovery'].update(status='PARTIAL', reasonCode='DISCOVERY_INCOMPLETE')
         else: entries = [source]
         report['discovered'] = len(entries)
         save(report_path, report)
@@ -285,7 +306,7 @@ def run(source, output, limit, list_only, extractor, ffmpeg, report_path, valida
         report['error'] = {'code': 'INTERRUPTED', 'reason': MESSAGES['INTERRUPTED']}
     except Exception as error:
         code = classify(error); report['error'] = {'code': code, 'reason': MESSAGES[code]}
-        if report['discovered'] is None: report['discovery'] = {'status': 'FAILED', 'reasonCode': code}
+        if report['discovered'] is None: report['discovery'] = {**getattr(extractor, 'discovery', {}), 'status': 'FAILED', 'reasonCode': code}
     save(report_path, finish(report))
     return report
 
@@ -312,7 +333,7 @@ def main():
         report_path = output / '.reports' / (stamp + '.json')
         try:
             ffmpeg = ffmpeg_binary()
-            report = run(source, output, args.limit, args.list_only, Extractor(ffmpeg), ffmpeg, report_path)
+            report = run(source, output, args.limit, args.list_only, Extractor(ffmpeg, output / '.browser-temp'), ffmpeg, report_path)
         except (OSError, ValueError, Failure):
             print(json.dumps({'status': 'ENVIRONMENT_ERROR', 'reason': MESSAGES['ENVIRONMENT_ERROR']}, ensure_ascii=False)); return 2
         print(json.dumps({'status': report['status'], 'report': str(report_path), 'counts': report['counts'], 'error': report.get('error')}, ensure_ascii=False))

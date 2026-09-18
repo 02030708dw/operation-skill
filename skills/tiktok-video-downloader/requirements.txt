@@ -1,3 +1,4 @@
 yt-dlp[default]==2026.8.19
 curl-cffi==0.13.0
 imageio-ffmpeg==0.6.0
+websocket-client==1.8.0

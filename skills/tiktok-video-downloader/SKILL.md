@@ -9,7 +9,7 @@ description: Download TikTok public videos from single video links or bounded pr
 
 ## 本地使用
 
-需要 Python 3.10+。从技能目录运行：
+需要 Python 3.10+。主页解析失败时的匿名发现还需要 Chromium 或 Chrome（可用 `TIKTOK_CHROMIUM_BIN` 指定程序，不接受已有浏览器资料）。从技能目录运行：
 
 ```bash
 bash scripts/setup.sh
@@ -21,6 +21,12 @@ bash scripts/setup.sh
 `PYTHON_BIN` 可指定安装解释器；`TIKTOK_DOWNLOADER_VENV` 可指定虚拟环境。依赖固定在 `requirements.txt`，含官方支持的 curl_cffi 和自带 FFmpeg 的 imageio-ffmpeg；已有系统 FFmpeg 时优先使用。
 
 主页默认处理平台返回的前 10 条（包括重复条目），不是下载 10 条新视频，也不承诺按发布日期排序。`--limit` 范围 1–1000；不要自行扩大用户要求的数量。支持官方 `/@账号`、`/@账号/video/ID` 链接；图文和直播单独记为不支持。
+
+## 匿名主页发现
+
+先尝试 yt-dlp；仅账号编号缺失或解析错误时补试独立匿名 Chromium，不为登录、权限拒绝、验证码或限流切换发现方式。每次使用输出目录 `.browser-temp/` 下全新的临时配置，结束即清理，不访问 Facebook、Google 或用户 Chrome 资料。
+
+浏览器最多 90 秒、10 次滚动，连续 3 次没有新增即停止。只提取目标账号的规范视频链接和公开结构化视频信息。验证码或限流即停止，不自动处理验证。没有拿满请求数量时保守记录 `DISCOVERY_INCOMPLETE`、`unattempted=null`，不会声称扫完主页；没有条目仍保持总数未知。报告仅保留 HTTP 状态、滚动次数及登录/验证布尔信号。
 
 ## 结果与恢复
 
