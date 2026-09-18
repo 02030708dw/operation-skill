@@ -24,6 +24,7 @@ AUTH_ENV = ('HM_GOOGLE_COOKIES','HM_FACEBOOK_PROFILE','HM_FACEBOOK_ACCOUNT_STATE
 LOGIN_CODES = {'LOGIN_REQUIRED','ACCOUNT_NOT_CONFIGURED','ACCOUNT_UNAVAILABLE','ACCOUNT_BUSY'}
 STOP = {'RATE_LIMITED','VERIFICATION_REQUIRED','ACCOUNT_SUSPENDED'}
 MESSAGES = {
+    'MEDIA_COMPAT_FAILED':'视频兼容处理失败，原文件已保留，请重试。',
     'ACCESS_DENIED':'当前账号已登录，但没有该内容的访问权限。',
     'LOGIN_REQUIRED':'该内容需要登录；没有可用登录会话时无法下载。',
     'ACCOUNT_NOT_CONFIGURED':'该内容需要登录，本地区未配置账号。',
@@ -368,10 +369,13 @@ def execute(args,job):
             return
         video=video_record(item)
         if video:ingest.record_video(backend,args.worker_token,args.worker_id,execution,video,download_status='DOWNLOADED' if video['status']=='downloaded' else 'LOGIN_REQUIRED' if video['status']=='login-required' else 'DOWNLOAD_FAILED',upload_status='PENDING')
+        if video and video.get('errorCode')=='MEDIA_COMPAT_FAILED':
+            item.update(status='failed',errorCode='MEDIA_COMPAT_FAILED')
     try:
         ingest.heartbeat(backend,args.worker_token,args.worker_id,execution,5);pump.start()
         report=run_download(platform,job['sourceUrl'],args.count,output,folder/'public-download.json',config,record)
         for item in report['results']:record(item)
+        finalize_report(report)
         state=report['status']
         report.update(executionId=execution,skill='public-first-capture')
         code=report.get('errorCode') or next((x.get('errorCode') for x in report['results'] if x['status'] in ('failed','login-required')),None)

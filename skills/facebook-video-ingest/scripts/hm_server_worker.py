@@ -106,6 +106,7 @@ def worker_environment(spec: dict) -> dict:
     env["TMPDIR"] = str(root / "slots" / str(spec["slot"]) / "tmp")
     env["FACEBOOK_FOLLOWED_REPORTS"] = str(root / "reports" / str(spec["dispatchId"]))
     env["HM_CAPTURE_POLICY"]=config.get("capturePolicy","ACCOUNT_REQUIRED")
+    env["HM_MEDIA_COMPAT_ENABLED"] = "1" if config.get("mediaCompatibility", False) else "0"
     if env["HM_CAPTURE_POLICY"]=="PUBLIC_FIRST":
         from hm_public_capture import clean_environment
         env=clean_environment(env)

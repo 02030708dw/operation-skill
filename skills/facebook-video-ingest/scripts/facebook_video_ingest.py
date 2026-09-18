@@ -495,6 +495,11 @@ def record_video(
     download_status: str,
     upload_status: str,
 ) -> None:
+    if download_status == "DOWNLOADED":
+        from hm_media_compat import prepare_record
+        prepare_record(video)
+        if video.get("errorCode") == "MEDIA_COMPAT_FAILED":
+            download_status, upload_status = "DOWNLOAD_FAILED", "PENDING"
     original_url = video.get("originalUrl") or video.get("canonicalUrl")
     if not original_url:
         raise PipelineError("video result is missing originalUrl")
@@ -629,6 +634,7 @@ class IncrementalVideoRecorder:
         self.execution_id = execution_id
         self.progress_callback = progress_callback
         self.recorded: set[str] = set()
+        self.normalized_results: dict[str, dict] = {}
         self.stream_errors: dict[str, str] = {}
         self._queue: queue.Queue[dict[str, Any] | object] = queue.Queue()
         self._thread: threading.Thread | None = None
@@ -665,6 +671,7 @@ class IncrementalVideoRecorder:
         for video in videos:
             identity = video_result_identity(video)
             if identity in self.recorded:
+                video.update(self.normalized_results.get(identity, {}))
                 continue
             self._record(video)
 
@@ -727,6 +734,7 @@ class IncrementalVideoRecorder:
             download_status=download_status,
             upload_status="PENDING",
         )
+        self.normalized_results[identity] = dict(video)
         self.recorded.add(identity)
         self.stream_errors.pop(identity, None)
 
