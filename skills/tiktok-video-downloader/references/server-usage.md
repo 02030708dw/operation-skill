@@ -33,6 +33,16 @@ docker run --rm --name tiktok-batch-test --user 10001:10001 --cap-drop ALL --sec
 
 匿名仍会有平台向本次 HTTP 会话发放的临时 Cookie；这不代表用户登录，也不从外部浏览器导入身份。
 
+## 本地与服务器结果不一致时
+
+先对齐 yt-dlp、curl_cffi 版本，禁用用户配置和导入 Cookie，分别验证主页枚举。服务器默认请求报 `PROFILE_ID_UNAVAILABLE` 时，可显式选择已验证的请求配置：
+
+```bash
+docker run --rm --name tiktok-compatible-batch --user 10001:10001 --cap-drop ALL --security-opt no-new-privileges --mount type=bind,src="$PWD/data",dst=/data hm-tiktok-downloader:COMMIT 'https://www.tiktok.com/@anunya.pangya' --impersonate chrome-131:macos-14 --limit 10 --output /data
+```
+
+`--impersonate` 设置 curl_cffi 请求头及 TLS 特征，不启动真实 Chrome，不读取浏览器资料，也不改变网络出口。报告 `requestClient` 会保留该值。枚举通过后仍须验收实际下载、解码和去重；不能仅凭一次成功认定始终可用。已有明确限流或验证阻断时停止，不能轮换该参数继续尝试。
+
 ## 验收
 
 1. 运行单条，检查报告 `decodePassed=true`、文件大小、时长、分辨率及音视频编码。

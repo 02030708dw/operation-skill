@@ -146,15 +146,20 @@ def ffmpeg_binary():
 
 
 class Extractor:
-    def __init__(self, ffmpeg, browser_temp_root=None):
+    def __init__(self, ffmpeg, browser_temp_root=None, impersonate=None):
         self.ffmpeg = ffmpeg
         self.browser_temp_root = browser_temp_root
+        self.impersonate = impersonate
         self.discovery = {'method':'YT_DLP'}
     def options(self):
-        return {'logger': QuietLogger(), 'quiet': True, 'no_warnings': True, 'noprogress': True,
+        options = {'logger': QuietLogger(), 'quiet': True, 'no_warnings': True, 'noprogress': True,
                 'cachedir': False, 'cookiefile': None, 'cookiesfrombrowser': None, 'usenetrc': False,
                 'socket_timeout': 15, 'retries': 0, 'extractor_retries': 0, 'fragment_retries': 0,
                 'ignoreerrors': False, 'ffmpeg_location': self.ffmpeg}
+        if self.impersonate:
+            from yt_dlp.networking.impersonate import ImpersonateTarget
+            options['impersonate'] = ImpersonateTarget.from_str(self.impersonate)
+        return options
     def discover(self, source, limit):
         import yt_dlp
         def request():
@@ -269,6 +274,7 @@ def finish(report):
 
 def run(source, output, limit, list_only, extractor, ffmpeg, report_path, validator=validate_file):
     report = {'source': source['url'], 'mode': 'list' if list_only else 'download', 'authentication': 'ANONYMOUS',
+              'requestClient': getattr(extractor, 'impersonate', None),
               'limit': 1 if source['kind'] != 'profile' else limit, 'startedAt': dt.datetime.now(dt.timezone.utc).isoformat(),
               'discovered': None, 'results': [], 'discovery': {'status': 'NOT_NEEDED'}}
     archive_path = output / '.download-archive.json'
@@ -316,6 +322,8 @@ def main():
     parser.add_argument('url')
     parser.add_argument('--limit', type=int, default=10)
     parser.add_argument('--list-only', action='store_true')
+    parser.add_argument('--impersonate', choices=['chrome-131:macos-14'],
+                        help='使用已验证的 curl_cffi 浏览器请求配置；不读取浏览器或账号 Cookie')
     parser.add_argument('--output', type=Path, default=Path.home() / 'Downloads/TikTok')
     args = parser.parse_args()
     if not 1 <= args.limit <= 1000: parser.error('--limit 必须在 1 到 1000 之间')
@@ -333,7 +341,8 @@ def main():
         report_path = output / '.reports' / (stamp + '.json')
         try:
             ffmpeg = ffmpeg_binary()
-            report = run(source, output, args.limit, args.list_only, Extractor(ffmpeg, output / '.browser-temp'), ffmpeg, report_path)
+            report = run(source, output, args.limit, args.list_only,
+                         Extractor(ffmpeg, output / '.browser-temp', args.impersonate), ffmpeg, report_path)
         except (OSError, ValueError, Failure):
             print(json.dumps({'status': 'ENVIRONMENT_ERROR', 'reason': MESSAGES['ENVIRONMENT_ERROR']}, ensure_ascii=False)); return 2
         print(json.dumps({'status': report['status'], 'report': str(report_path), 'counts': report['counts'], 'error': report.get('error')}, ensure_ascii=False))

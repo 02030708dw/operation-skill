@@ -54,6 +54,27 @@ class DownloadTests(unittest.TestCase):
         self.assertEqual(report['counts']['skipped'], 1)
         self.assertEqual(len(list(self.output.rglob('*.mp4'))), 2)
         self.assertNotIn(('inspect', '3'), e.calls)
+    def test_fixed_request_client_reaches_all_sdk_phases_without_credentials(self):
+        import yt_dlp
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+        seen = []
+        def extract(ydl, url, download=True):
+            seen.append(ydl.params)
+            return {'entries': [{'id': '123'}]} if url == PROFILE else {'id': '123'}
+        extractor = d.Extractor(d.ffmpeg_binary(), impersonate='chrome-131:macos-14')
+        with patch.object(yt_dlp.YoutubeDL, 'extract_info', extract):
+            extractor.discover(d.normalize_url(PROFILE), 10)
+            extractor.inspect(d.normalize_url(PROFILE + '/video/123'))
+            extractor.download(d.normalize_url(PROFILE + '/video/123'), self.output / '123.mp4')
+        self.assertEqual(len(seen), 3)
+        for options in seen:
+            self.assertEqual(options['impersonate'], ImpersonateTarget.from_str('chrome-131:macos-14'))
+            self.assertIsNone(options['cookiefile'])
+            self.assertIsNone(options['cookiesfrombrowser'])
+        with patch.object(extractor, 'discover', return_value=[{'id':'123'}]):
+            report = self.run_case(extractor, list_only=True)
+        self.assertEqual(report['requestClient'], 'chrome-131:macos-14')
+        self.assertEqual(report['authentication'], 'ANONYMOUS')
     def test_duplicate_batch_does_not_request_videos(self):
         self.run_case()
         e = FakeExtractor()
