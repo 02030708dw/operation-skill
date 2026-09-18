@@ -25,6 +25,7 @@ MESSAGES = {
     'NETWORK_ERROR': '网络请求失败，最多补试一次后结束。',
     'DISCOVERY_EMPTY': '未能从主页枚举视频，数量未知。',
     'EXTRACTION_ERROR': '无法解析平台返回内容，不等同于需要登录。',
+    'PROFILE_ID_UNAVAILABLE': '主页未返回可解析的公开账号编号，无法枚举视频；这不等同于需要登录。',
     'UNSUPPORTED_PHOTO': '图文内容不在本次视频下载范围内。',
     'UNSUPPORTED_LIVE': '直播不在本次视频下载范围内。',
     'UNSUPPORTED_CONTENT': '没有可下载的视频流。',
@@ -67,7 +68,9 @@ def classify(error):
     text = str(error).lower()
     if any(x in text for x in ('429', 'too many requests', 'rate limit')): return 'RATE_LIMITED'
     if any(x in text for x in ('captcha', 'verify your', 'security check', 'verification required', 'challenge', 'not a bot')): return 'VERIFICATION_REQUIRED'
-    if any(x in text for x in ('log in to', 'login required', 'login to', 'sign in to', 'authentication required', 'only available for registered')): return 'LOGIN_REQUIRED'
+    if 'likely either private' in text: return 'ACCESS_DENIED'
+    if any(x in text for x in ('log in to', 'login required', 'login to', 'sign in to', 'authentication required', 'only available for registered', 'requiring login for access', 'log into an account that has access')): return 'LOGIN_REQUIRED'
+    if 'unable to extract secondary user id' in text: return 'PROFILE_ID_UNAVAILABLE'
     if any(x in text for x in ('private', '403', '404', 'access denied', 'not available', 'unavailable', 'permission', 'geo-restrict', 'not authorized')): return 'ACCESS_DENIED'
     if any(x in text for x in ('timed out', 'timeout', 'connection', 'network', 'resolve host', '502', '503', '504')): return 'NETWORK_ERROR'
     return 'EXTRACTION_ERROR'

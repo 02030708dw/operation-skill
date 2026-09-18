@@ -96,6 +96,11 @@ class DownloadTests(unittest.TestCase):
     def test_permission_parse_and_empty_are_not_login(self):
         for msg in ('HTTP Error 403', 'private video', 'unable to extract webpage', 'no videos found'):
             self.assertNotEqual(d.classify(RuntimeError(msg)), 'LOGIN_REQUIRED')
+    def test_explicit_tiktok_login_messages(self):
+        for msg in ('TikTok is requiring login for access to this content', "This user account is private. Log into an account that has access"):
+            self.assertEqual(d.classify(RuntimeError(msg)), 'LOGIN_REQUIRED')
+        self.assertEqual(d.classify(RuntimeError('Unable to extract secondary user ID')), 'PROFILE_ID_UNAVAILABLE')
+        self.assertEqual(d.classify(RuntimeError("This user's account is likely either private or all videos private. Log into an account that has access")), 'ACCESS_DENIED')
     def test_network_retry_once_only(self):
         calls = []
         def fail(): calls.append(1); raise RuntimeError('connection timed out')
