@@ -1,0 +1,9 @@
+*
+!requirements.txt
+!scripts/
+!scripts/**
+!references/
+!references/**
+!SKILL.md
+**/__pycache__
+**/*.pyc
