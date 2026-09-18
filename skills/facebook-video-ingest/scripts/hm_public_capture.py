@@ -20,7 +20,7 @@ import hm_google_account as google
 from download import Logger, save, resolve_ffmpeg, normalize_url
 
 AUTH_ENV = ('HM_GOOGLE_COOKIES','HM_FACEBOOK_PROFILE','HM_FACEBOOK_ACCOUNT_STATE',
-            'FACEBOOK_FOLLOWED_COOKIES','FB_FOLLOWED_COOKIES','YTDLP_COOKIES','YTDLP_COOKIES_FROM_BROWSER')
+            'FACEBOOK_FOLLOWED_COOKIES','FB_FOLLOWED_COOKIES','YTDLP_COOKIES','YTDLP_COOKIES_FROM_BROWSER','TIKTOK_COOKIES','TIKTOK_PROFILE')
 LOGIN_CODES = {'LOGIN_REQUIRED','ACCOUNT_NOT_CONFIGURED','ACCOUNT_UNAVAILABLE','ACCOUNT_BUSY'}
 STOP = {'RATE_LIMITED','VERIFICATION_REQUIRED','ACCOUNT_SUSPENDED'}
 MESSAGES = {
@@ -35,6 +35,12 @@ MESSAGES = {
     'NETWORK_ERROR':'请求超时或网络异常，本次尝试已结束。',
     'DISCOVERY_EMPTY':'来源页未发现可下载视频，未能枚举本次视频列表。',
     'DOWNLOAD_FAILED':'未获得可验证的视频文件，请检查链接或查看平台访问情况。',
+    'PROFILE_ID_UNAVAILABLE':'主页未返回可解析的账号编号，未能枚举；不等同于需要登录。',
+    'EXTRACTION_ERROR':'平台返回内容无法解析。',
+    'VALIDATION_FAILED':'视频音画校验失败，未计入下载成功。',
+    'UNSUPPORTED_PHOTO':'图文内容不在本次下载范围内。',
+    'UNSUPPORTED_LIVE':'直播不在本次下载范围内。',
+    'UNSUPPORTED_CONTENT':'该内容没有可下载的视频流。',
     'VIDEO_BUSY':'该视频已有下载正在进行，请稍后重试。',
 }
 
@@ -53,6 +59,7 @@ class Failure(Exception):
 
 def classify(error):
     if isinstance(error,Failure): return error.code
+    if error.__class__.__module__ == 'hm_tiktok_download': return error.code
     text=str(error).lower()
     if any(x in text for x in ('429','too many requests','rate limit','temporarily blocked','try again later')): return 'RATE_LIMITED'
     if any(x in text for x in ('captcha','not a bot','checkpoint','challenge','verify your identity','security check','verification required')): return 'VERIFICATION_REQUIRED'
@@ -71,6 +78,7 @@ def clean_environment(env):
 
 @contextlib.contextmanager
 def authenticated_session(config,platform):
+    if platform=='TikTok': raise Failure('ACCOUNT_NOT_CONFIGURED')
     provider=google if platform=='YouTube' else facebook
     account=provider.account_config(config)
     if not account: raise Failure('ACCOUNT_NOT_CONFIGURED')
@@ -91,12 +99,14 @@ def authenticated_session(config,platform):
 
 
 def saved_session_available(config,platform):
+    if platform=='TikTok': return False
     provider=google if platform=='YouTube' else facebook
     account=provider.account_config(config)
     return bool(account and provider.read_state(account).get('state') in ('AVAILABLE','LOGGED_IN'))
 
 
 def account_outcome(config,platform,code):
+    if platform=='TikTok': return
     provider=google if platform=='YouTube' else facebook
     if not provider.account_config(config):return
     prefix='GOOGLE_' if platform=='YouTube' else 'FACEBOOK_'
@@ -149,15 +159,16 @@ def finalize_report(report):
         if item.get('status')=='failed' and requires_login(item.get('errorCode'),item.get('attempts',[])):
             item['status']='login-required'
     counts={name:sum(x['status']==name for x in report['results']) for name in ('downloaded','skipped','failed','filtered-duration','login-required')}
-    counts['unattempted']=None if report['discovered'] is None else max(0,report['discovered']-len(report['results']))
+    if report.get('platform')=='TikTok': counts['unsupported']=sum(x['status']=='unsupported' for x in report['results'])
+    counts['unattempted']=None if report['discovered'] is None or report.get('discovery',{}).get('incomplete') else max(0,report['discovered']-len(report['results']))
     discovery_login=requires_login(report.get('errorCode'),report.get('attempts',[])) or any(x['status']=='login-required' and x.get('errorCode')==report.get('errorCode') for x in report['results'])
     restricted=discovery_login or counts['login-required']>0
     real_error=bool(report.get('errorCode') and not discovery_login) or counts['failed']>0
-    public_results=counts['downloaded']+counts['skipped']+counts['filtered-duration']
+    public_results=counts['downloaded']+counts['skipped']+counts['filtered-duration']+counts.get('unsupported',0)
     scope='FULL' if restricted and not real_error and not public_results else 'PARTIAL' if restricted else 'NONE'
     code=report.get('errorCode') if discovery_login else next((x.get('errorCode') for x in report['results'] if x['status']=='login-required'),None)
     report.update(counts=counts,loginRestriction=dict(scope=scope,reasonCode=code),
-        status='LOGIN_REQUIRED' if scope=='FULL' else 'PARTIAL' if (real_error or restricted) and public_results else 'FAILED' if real_error else 'COMPLETED')
+        status='LOGIN_REQUIRED' if scope=='FULL' else 'PARTIAL' if (real_error or restricted) and public_results else 'FAILED' if real_error else 'PARTIAL' if report.get('discovery',{}).get('incomplete') else 'COMPLETED')
     return report
 
 
@@ -169,6 +180,12 @@ def common_options(credentials):
 
 
 def single_source(platform,url):
+    if platform=='TikTok':
+        from hm_tiktok_capture import source
+        value=source(url)
+        if value['kind']=='profile': return None
+        value['id']=value.get('id') or hashlib.sha256(value['url'].encode()).hexdigest()[:24]
+        return value
     if platform=='YouTube':
         normalized,vid=normalize_url(url)
         return {'id':vid,'url':normalized} if vid else None
@@ -180,6 +197,9 @@ def single_source(platform,url):
 
 
 def discover(platform,url,limit,credentials):
+    if platform=='TikTok':
+        from hm_tiktok_capture import discover as discover_tiktok
+        return discover_tiktok(url,limit)
     if platform=='YouTube':
         import yt_dlp
         with yt_dlp.YoutubeDL(dict(common_options(credentials),extract_flat='in_playlist',skip_download=True,playlistend=limit)) as ydl:
@@ -199,6 +219,9 @@ def discover(platform,url,limit,credentials):
 
 
 def download_item(platform,item,output,credentials):
+    if platform=='TikTok':
+        from hm_tiktok_capture import download
+        return download(item,output)
     import yt_dlp
     from yt_dlp.postprocessor.common import PostProcessor
     captured=[]
@@ -232,11 +255,11 @@ def run_download(platform,url,limit,output,report_path,config,on_item=lambda *_:
         try:
             single=single_source(platform,url)
             entries=[single] if single else attempt(lambda c:discover(platform,url,limit,c),config,platform,report['attempts'],'DISCOVERY')
-            report.update(entries=entries,discovered=len(entries));save(report_path,report)
+            report.update(entries=entries,discovered=len(entries),discovery=getattr(entries,'discovery',{}));save(report_path,report)
         except Exception as error:
             report['errorCode']=classify(error);entries=[]
     legacy_ids=set()
-    archives=[output/'.download-archive.txt'] if platform=='YouTube' else list(output.parent.rglob('.yt-dlp-archive.txt'))
+    archives=[] if platform=='TikTok' else [output/'.download-archive.txt'] if platform=='YouTube' else list(output.parent.rglob('.yt-dlp-archive.txt'))
     prefix='youtube ' if platform=='YouTube' else 'facebook '
     for archive in archives:
         if archive.is_file():legacy_ids.update(line[len(prefix):].strip() for line in archive.read_text().splitlines() if line.startswith(prefix))
@@ -249,7 +272,11 @@ def run_download(platform,url,limit,output,report_path,config,on_item=lambda *_:
         with (receipts/(key+'.lock')).open('a') as lock:
             try:
                 fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-                if receipt.exists():
+                valid=receipt.exists()
+                if valid and platform=='TikTok':
+                    from hm_tiktok_capture import receipt_valid
+                    valid=receipt_valid(json.loads(receipt.read_text()))
+                if valid:
                     item.update(json.loads(receipt.read_text()),status='skipped',attempts=[])
                 elif entry['id'] in legacy_ids:
                     previous=output/'.items'/(entry['id']+'.json')
@@ -287,7 +314,7 @@ def run_download(platform,url,limit,output,report_path,config,on_item=lambda *_:
 
 
 def video_record(item):
-    if item['status']=='filtered-duration':return None
+    if item['status'] in ('filtered-duration','unsupported'):return None
     path=Path(item['path']) if item.get('path') else None
     good=item['status'] in ('downloaded','skipped') and path and path.is_file()
     if item['status']=='skipped' and not good:return None
@@ -306,12 +333,13 @@ def video_record(item):
         localPath=str(path) if good else None,fileName=path.name if good else None,fileSize=path.stat().st_size if good else None,sha256=digest,
         durationSeconds=round(item['duration']) if item.get('duration') else None,publishedAt=published,
         statistics=dict(attemptId=hashlib.sha256(item['id'].encode()).hexdigest()[:32],occurredAt=item['observedAt'],outcome='CACHE' if item['status']=='skipped' else 'SUCCESS' if good else 'LOGIN_REQUIRED' if item['status']=='login-required' else 'FAILURE') if item.get('observedAt') else None,
+        originalPath=item.get('originalPath'),originalSha256=item.get('originalSha256'),requestClient=item.get('requestClient'),
         status='downloaded' if good else 'login-required' if item['status']=='login-required' else 'download-failed',errorCode=None if good else 'PUBLIC_'+item.get('errorCode','DOWNLOAD_FAILED'),
         error=None if good else MESSAGES.get(item.get('errorCode'),MESSAGES['DOWNLOAD_FAILED']),attempts=item.get('attempts',[]))
 
 
 def log_text(report):
-    lines=['下载策略：公开优先，明确需要登录时使用可用账号补试一次。']
+    lines=['下载策略：TikTok 匿名下载，不读取其他平台账号。' if report.get('platform')=='TikTok' else '下载策略：公开优先，明确需要登录时使用可用账号补试一次。']
     for a in report['attempts']:
         lines.append('发现列表 · '+('匿名' if a['mode']=='PUBLIC' else '账号补试')+' · '+a['result']+' '+MESSAGES.get(a.get('reasonCode'),''))
     for item in report['results']:
@@ -332,6 +360,12 @@ def execute(args,job):
     backend=ingest.normalize_backend(args.backend)
     pump=ingest.HeartbeatPump(backend,args.worker_token,args.worker_id,execution,args.heartbeat_seconds)
     def record(item):
+        if item['status']=='filtered-duration':
+            ingest.api_call(backend,args.worker_token,'POST',f'/api/internal/capture/executions/{execution}/statistics',
+                dict(originalUrl=item['url'],platformVideoId=item['id'],downloadStatus='DISCOVERED',
+                     statistics=dict(attemptId=hashlib.sha256(item['id'].encode()).hexdigest()[:32],occurredAt=item['observedAt'],outcome='FILTERED')),
+                worker_id=args.worker_id,retry_transient=True)
+            return
         video=video_record(item)
         if video:ingest.record_video(backend,args.worker_token,args.worker_id,execution,video,download_status='DOWNLOADED' if video['status']=='downloaded' else 'LOGIN_REQUIRED' if video['status']=='login-required' else 'DOWNLOAD_FAILED',upload_status='PENDING')
     try:

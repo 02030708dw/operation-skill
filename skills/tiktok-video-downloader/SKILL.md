@@ -41,3 +41,9 @@ bash scripts/setup.sh
 - 退出码：0 完成或列出成功；1 部分完成、受限或失败；2 参数/环境/目录锁错误；130 中断。不要以退出码 0 或只解析出格式代替实际文件验收。
 
 服务器构建、持久化和复现步骤见 [服务器使用说明](references/server-usage.md)。本技能独立运行，不修改四区后台、账号状态或共享 Worker，也不自动创建定时任务。
+
+## 四区后台适配
+
+`facebook-video-ingest/scripts/hm_tiktok_capture.py` 将本技能接入区域 Worker。平台能力来自区域配置 `enabledPlatforms`，仅在 `PUBLIC_FIRST` 且显式启用 TikTok 时运行；每区并发 1，使用匿名请求客户端 `chrome-131:macos-14`，不读取浏览器或其他平台账号。
+
+原文件保存在区域输出目录 `TikTok/originals`，需要时另外生成 `TikTok/previews` 下的 H.264/AAC 预览。持久化逐条回执后回传；归档和回执按区域、平台、视频 ID 去重。后台已有视频的缓存命中只记录缓存统计；回传曾丢失时恢复视频记录。

@@ -1465,7 +1465,7 @@ def execute_one(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         return 0, result
     # Refuse to claim durable backend work when an interrupted Skill update or
     # an unsupported Node runtime would make execution fail after assignment.
-    if os.getenv("HM_CAPTURE_PLATFORM") != "YouTube": download_runtime_check()
+    if os.getenv("HM_CAPTURE_PLATFORM", "Facebook") == "Facebook": download_runtime_check()
     deadline = time.monotonic() + args.wait_for_work_seconds
     while True:
         job = claim(backend, token, worker_id, args.task_no, args.execution_no)

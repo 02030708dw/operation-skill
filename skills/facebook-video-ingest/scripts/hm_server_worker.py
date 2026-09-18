@@ -27,12 +27,17 @@ def validate_spec(spec: dict) -> dict:
             raise ValueError("Invalid execution tenant")
         result["tenant"] = tenant
     platform=spec.get("platform", "Facebook")
-    if platform not in {"Facebook","YouTube"}:raise ValueError("Invalid capture platform")
+    if platform not in {"Facebook","YouTube","TikTok"}:raise ValueError("Invalid capture platform")
     if platform=="YouTube" and (not tenant or result["kind"]!="CAPTURE" or not (tenant_config(result).get("googleAccount") or tenant_config(result).get("capturePolicy")=="PUBLIC_FIRST")):
         raise ValueError("YouTube is not enabled for this tenant")
     policy=tenant_config(result).get("capturePolicy","ACCOUNT_REQUIRED") if tenant else "ACCOUNT_REQUIRED"
     if policy=="PUBLIC_FIRST" and not tenant:raise ValueError("Public-first requires a configured tenant")
     if spec.get("capturePolicy",policy)!=policy:raise ValueError("Capture policy mismatch")
+    enabled=tenant_config(result).get("enabledPlatforms") if tenant else None
+    if enabled is not None and result["kind"]=="CAPTURE" and platform not in enabled:
+        raise ValueError("Capture platform is disabled for this tenant")
+    if platform=="TikTok" and (not tenant or result["kind"]!="CAPTURE" or policy!="PUBLIC_FIRST" or not enabled or platform not in enabled):
+        raise ValueError("TikTok is not enabled for this tenant")
     result["capturePolicy"]=policy
     result["platform"]=platform
     if os.getenv("HM_TENANT_CONFIG"):
@@ -169,7 +174,7 @@ def run(spec: dict) -> int:
         sys.path.insert(0,str(Path(__file__).resolve().parents[2]/"youtube-video-downloader/scripts"))
         import hm_google_account as accounts
     config = tenant_config(spec)
-    account = accounts.account_config(config) if spec["kind"] in {"CAPTURE", "TITLE"} else None
+    account = accounts.account_config(config) if spec["kind"] in {"CAPTURE", "TITLE"} and config.get("capturePolicy")!="PUBLIC_FIRST" else None
     account_lock = None
     if config.get("capturePolicy")=="PUBLIC_FIRST":
         account=None
@@ -192,6 +197,11 @@ def run(spec: dict) -> int:
         except Exception:
             account_lock.close()
             raise
+    platform_lock=None
+    if spec.get("platform")=="TikTok" and spec["kind"]=="CAPTURE":
+        platform_lock=lock_file(execution_root / "locks" / "platform-TikTok.lock")
+        if platform_lock is None:
+            os.environ.update(worker_environment(spec));status(spec,"RETRY");return 0
     slots = [spec["slot"]]
     if spec.get("tenant") and spec["kind"] in {"CAPTURE", "TITLE"}:
         slots += [slot for slot in range(1, int(os.getenv("HM_CAPTURE_SLOTS", "8")) + 1) if slot != spec["slot"]]
@@ -228,7 +238,7 @@ def run(spec: dict) -> int:
                 status(spec, "RETRY", "服务器剩余存储不足，已暂停新下载和生成")
                 return 0
         status(spec, "RUNNING")  # Reject stale attempts before claiming business work.
-        inherited_locks = tuple(handle.fileno() for handle in (slot_lock, execution_lock) if handle)
+        inherited_locks = tuple(handle.fileno() for handle in (slot_lock, execution_lock, platform_lock) if handle)
         if account_lock: inherited_locks += account_lock.filenos()
         child = subprocess.Popen(command(spec), env=environment, start_new_session=True, pass_fds=inherited_locks)
         last_ack = time.monotonic()
@@ -260,6 +270,7 @@ def run(spec: dict) -> int:
                 child.wait()
         if execution_lock: execution_lock.close()
         if slot_lock: slot_lock.close()
+        if platform_lock: platform_lock.close()
         if account_lock: account_lock.close()
 
 
