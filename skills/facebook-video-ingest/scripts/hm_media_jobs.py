@@ -60,19 +60,17 @@ def refetch(job, base, source, guard):
     config = registry[job['region'].lower()]
     directory = base/'recovered'; directory.mkdir(exist_ok=True)
     guard()
-    # Public first, then the same account lease used by normal regional capture.
+    # Reuse the capture policy: only an explicit login wall permits one
+    # authenticated supplement; restrictions update the same account state.
+    attempts = []
     try:
-        try:
-            recovered = capture.download_item(platform, {'id': expected_id, 'url': url}, directory, {})
-        except Exception as public_error:
-            if capture.classify(public_error) in capture.STOP:
-                raise JobFailure('RECOVERY_'+capture.classify(public_error)) from None
-            with capture.authenticated_session(config, platform) as credentials:
-                recovered = capture.download_item(platform, {'id': expected_id, 'url': url}, directory, credentials)
-    except JobFailure: raise
+        recovered = capture.attempt(
+            lambda credentials: capture.download_item(platform, {'id': expected_id, 'url': url}, directory, credentials),
+            config, platform, attempts, 'DOWNLOAD')
     except Exception as error:
         code = capture.classify(error)
         raise JobFailure('RECOVERY_'+code, code in ('NETWORK_ERROR','ACCOUNT_BUSY')) from None
+    storage.write_journal(base/'recovery-attempts.json', {'attempts': attempts})
     guard()
     if str(recovered.get('id')) != expected_id or recovered.get('status') != 'downloaded':
         raise JobFailure('RECOVERY_IDENTITY_MISMATCH')

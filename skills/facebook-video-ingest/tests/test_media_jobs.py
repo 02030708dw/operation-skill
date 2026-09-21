@@ -70,4 +70,25 @@ class MediaJobsTest(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):jobs.execute(self.job,self.args,self.pipeline,lambda:None)
         self.assertTrue(list(self.base.rglob('*.original.mp4')));self.assertEqual(self.s3.writes,0)
 
+class RecoveryIdentityTest(unittest.TestCase):
+    def run_recovery(self, returned_id='123', duration=1):
+        import json
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);registry=root/'tenants.json';registry.write_text(json.dumps({'th':{}}))
+            def download(platform,item,output,credentials):
+                path=output/'recovered.mp4';path.write_bytes(b'recovered')
+                return dict(id=returned_id,status='downloaded',path=str(path))
+            capture=SimpleNamespace(attempt=lambda operation,*args:operation({}),download_item=download,classify=lambda error:'NETWORK_ERROR')
+            before={'format':{'duration':'1'},'streams':[{'codec_type':'video','start_time':'0','duration':'1'}]}
+            after={'format':{'duration':str(duration)},'streams':[{'codec_type':'video','start_time':'0','duration':str(duration)}]}
+            job={'region':'TH','videos':[dict(platform='Facebook',platform_video_id='123',canonical_url='https://www.facebook.com/watch/?v=123')]}
+            with mock.patch.dict(sys.modules,{'hm_public_capture':capture}),mock.patch.dict(os.environ,{'HM_TENANT_CONFIG':str(registry)}),mock.patch.object(media,'probe',side_effect=[before,after]):
+                return jobs.refetch(job,root,root/'original.mp4',lambda:None)
+    def test_wrong_platform_video_is_rejected(self):
+        with self.assertRaisesRegex(jobs.JobFailure,'RECOVERY_IDENTITY_MISMATCH'):self.run_recovery('999')
+    def test_truncated_replacement_is_rejected(self):
+        with self.assertRaisesRegex(media.CompatibilityError,'DURATION_MISMATCH'):self.run_recovery(duration=2)
+    def test_same_identity_and_duration_can_be_recovered(self):
+        self.assertEqual(self.run_recovery().name,'recovered.mp4')
+
 if __name__=='__main__':unittest.main()
