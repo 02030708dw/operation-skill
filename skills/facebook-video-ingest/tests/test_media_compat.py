@@ -97,6 +97,15 @@ class MediaCompatibilityTest(unittest.TestCase):
 
 
 class IngressGateTest(unittest.TestCase):
+    def test_ingress_keeps_original_download_name_and_title(self):
+        video=dict(localPath='/downloads/original.webm',fileName='原标题.第1集.webm',title='原标题🎬')
+        result=dict(path='/downloads/.hm-compatible/v1-hash.mp4',fileSize=42,sha256='a'*64,durationSeconds=1.0)
+        with mock.patch.dict(os.environ,{'HM_MEDIA_COMPAT_ENABLED':'1'}),mock.patch.object(media,'normalize',return_value=result):
+            media.prepare_record(video)
+        self.assertEqual(video['fileName'],'原标题.第1集.mp4')
+        self.assertEqual(video['title'],'原标题🎬')
+        self.assertEqual(video['localPath'],result['path'])
+
     def test_failed_conversion_is_never_recorded_as_downloaded(self):
         import facebook_video_ingest as ingest
         video=dict(localPath='/missing/source.mp4',originalUrl='https://example.test/1',status='downloaded',statistics={'outcome':'SUCCESS'})

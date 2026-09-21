@@ -175,8 +175,11 @@ def _normalize(source):
 def prepare_record(video):
     if os.environ.get('HM_MEDIA_COMPAT_ENABLED', '0') != '1': return
     try:
+        original_name = Path(video.get('fileName') or video['localPath']).name
+        if Path(original_name).suffix.lower() in ('.mp4', '.webm', '.mkv', '.mov', '.m4v', '.avi'):
+            original_name = Path(original_name).stem
         result = normalize(video['localPath'])
-        video.update(localPath=result['path'], fileName=Path(result['path']).name,
+        video.update(localPath=result['path'], fileName=original_name + '.mp4',
                      fileSize=result['fileSize'], sha256=result['sha256'], durationSeconds=round(result['durationSeconds']),
                      mediaCompatibility=result)
     except (CompatibilityError, OSError, ValueError, KeyError) as exc:
