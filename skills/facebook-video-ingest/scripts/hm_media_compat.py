@@ -110,6 +110,15 @@ def validate(source, target):
 
 
 def normalize(source):
+    # All tenants and ingress paths share the same encoder budget.
+    root = Path(os.environ.get('HM_MEDIA_ENCODER_LOCK', '/tmp/hm-media-encoder.lock'))
+    root.parent.mkdir(parents=True, exist_ok=True)
+    with root.open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _normalize(source)
+
+
+def _normalize(source):
     source = Path(source).resolve(strict=True)
     source_hash = sha256(source)
     cache = source.parent / '.hm-compatible'

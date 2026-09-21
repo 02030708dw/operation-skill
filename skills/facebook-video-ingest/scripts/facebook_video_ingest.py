@@ -1193,11 +1193,13 @@ def drain_upload_jobs(
     for _ in range(10000):
         if time.monotonic() >= batch_deadline:
             break
+        import hm_media_jobs
+        compat_processed = hm_media_jobs.process_one(args, backend, token, worker_id, sys.modules[__name__])
         import hm_review_storage
         review_processed = hm_review_storage.process_one(args, backend, token, worker_id, sys.modules[__name__])
         job = claim_upload(backend, token, worker_id, task_no)
         if job is None:
-            if review_processed:
+            if review_processed or compat_processed:
                 continue
             break
         try:

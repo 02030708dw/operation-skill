@@ -215,7 +215,14 @@ def promote(job: dict, target: str, check) -> dict:
         else:
             verify(head(s3, bucket, source, encryption(config, job["reviewKeyVersion"])), job)
             guard()
+            proof = job.get("mediaCompatibility")
+            if proof and (proof.get("ruleVersion") != 1 or proof.get("sha256") != job["fileSha256"] or proof.get("sourceKey") != source):
+                raise StorageFailure("MEDIA_COMPAT_PROOF_MISMATCH")
+            source_head = s3.head_object(Bucket=bucket, Key=source, **encryption(config, job["reviewKeyVersion"]))
+            if proof and source_head["ETag"] != proof.get("sourceETag"):
+                raise StorageFailure("MEDIA_COMPAT_SOURCE_CHANGED")
             s3.copy_object(Bucket=bucket, Key=target, CopySource={"Bucket": bucket, "Key": source},
+                           CopySourceIfMatch=source_head["ETag"],
                            MetadataDirective="COPY", **encryption(config, job["reviewKeyVersion"], source=True))
             verify(head(s3, bucket, target, {}), job)
     return {"status": "uploaded", "r2Bucket": bucket, "r2ObjectKey": target,
