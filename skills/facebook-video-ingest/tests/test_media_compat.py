@@ -38,6 +38,26 @@ class MediaCompatibilityTest(unittest.TestCase):
         self.assertTrue(any(s.get('profile')=='LC' for s in info['streams']))
         with mock.patch.object(media,'run',side_effect=AssertionError('must reuse verified result')):
             self.assertEqual(result,media.normalize(path))
+    def test_he_aac_is_transcoded_to_lc_with_audio(self):
+        # Generated locally from a 440 Hz sine wave using AudioToolbox HE-AAC;
+        # retaining the tiny fixture makes this test portable to Linux FFmpeg.
+        import base64
+        audio=self.root/'heaac.m4a'
+        audio.write_bytes(base64.b64decode((Path(__file__).parent/'fixtures/heaac-sine.m4a.b64').read_bytes()))
+        source=self.root/'he-aac.mp4'
+        subprocess.run([os.environ.get('FFMPEG','ffmpeg'),'-v','error','-y',
+            '-i',str(self.fixture('libx264',audio=False)),'-i',str(audio),
+            '-map','0:v:0','-map','1:a:0','-c','copy','-shortest','-movflags','+faststart',str(source)],check=True,capture_output=True)
+        before=media.probe(source)
+        self.assertEqual(next(s['profile'] for s in before['streams'] if s['codec_type']=='audio'),'HE-AAC')
+        self.assertFalse(media.compatible(source,before))
+        result=media.normalize(source)
+        self.assertTrue(result['converted'])
+        after=media.probe(result['path'])
+        self.assertEqual(next(s['profile'] for s in after['streams'] if s['codec_type']=='audio'),'LC')
+        self.assertTrue(media.compatible(result['path'],after))
+        media.validate(before,after)
+
     def test_rotation_and_frame_rate(self):
         source=self.fixture(size='200x120')
         rotated=self.root/'rotated.mp4'
