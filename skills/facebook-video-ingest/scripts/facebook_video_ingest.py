@@ -1187,6 +1187,9 @@ def drain_upload_jobs(
             payload = json.loads(pending.read_text(encoding="utf-8"))
             if payload.get("workerId") == worker_id:
                 results.append(process_upload_job(args, backend, token, worker_id, payload["job"]))
+    import hm_media_capacity
+    if hm_media_capacity.limit() == 2:
+        return results + drain_parallel_compatibility(args, backend, token, worker_id, task_no)
     # Amortize scheduler startup without monopolizing the shared regional slot.
     # Finish the current durable operation, then yield after 30 seconds.
     batch_deadline = time.monotonic() + 30 if os.getenv("HM_SERVER_COMPONENT") == "UPLOAD" else float("inf")
@@ -1214,6 +1217,40 @@ def drain_upload_jobs(
                 file=sys.stderr,
                 flush=True,
             )
+    return results
+
+
+def drain_parallel_compatibility(args, backend, token, worker_id, task_no=""):
+    """Two bounded compatibility workers; publish completed files while a peer encodes."""
+    from concurrent.futures import ThreadPoolExecutor
+    import hm_media_capacity
+    import hm_media_jobs
+    import hm_review_storage
+    results = []
+    deadline = time.monotonic() + 30
+    next_submit = 0
+    futures = set()
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix='media-compat') as pool:
+        while True:
+            for future in list(futures):
+                if future.done():
+                    futures.remove(future)
+                    future.result()  # Surface failed callbacks; durable journals survive.
+            now = time.monotonic()
+            accepting = now < deadline and hm_media_capacity.limit() == 2
+            if accepting and now >= next_submit:
+                while len(futures) < 2:
+                    futures.add(pool.submit(hm_media_jobs.process_one, args, backend, token, worker_id, sys.modules[__name__]))
+                next_submit = now + 1  # Contending regions must not busy-poll APIs.
+            hm_review_storage.process_one(args, backend, token, worker_id, sys.modules[__name__])
+            job = claim_upload(backend, token, worker_id, task_no)
+            if job is not None:
+                results.append(process_upload_job(args, backend, token, worker_id, job))
+            if not accepting and not futures:
+                break
+            if job is None:
+                time.sleep(.2)
+    hm_media_jobs.restore_capacity_if_idle(sys.modules[__name__])
     return results
 
 

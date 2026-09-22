@@ -10,6 +10,29 @@ import shutil
 from urllib.parse import quote, urlparse
 import hm_media_compat as media
 import hm_review_storage as storage
+import hm_media_capacity as capacity
+
+
+@contextlib.contextmanager
+def journal_lock(root):
+    with (root/'.replay.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def restore_capacity_if_idle(pipeline):
+    observed = capacity.configuration()
+    registry_path = os.environ.get('HM_TENANT_CONFIG')
+    if observed['limit'] != 2 or not registry_path: return False
+    registry = json.loads(Path(registry_path).read_text())
+    pending = {}
+    for region, config in registry.items():
+        try:
+            pending[region] = pipeline.api_call(config['backendUrl'], config['workerToken'], 'POST',
+                '/api/internal/capture/media-compat/pending', {'workerId': config['workerId']}, retry_transient=False)
+        except Exception:
+            return False
+    return capacity.restore_if_drained(observed, pending, registry)
 
 
 class JobFailure(RuntimeError):
@@ -208,32 +231,36 @@ def process_one(args, backend, token, worker_id, pipeline):
         path.unlink()
         if saved['receipt'].get('status') == 'SUCCEEDED' and ack.get('backupVerified'):
             cleanup_cache(saved['receipt'])
-    # One shared Worker job at a time across all tenant processes. The encoder
-    # has a separate global lock also shared with new-video ingress.
+    # Both job admission and actual encoders obey the same global capacity.
     lock_path = Path(os.environ.get('HM_MEDIA_JOB_LOCK', '/opt/data/media-compat-job.lock'))
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open('a') as lock:
-        try: fcntl.flock(lock, fcntl.LOCK_EX|fcntl.LOCK_NB)
-        except BlockingIOError: return False
-        for path in sorted(root.glob('*.json')):
-            saved = json.loads(path.read_text())
-            if saved['workerId'] != worker_id: continue
-            deliver(path, saved)
+    with capacity.slot(lock_path) as lock:
+        if lock is None: return False
+        with journal_lock(root):
+            for path in sorted(root.glob('*.json')):
+                saved = json.loads(path.read_text())
+                if saved['workerId'] != worker_id: continue
+                deliver(path, saved)
         priority_only = False
+        observed = capacity.configuration()
+        pending_regions = {}
         registry_path = os.environ.get('HM_TENANT_CONFIG')
         if registry_path:
             registry = json.loads(Path(registry_path).read_text())
-            for other in registry.values():
-                if other.get('workerId') == worker_id: continue
+            for region, other in registry.items():
+                if other.get('workerId') == worker_id and observed['limit'] == 1: continue
                 try:
                     pending = pipeline.api_call(other['backendUrl'], other['workerToken'], 'POST',
                         '/api/internal/capture/media-compat/pending', {'workerId': other['workerId']}, retry_transient=False)
-                    if pending.get('urgent', 0): priority_only = True
+                    pending_regions[region] = pending
+                    if other.get('workerId') != worker_id and pending.get('urgent', 0): priority_only = True
                 except Exception:
                     # During rolling upgrades, never let history compete with an
                     # unknown foreground backlog. Local foreground still runs.
                     priority_only = True
-        job = call('claim', {'priorityOnly': priority_only})
+            if capacity.restore_if_drained(observed, pending_regions, registry):
+                return False
+        job = call('claim', {'priorityOnly': priority_only, 'maxConcurrentJobs': capacity.limit()})
         if not job: return False
         receipt = {'executionVersion': job['executionVersion'], 'status': 'SUCCEEDED'}
         try:
@@ -245,8 +272,9 @@ def process_one(args, backend, token, worker_id, pipeline):
             retryable = getattr(exc, 'retryable', not isinstance(exc, (JobFailure, media.CompatibilityError)))
             receipt.update(status='FAILED', errorCode=code, retryable=retryable)
         path = root/(job['jobNo']+'-a'+str(job['executionVersion'])+'.json')
-        storage.write_journal(path, {'jobNo': job['jobNo'], 'workerId': worker_id, 'receipt': receipt})
-        deliver(path, {'jobNo': job['jobNo'], 'workerId': worker_id, 'receipt': receipt})
+        with journal_lock(root):
+            storage.write_journal(path, {'jobNo': job['jobNo'], 'workerId': worker_id, 'receipt': receipt})
+            deliver(path, {'jobNo': job['jobNo'], 'workerId': worker_id, 'receipt': receipt})
         return True
 
 
