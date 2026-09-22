@@ -67,21 +67,30 @@ def faststart(path):
     return False
 
 
-def compatible(path, info):
+def compatible_video(info):
     media = streams(info)
     videos = [s for s in media if s['codec_type'] == 'video']
-    audio = [s for s in media if s['codec_type'] == 'audio']
-    if not videos: return False
+    if len(videos) != 1: return False
     v = videos[0]
     rate = v.get('avg_frame_rate', '0/1').split('/')
     fps = float(rate[0]) / max(float(rate[-1]), 1)
-    return (info['format'].get('tags', {}).get('major_brand', '').strip() != 'qt' and fps <= 30.01
+    return (fps <= 30.01
         and max(v['width'], v['height']) <= 1920 and min(v['width'], v['height']) <= 1080
-        and 'mp4' in info['format'].get('format_name', '').split(',') and len(videos) == 1
         and videos[0].get('codec_name') == 'h264' and videos[0].get('codec_tag_string') == 'avc1'
         and videos[0].get('pix_fmt') == 'yuv420p' and videos[0].get('profile') in ('Constrained Baseline', 'Baseline', 'Main', 'High')
-        and int(videos[0].get('level', 999)) <= 42
-        and len(audio) <= 1 and all(s.get('codec_name') == 'aac' and s.get('profile') == 'LC' and int(s.get('channels', 99)) <= 2 for s in audio)
+        and int(videos[0].get('level', 999)) <= 42)
+
+
+def compatible_audio(info):
+    audio = [s for s in streams(info) if s['codec_type'] == 'audio']
+    return len(audio) <= 1 and all(s.get('codec_name') == 'aac' and s.get('profile') == 'LC'
+                                 and int(s.get('channels', 99)) <= 2 for s in audio)
+
+
+def compatible(path, info):
+    return (info['format'].get('tags', {}).get('major_brand', '').strip() != 'qt'
+        and 'mp4' in info['format'].get('format_name', '').split(',')
+        and compatible_video(info) and compatible_audio(info)
         and faststart(path))
 
 
@@ -148,11 +157,18 @@ def _normalize(source):
                 rate = video.get('avg_frame_rate', '0/1').split('/')
                 fps = float(rate[0]) / max(float(rate[-1]), 1)
                 if fps > 30: filters += ',fps=30'
+                # An incompatible audio profile or MP4 index does not require
+                # re-encoding already compatible video. Preserve its packets,
+                # rotation and quality; still verify the entire output below.
+                copy_video, copy_audio = compatible_video(original), compatible_audio(original)
+                video_args = ['-c:v', 'copy'] if copy_video else [
+                    '-vf', filters, '-c:v', 'libx264', '-threads', '2', '-filter_threads', '1',
+                    '-preset', 'medium', '-crf', '20', '-pix_fmt', 'yuv420p', '-profile:v', 'high']
+                audio_args = ['-c:a', 'copy'] if copy_audio else [
+                    '-c:a', 'aac', '-profile:a', 'aac_low', '-b:a', '160k', '-ac', '2', '-threads:a', '2']
                 run([os.environ.get('FFMPEG', 'ffmpeg'), '-nostdin', '-v', 'error', '-xerror', '-y',
                      '-threads', '2', '-i', str(source), '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn',
-                     '-vf', filters, '-c:v', 'libx264', '-threads', '2', '-filter_threads', '1',
-                     '-preset', 'medium', '-crf', '20', '-pix_fmt', 'yuv420p', '-profile:v', 'high',
-                     '-tag:v', 'avc1', '-c:a', 'aac', '-profile:a', 'aac_low', '-b:a', '160k', '-ac', '2',
+                     *video_args, '-tag:v', 'avc1', *audio_args,
                      '-movflags', '+faststart', str(temporary)])
                 info = probe(temporary)
                 if not compatible(temporary, info): raise CompatibilityError('MEDIA_COMPAT_OUTPUT_UNSUPPORTED')
@@ -160,7 +176,8 @@ def _normalize(source):
                 decode(temporary)
                 if sha256(source) != source_hash: raise CompatibilityError('MEDIA_COMPAT_SOURCE_CHANGED')
                 result = dict(path=str(output), sha256=sha256(temporary), fileSize=temporary.stat().st_size,
-                              durationSeconds=float(info['format']['duration']), converted=True)
+                              durationSeconds=float(info['format']['duration']), converted=True,
+                              videoReencoded=not copy_video, audioReencoded=not copy_audio)
                 temporary.replace(output)
             finally:
                 temporary.unlink(missing_ok=True)

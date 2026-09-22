@@ -19,6 +19,11 @@ class MediaCompatibilityTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
     def tearDown(self): self.tmp.cleanup()
+    def packet_hashes(self, path, selector):
+        data = subprocess.check_output([os.environ.get('FFPROBE','ffprobe'), '-v', 'error',
+            '-select_streams', selector, '-show_packets', '-show_data_hash', 'sha256',
+            '-show_entries', 'packet=data_hash', '-of', 'json', str(path)])
+        return [p['data_hash'] for p in json.loads(data)['packets']]
     def fixture(self, codec='libvpx-vp9', audio=True, size='120x200'):
         path = self.root / 'source.mp4'
         cmd = [os.environ.get('FFMPEG','ffmpeg'), '-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=size='+size+':rate=30']
@@ -36,6 +41,8 @@ class MediaCompatibilityTest(unittest.TestCase):
         info=media.probe(result['path']); self.assertTrue(media.compatible(result['path'],info))
         v=info['streams'][0]; self.assertEqual((v['width'],v['height']),(120,200))
         self.assertTrue(any(s.get('profile')=='LC' for s in info['streams']))
+        self.assertTrue(result['videoReencoded']); self.assertFalse(result['audioReencoded'])
+        self.assertEqual(self.packet_hashes(path,'a:0'), self.packet_hashes(result['path'],'a:0'))
         with mock.patch.object(media,'run',side_effect=AssertionError('must reuse verified result')):
             self.assertEqual(result,media.normalize(path))
     def test_he_aac_is_transcoded_to_lc_with_audio(self):
@@ -53,9 +60,31 @@ class MediaCompatibilityTest(unittest.TestCase):
         self.assertFalse(media.compatible(source,before))
         result=media.normalize(source)
         self.assertTrue(result['converted'])
+        self.assertFalse(result['videoReencoded']); self.assertTrue(result['audioReencoded'])
+        self.assertEqual(self.packet_hashes(source,'v:0'), self.packet_hashes(result['path'],'v:0'))
         after=media.probe(result['path'])
         self.assertEqual(next(s['profile'] for s in after['streams'] if s['codec_type']=='audio'),'LC')
         self.assertTrue(media.compatible(result['path'],after))
+        media.validate(before,after)
+
+    def test_faststart_only_copies_both_streams_and_preserves_rotation(self):
+        source=self.fixture('libx264')
+        slow=self.root/'tail-index.mp4'
+        subprocess.run([os.environ.get('FFMPEG','ffmpeg'),'-v','error','-y','-i',str(source),
+            '-c','copy',str(slow)],check=True,capture_output=True)
+        data=bytearray(slow.read_bytes());matrix=data.index(b'tkhd')+44
+        data[matrix:matrix+36]=struct.pack('>9i',0,65536,0,-65536,0,0,0,0,1<<30)
+        slow.write_bytes(data)
+        self.assertFalse(media.faststart(slow))
+        before=media.probe(slow)
+        result=media.normalize(slow);after=media.probe(result['path'])
+        self.assertTrue(media.compatible(result['path'],after))
+        self.assertFalse(result['videoReencoded']);self.assertFalse(result['audioReencoded'])
+        for stream in ('v:0','a:0'):
+            self.assertEqual(self.packet_hashes(slow,stream),self.packet_hashes(result['path'],stream))
+        def rotation(info):
+            return [d.get('rotation') for s in info['streams'] if s['codec_type']=='video' for d in s.get('side_data_list',[]) if 'rotation' in d]
+        self.assertEqual(rotation(before),rotation(after));self.assertTrue(rotation(after))
         media.validate(before,after)
 
     def test_rotation_and_frame_rate(self):
