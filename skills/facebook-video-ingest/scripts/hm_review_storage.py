@@ -40,7 +40,9 @@ def encryption(config: dict, version: str, source: bool = False) -> dict:
 def client():
     import boto3
     from botocore.config import Config
-    s3 = boto3.client("s3", endpoint_url="https://" + os.environ["CLOUDFLARE_R2_ACCOUNT_ID"] + ".r2.cloudflarestorage.com",
+    # Compatibility jobs now run in parallel; boto3's default Session must not
+    # be lazily initialized/shared by their client constructors.
+    s3 = boto3.session.Session().client("s3", endpoint_url="https://" + os.environ["CLOUDFLARE_R2_ACCOUNT_ID"] + ".r2.cloudflarestorage.com",
                         aws_access_key_id=os.environ["CLOUDFLARE_R2_ACCESS_KEY_ID"],
                         aws_secret_access_key=os.environ["CLOUDFLARE_R2_SECRET_ACCESS_KEY"], region_name="auto",
                         config=Config(signature_version="s3v4", retries={"max_attempts": 2, "mode": "standard"}, connect_timeout=15, read_timeout=60))

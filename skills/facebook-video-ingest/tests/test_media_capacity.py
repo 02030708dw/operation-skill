@@ -23,6 +23,23 @@ def occupy(payload):
 
 
 class CapacityTest(unittest.TestCase):
+    def test_parallel_s3_clients_do_not_share_default_sdk_session(self):
+        try:
+            import boto3
+        except ImportError:
+            self.skipTest('boto3 is not installed')
+        import hm_review_storage as storage
+        with patch.dict(os.environ, {'CLOUDFLARE_R2_ACCOUNT_ID':'test',
+                'CLOUDFLARE_R2_ACCESS_KEY_ID':'test','CLOUDFLARE_R2_SECRET_ACCESS_KEY':'test'}), \
+                patch.object(boto3, 'DEFAULT_SESSION', None), ThreadPoolExecutor(max_workers=2) as pool:
+            clients = list(pool.map(lambda _: storage.client(), range(4)))
+            try:
+                self.assertIsNone(boto3.DEFAULT_SESSION)
+                self.assertEqual(len({id(c) for c in clients}),4)
+                self.assertTrue(all(c.meta.config.max_pool_connections >= 2 for c in clients))
+            finally:
+                for client in clients: client.close()
+
     def test_two_slots_across_processes_and_default_single_slot(self):
         import multiprocessing
         context=multiprocessing.get_context('fork')
