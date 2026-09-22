@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+import threading
 from pathlib import Path
 from typing import IO, Any, Callable
 from urllib import error, request
@@ -23,6 +24,10 @@ SKILL_VERSION = "1.2.3"
 WORKER_USER_AGENT = "HM-Hermes-Worker/1.0"
 TRANSIENT_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 TRANSIENT_BACKEND_ATTEMPTS = 6
+# Parallel media work may hit the same regional row sets through claim,
+# completion and publication. Serialize individual HTTP operations, releasing
+# this lock between retries so lease renewals can still proceed.
+BACKEND_REQUEST_LOCK = threading.RLock()
 VIDEO_RESULT_EVENT_PREFIX = "__HM_VIDEO_RESULT__:"
 VIDEO_RESULT_EVENTS_ENV = "HM_VIDEO_RESULT_EVENTS"
 NON_ACTIONABLE_VIDEO_STATUSES = {"filtered-duration", "archived-existing"}
@@ -262,8 +267,9 @@ def api_call(
             f"{backend}{path}", data=body, headers=headers, method=method
         )
         try:
-            with request.urlopen(outgoing, timeout=30) as response:
-                parsed = json.loads(response.read().decode("utf-8"))
+            with BACKEND_REQUEST_LOCK:
+                with request.urlopen(outgoing, timeout=30) as response:
+                    parsed = json.loads(response.read().decode("utf-8"))
             break
         except error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:1000]
@@ -1229,6 +1235,7 @@ def drain_parallel_compatibility(args, backend, token, worker_id, task_no=""):
     results = []
     deadline = time.monotonic() + 30
     next_submit = 0
+    next_publish = 0
     futures = set()
     with ThreadPoolExecutor(max_workers=2, thread_name_prefix='media-compat') as pool:
         while True:
@@ -1242,10 +1249,13 @@ def drain_parallel_compatibility(args, backend, token, worker_id, task_no=""):
                 while len(futures) < 2:
                     futures.add(pool.submit(hm_media_jobs.process_one, args, backend, token, worker_id, sys.modules[__name__]))
                 next_submit = now + 1  # Contending regions must not busy-poll APIs.
-            hm_review_storage.process_one(args, backend, token, worker_id, sys.modules[__name__])
-            job = claim_upload(backend, token, worker_id, task_no)
-            if job is not None:
-                results.append(process_upload_job(args, backend, token, worker_id, job))
+            job = None
+            if now >= next_publish:
+                hm_review_storage.process_one(args, backend, token, worker_id, sys.modules[__name__])
+                job = claim_upload(backend, token, worker_id, task_no)
+                if job is not None:
+                    results.append(process_upload_job(args, backend, token, worker_id, job))
+                next_publish = time.monotonic() + 1
             if not accepting and not futures:
                 break
             if job is None:

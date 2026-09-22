@@ -23,6 +23,25 @@ def occupy(payload):
 
 
 class CapacityTest(unittest.TestCase):
+    def test_parallel_media_requests_serialize_database_calls(self):
+        import threading
+        import facebook_video_ingest as ingest
+        mutex=threading.Lock();counts={'active':0,'peak':0}
+        class Response:
+            def __enter__(self):
+                with mutex:
+                    counts['active']+=1;counts['peak']=max(counts['peak'],counts['active'])
+                time.sleep(.02)
+                return self
+            def read(self):return b'{"code":200,"data":{"ok":true}}'
+            def __exit__(self,*args):
+                with mutex:counts['active']-=1
+        with patch.object(ingest.request,'urlopen',side_effect=lambda *a,**kw:Response()), \
+                ThreadPoolExecutor(max_workers=4) as pool:
+            results=list(pool.map(lambda _:ingest.api_call('http://test','token','POST','/test',{}),range(8)))
+        self.assertEqual(counts['peak'],1)
+        self.assertTrue(all(r['ok'] for r in results))
+
     def test_parallel_s3_clients_do_not_share_default_sdk_session(self):
         try:
             import boto3
