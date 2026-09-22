@@ -48,6 +48,56 @@ def simulate_regional_job(payload):
     raise RuntimeError('Simulated regional job did not obtain a shared slot')
 
 class ServerWorkerTests(unittest.TestCase):
+    def test_regional_uploads_do_not_block_each_other_but_exclude_duplicates(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            held = []
+            try:
+                for region in ('ph', 'th', 'vn', 'id'):
+                    spec = dict(kind='UPLOAD', tenant=region)
+                    regional = root/'tenants'/region
+                    pair = worker.acquire_slot(spec, 1, root, regional)
+                    self.assertTrue(all(pair))
+                    held.extend(pair)
+                    self.assertEqual(worker.acquire_slot(spec, 1, root, regional), (None, None))
+                # Existing deployment guards and old global upload runners use
+                # this exclusive lock and must wait for every regional upload.
+                self.assertIsNone(worker.lock_file(root/'locks'/'UPLOAD-1.lock'))
+            finally:
+                for handle in held: handle.close()
+            guard = worker.lock_file(root/'locks'/'UPLOAD-1.lock')
+            self.assertIsNotNone(guard)
+            try:
+                for region in ('ph', 'th', 'vn', 'id'):
+                    self.assertEqual(worker.acquire_slot(dict(kind='UPLOAD', tenant=region), 1,
+                                     root, root/'tenants'/region), (None, None))
+            finally:
+                guard.close()
+            pair = worker.acquire_slot(dict(kind='UPLOAD', tenant='th'), 1, root, root/'tenants'/'th')
+            self.assertTrue(all(pair))
+            for handle in pair: handle.close()
+
+    def test_upload_child_inherits_both_locks_and_runner_releases_them(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); registry, _ = self.registry(root)
+            server = root/'server'
+            def start(*args, **kwargs):
+                self.assertEqual(len(kwargs['pass_fds']), 2)
+                for fd in kwargs['pass_fds']: os.fstat(fd)
+                self.assertIsNone(worker.lock_file(server/'locks'/'UPLOAD-1.lock'))
+                self.assertIsNone(worker.lock_file(server/'tenants'/'th'/'locks'/'UPLOAD-1.lock'))
+                return Mock(poll=Mock(return_value=0), returncode=0)
+            spec = dict(dispatchId=1, attempt=1, kind='UPLOAD', slot=1,
+                        tenant='th', taskNo=None, executionNo=None)
+            with patch.dict(os.environ, {'HM_TENANT_CONFIG':str(registry), 'HM_SERVER_STATE_DIR':str(server)}), \
+                    patch.object(worker, 'status'), patch.object(worker.subprocess, 'Popen', side_effect=start):
+                self.assertEqual(worker.run(spec), 0)
+            for path in (server/'locks'/'UPLOAD-1.lock', server/'tenants'/'th'/'locks'/'UPLOAD-1.lock'):
+                handle = worker.lock_file(path)
+                self.assertIsNotNone(handle)
+                handle.close()
+
     def spec(self, **changes):
         return dict(dispatchId=12,attempt=1,kind="CAPTURE",slot=1,taskNo="C-12",executionNo="E-12",**changes)
 

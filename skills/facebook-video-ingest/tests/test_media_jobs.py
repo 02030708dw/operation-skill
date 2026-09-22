@@ -30,6 +30,9 @@ class Storage:
 
 class MediaJobsTest(unittest.TestCase):
     def setUp(self):
+        # These tests use tiny fake media and must not depend on host free space.
+        disk=mock.patch.object(jobs.shutil,'disk_usage',return_value=SimpleNamespace(free=100*1024**3))
+        disk.start();self.addCleanup(disk.stop)
         self.tmp=tempfile.TemporaryDirectory();self.base=Path(self.tmp.name);self.s3=Storage()
         self.args=SimpleNamespace(state_dir=self.base);self.pipeline=SimpleNamespace(resolve_local_delete_path=lambda p,_:Path(p))
         self.job={'jobNo':'M-test','subject':'V-A','region':'TH','bucket':'test','ruleVersion':1,'executionVersion':1,'key':'review/TH/V-A/original.mp4','keyVersion':'v1','sourceETag':'old','targetKey':'review/TH/V-A/new.mp4','targetKeyVersion':'v1','fileSize':8,'sha256':__import__('hashlib').sha256(b'original').hexdigest(),'fileName':'原标题.mp4','videos':[]}

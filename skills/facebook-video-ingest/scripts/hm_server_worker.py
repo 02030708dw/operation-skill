@@ -129,15 +129,37 @@ def status(spec: dict, state: str, error: str | None = None) -> None:
         {"attempt": spec["attempt"], "state": state, "error": error})
 
 
-def lock_file(path: Path):
+def lock_file(path: Path, *, shared: bool = False):
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = path.open("a+")
     try:
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(handle, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
     except BlockingIOError:
         handle.close()
         return None
     return handle
+
+
+def acquire_slot(spec: dict, slot: int, root: Path, execution_root: Path):
+    kind = "CAPTURE" if spec["kind"] == "TITLE" else spec["kind"]
+    global_path = root / "locks" / f"{kind}-{slot}.lock"
+    if kind != "UPLOAD" or not spec.get("tenant"):
+        return lock_file(global_path), None
+    # Upload I/O is isolated per region. Keep the existing global lock as a
+    # shared maintenance barrier so deployment guards and legacy runners still
+    # exclude every regional upload. Encoding has its own global exclusive lock.
+    maintenance = lock_file(global_path, shared=True)
+    if maintenance is None:
+        return None, None
+    try:
+        regional = lock_file(execution_root / "locks" / f"UPLOAD-{slot}.lock")
+    except BaseException:
+        maintenance.close()
+        raise
+    if regional is None:
+        maintenance.close()
+        return None, None
+    return regional, maintenance
 
 
 def launch(spec: dict) -> None:
@@ -207,8 +229,9 @@ def run(spec: dict) -> int:
     if spec.get("tenant") and spec["kind"] in {"CAPTURE", "TITLE"}:
         slots += [slot for slot in range(1, int(os.getenv("HM_CAPTURE_SLOTS", "8")) + 1) if slot != spec["slot"]]
     slot_lock = None
+    maintenance_lock = None
     for slot in slots:
-        slot_lock = lock_file(root / "locks" / f'{"CAPTURE" if spec["kind"] == "TITLE" else spec["kind"]}-{slot}.lock')
+        slot_lock, maintenance_lock = acquire_slot(spec, slot, root, execution_root)
         if slot_lock:
             spec = dict(spec, slot=slot)
             break
@@ -239,7 +262,7 @@ def run(spec: dict) -> int:
                 status(spec, "RETRY", "服务器剩余存储不足，已暂停新下载和生成")
                 return 0
         status(spec, "RUNNING")  # Reject stale attempts before claiming business work.
-        inherited_locks = tuple(handle.fileno() for handle in (slot_lock, execution_lock, platform_lock) if handle)
+        inherited_locks = tuple(handle.fileno() for handle in (slot_lock, maintenance_lock, execution_lock, platform_lock) if handle)
         if account_lock: inherited_locks += account_lock.filenos()
         child = subprocess.Popen(command(spec), env=environment, start_new_session=True, pass_fds=inherited_locks)
         last_ack = time.monotonic()
@@ -271,6 +294,7 @@ def run(spec: dict) -> int:
                 child.wait()
         if execution_lock: execution_lock.close()
         if slot_lock: slot_lock.close()
+        if maintenance_lock: maintenance_lock.close()
         if platform_lock: platform_lock.close()
         if account_lock: account_lock.close()
 
