@@ -258,6 +258,7 @@ def discover_page(source, cursor, temp_root, browser_factory=Chromium, timeout=9
     start=str((cursor or {}).get('providerCursor','0'))
     if not start.isdigit(): raise BrowserFailure('DISCOVERY_INCOMPLETE')
     deadline=time.monotonic()+min(timeout,90)
+    if temp_root: Path(temp_root).mkdir(parents=True,exist_ok=True)
     with browser_factory(temp_root,deadline) as browser:
         navigation=browser.call('Page.navigate',{'url':source['url']})
         if navigation.get('errorText'): raise BrowserFailure('NETWORK_ERROR')

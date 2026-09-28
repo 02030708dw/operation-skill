@@ -137,3 +137,16 @@ class DurablePageTests(unittest.TestCase):
             def fetch_page(self, account, cursor, sec_uid):return {'start':cursor,'cursor':cursor,'entries':[],'exhausted':False}
         with self.assertRaises(b.BrowserFailure) as raised:b.discover_page(SOURCE,{'providerCursor':'8000'},None,Pager,pause=0)
         self.assertEqual('DISCOVERY_INCOMPLETE',raised.exception.code)
+
+    def test_new_stage_creates_its_isolated_browser_directory(self):
+        class Pager(FakeBrowser):
+            post_template='template';post_pages={}
+            def __init__(self, temp_root, deadline):
+                assert Path(temp_root).is_dir()
+                super().__init__(temp_root,deadline)
+            def snapshot(self, account):return {'host':'www.tiktok.com','secUid':'own'}
+            def fetch_page(self, account, cursor, sec_uid):return {'start':cursor,'cursor':'0','entries':[],'exhausted':True}
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)/'new-stage'/'anonymous'
+            result=b.discover_page(SOURCE,{},root,Pager,pause=0)
+            self.assertTrue(result['sourceExhausted']);self.assertTrue(root.is_dir())
