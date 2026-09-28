@@ -29,6 +29,16 @@ def atomic_json(path, value):
     temporary.replace(path)
 
 
+def backend_title(value, limit=300):
+    """Keep titles within the Java API's UTF-16 code-unit limit."""
+    chars=[]; units=0
+    for char in str(value):
+        width=2 if ord(char)>0xffff else 1
+        if units+width>limit:break
+        chars.append(char);units+=width
+    return ''.join(chars)
+
+
 def request(config, path, body):
     payload = dict(body, workerId=config['workerId'], storageNode=config['workerId'])
     req = urllib.request.Request(config['backendUrl'].rstrip('/')+PREFIX+path,
@@ -270,7 +280,7 @@ def _execute_stage(job_file):
                     path=Path(item['path']).resolve(strict=True)
                     if not path.is_relative_to(Path(config['mediaRoot']).resolve()):raise ValueError('REGION_PATH_INVALID')
                     video=dict(originalUrl=job['entry']['url'],canonicalUrl=job['entry']['url'],
-                        platformVideoId=job['entry']['id'],title=str(item.get('title') or job['entry']['id'])[:300],
+                        platformVideoId=job['entry']['id'],title=backend_title(item.get('title') or job['entry']['id']),
                         localPath=str(path),fileName=path.name,fileSize=path.stat().st_size,fileSha256=digest(path),
                         durationSeconds=int(item.get('duration') or 0),expectAudio=bool(item.get('expectAudio')),attempts=attempts)
             elif video is None:
@@ -283,6 +293,9 @@ def _execute_stage(job_file):
                 if video.get('expectAudio') and not any(s.get('codec_type')=='audio' for s in compat.probe(video['localPath'])['streams']):raise public.Failure('VALIDATION_FAILED')
                 video['fileSha256']=digest(video['localPath'])
             if video:
+                # Persisted downloads and media receipts may predate the title
+                # limit fix; normalize them before either stage reports success.
+                video['title']=backend_title(video.get('title') or video.get('platformVideoId') or job['subjectKey'])
                 if job['stage']=='MEDIA':
                     # Immutable canonical cache stays in pipeline/. Each ownership
                     # receives its own hard link, so review cleanup cannot destroy

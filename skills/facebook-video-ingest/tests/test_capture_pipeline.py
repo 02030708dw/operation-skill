@@ -16,6 +16,10 @@ import hm_server_worker as runner
 
 
 class PipelineTests(unittest.TestCase):
+    def test_title_limit_counts_java_utf16_units_without_splitting_emoji(self):
+        self.assertEqual('a'*299,pipeline.backend_title('a'*299+'😀'))
+        self.assertEqual('a'*298+'😀',pipeline.backend_title('a'*298+'😀'+'b'))
+
     def test_stage_browser_socket_fits_even_with_long_inherited_job_directory(self):
         roots=[]
         def stage(_):
@@ -166,13 +170,16 @@ class PipelineMediaTests(unittest.TestCase):
             sha=pipeline.digest(source)
             job={'jobNo':'P-media','leaseVersion':1,'tenant':'ph','stage':'MEDIA','platform':'Facebook',
                  'subjectKey':'fixture','taskIds':[10,20],
-                 'download':{'localPath':str(source),'fileSha256':sha,'fileName':'source.webm','fileSize':source.stat().st_size}}
+                 'download':{'localPath':str(source),'fileSha256':sha,'fileName':'source.webm','fileSize':source.stat().st_size,
+                             'title':'a'*290+'😀'*10}}
             path=root/'job.json';pipeline.atomic_json(path,job)
             environment={'HM_MEDIA_COMPAT_ENABLED':'1','HM_SERVER_STATE_DIR':str(root/'state'),'HM_MEDIA_LOCK_DIR':str(root/'locks')}
             with patch.object(runner,'tenant_config',return_value={'mediaRoot':str(root)}),patch.dict(os.environ,environment):
                 pipeline.execute_stage(path)
                 result=json.loads(pipeline.result_file(path).read_text())
                 self.assertEqual('SUCCESS',result['outcome']);video=result['video']
+                self.assertEqual(300,len(video['title'].encode('utf-16-le'))//2)
+                self.assertEqual(video['title'],json.loads((root/'pipeline'/'fixture'/'media.json').read_text())['title'])
                 self.assertTrue(video['mediaCompatibility']['converted']);self.assertEqual(sha,pipeline.digest(source))
                 self.assertEqual(2,len(video['deliveryPaths']))
                 for delivered in video['deliveryPaths'].values():self.assertEqual(video['fileSha256'],pipeline.digest(delivered))
