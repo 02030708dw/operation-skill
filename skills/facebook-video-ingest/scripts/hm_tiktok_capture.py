@@ -53,8 +53,18 @@ def download(item, output):
         if reason: return dict(item, status='unsupported', errorCode=reason)
         if (info.get('duration') or 0) > 1200:
             return dict(item, status='filtered-duration', duration=info['duration'])
-    saved = downloader.download_one(current, raw, archive, engine, engine.ffmpeg)
+    deferred = os.getenv('HM_PIPELINE_DEFER_MEDIA') == '1'
+    def transport_receipt(path, _ffmpeg, _expect_audio):
+        if not path.is_file() or path.stat().st_size<=0:raise downloader.Failure('DOWNLOAD_FAILED')
+        return dict(bytes=path.stat().st_size,sha256=downloader.digest(path),duration=0,
+            decodePassed=False,validationPending=True)
+    saved = downloader.download_one(current, raw, archive, engine, engine.ffmpeg,
+        validator=transport_receipt if deferred else downloader.validate_file)
     original = raw / saved['path']
+    if deferred:
+        return dict(item,status='downloaded',title=saved.get('title') or current['id'],
+            duration=saved['duration'],path=str(original),bytes=saved['bytes'],sha256=saved['sha256'],
+            originalPath=str(original),originalSha256=saved['sha256'],requestClient=CLIENT,expectAudio=saved.get('expectAudio',True))
     preview = output / 'previews' / (current['id']+'.mp4')
     preview.parent.mkdir(parents=True, exist_ok=True)
     if saved['videoCodec'] == 'h264' and saved.get('audioCodec') in (None, 'aac'):

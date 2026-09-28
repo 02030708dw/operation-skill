@@ -100,6 +100,22 @@ class TikTokCaptureTests(unittest.TestCase):
                 recovered=tiktok.download({'id':'123','url':PROFILE+'/video/123'},root)
                 self.assertEqual('skipped',recovered['status']);self.assertTrue(tiktok.receipt_valid(recovered))
 
+    def test_pipeline_download_defers_decode_and_transcode_to_media_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);raw=root/'originals';raw.mkdir()
+            source=raw/'test.mp4';source.write_bytes(b'transport-only-fixture')
+            engine=Mock(ffmpeg='ffmpeg',inspect=Mock(return_value={'formats':[{}],'duration':5}))
+            def downloaded(_current,_raw,_archive,_engine,ffmpeg,validator):
+                saved=validator(source,ffmpeg,False)
+                self.assertFalse(saved['decodePassed']);self.assertTrue(saved['validationPending'])
+                return dict(saved,path='test.mp4',expectAudio=False)
+            with patch.dict(os.environ,{'HM_PIPELINE_DEFER_MEDIA':'1'}),patch.object(tiktok,'provider',return_value=engine), \
+                    patch.object(tiktok.downloader,'download_one',side_effect=downloaded), \
+                    patch.object(tiktok.downloader,'validate_file',side_effect=AssertionError('decode in DOWNLOAD')):
+                item=tiktok.download({'id':'123','url':PROFILE+'/video/123'},root)
+            self.assertEqual(str(source),item['path']);self.assertFalse(item['expectAudio'])
+            self.assertFalse((root/'previews').exists())
+
     def test_platform_opt_in_and_locks_are_regional(self):
         spec=dict(dispatchId=1,attempt=1,kind='CAPTURE',slot=1,taskNo='C-X',executionNo='E-X',tenant='vn',platform='TikTok',capturePolicy='PUBLIC_FIRST')
         with patch.object(worker,'tenant_config',return_value={'capturePolicy':'PUBLIC_FIRST','enabledPlatforms':['Facebook']}):

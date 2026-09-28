@@ -549,13 +549,14 @@ function discoveryExpression() {
         title: String(document.title || '').slice(0, 500),
         gateText: Array.from(document.querySelectorAll('[role="dialog"],[role="alert"]')).filter(node => node.getClientRects().length && getComputedStyle(node).visibility !== 'hidden' && getComputedStyle(node).display !== 'none' && node.getAttribute('aria-hidden') !== 'true').map(node => String(node.innerText || '')).join(' ').slice(0, 6000),
         bodyText: String(document.body ? document.body.innerText : '').slice(0, 6000),
+        paginationLoginGate: [...document.querySelectorAll('input[type="password"]')].some(node => node.getClientRects().length && getComputedStyle(node).visibility !== 'hidden') && /see more on facebook/i.test(document.body?.innerText || ''),
         videoElements: document.querySelectorAll('video').length
       });
     })()
       `;
 }
 
-async function discoverOnPage(ws, url, stopKeys = new Set(), minimumItems = 0) {
+async function discoverOnPage(ws, url, stopKeys = new Set(), minimumItems = 0, pipelineCursor = undefined) {
   console.log(`  掃描: ${url}`);
   const extractExpression = discoveryExpression();
   const collected = new Set();
@@ -564,6 +565,20 @@ async function discoverOnPage(ws, url, stopKeys = new Set(), minimumItems = 0) {
   let stagnantRounds = 0;
   let reachedKnownVideo = false;
   let layoutUnsupported = false;
+  const {parsePage, PaginationProof} = require('./facebook_pagination');
+  const proof = new PaginationProof(), requests = new Map(), responses = new Set(), templates = new Map();
+  let pipelinePage = null, pipelineLoginGate = false;
+  const paginationEvent = data => {
+    try {
+      const event = JSON.parse(data), p = event.params || {};
+      if (event.method === 'Network.requestWillBeSent' && new URL(p.request.url).pathname === '/api/graphql/') {
+        const form = new URLSearchParams(p.request.postData || '');
+        requests.set(p.requestId, {variables:JSON.parse(form.get('variables') || '{}'), form:form.toString()});
+      }
+      if (event.method === 'Network.loadingFinished' && requests.has(p.requestId)) responses.add(p.requestId);
+    } catch { /* Unsupported network shape is incomplete, never successful. */ }
+  };
+  ws.on('message', paginationEvent);
   async function collectVisibleLinks() {
     const result = await cdpCall(ws, {
       id: nextCdpId(),
@@ -584,6 +599,54 @@ async function discoverOnPage(ws, url, stopKeys = new Set(), minimumItems = 0) {
     Object.assign(titleCandidates, captionResult?.result?.result?.value?.candidates || {});
     // Captions in a healthy feed are content, not account diagnostics.
     assertPageAccess(snapshot);
+    pipelineLoginGate = !!snapshot.paginationLoginGate;
+    if (!(snapshot.urls || []).length && !snapshot.videoElements && /this content (?:isn't|isn’t|is not) available|content not found/i.test(snapshot.bodyText || '')) {
+      throw codedError('FACEBOOK_ACCESS_DENIED','The requested source is not publicly accessible');
+    }
+    for (const requestId of [...responses]) {
+      responses.delete(requestId);
+      try {
+        const response = await cdpCall(ws, {id:nextCdpId(),method:'Network.getResponseBody',params:{requestId}},5000);
+        if (!response.result?.base64Encoded) for (const line of String(response.result?.body || '').replace(/^for \(;;\);/, '').split('\n')) {
+          try {
+            const request = requests.get(requestId);
+            const pages = parsePage(JSON.parse(line), url, request.variables);
+            proof.add(pages);
+            for (const page of pages) templates.set(page.key, request.form);
+          } catch {}
+        }
+      } catch { /* Missing response remains incomplete. */ }
+      requests.delete(requestId);
+    }
+    if (pipelineCursor !== undefined && !pipelinePage) {
+      const key = pipelineCursor?.key || [...templates.keys()].find(k => /:(all_videos|video_list)$/.test(k));
+      const start = pipelineCursor?.after ?? null;
+      const formText = key && templates.get(key);
+      if (formText) {
+        pipelinePage = proof.chains.get(key)?.get(start) || null;
+        if (!pipelinePage) {
+          const form = new URLSearchParams(formText), variables = JSON.parse(form.get('variables'));
+          if (Object.hasOwn(variables,'cursor')) variables.cursor = start;
+          else if (Object.hasOwn(variables,'after')) variables.after = start;
+          form.set('variables',JSON.stringify(variables));
+          // Use the page's fresh request context. Persist only the provider's
+          // connection/cursor, never session tokens, headers or cookies.
+          const expression = `(async () => {const r=await fetch('/api/graphql/',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:${JSON.stringify(form.toString())}});return {status:r.status,body:await r.text()};})()`;
+          const reply = await cdpCall(ws,{id:nextCdpId(),method:'Runtime.evaluate',params:{expression,awaitPromise:true,returnByValue:true}},30000);
+          const value = reply.result?.result?.value;
+          if (value?.status===429) throw codedError('FACEBOOK_RATE_LIMITED','Facebook rate limited');
+          if (value?.status===200) for (const line of String(value.body).replace(/^for \(;;\);/, '').split('\n')) {
+            try {
+              pipelinePage = parsePage(JSON.parse(line),url,variables).find(p => p.key===key && p.start===start) || pipelinePage;
+            } catch {}
+          }
+        }
+      }
+    }
+    for (const videoUrl of proof.urls) collected.add(videoUrl);
+    // User captions can contain "no more videos". Neither page text nor a
+    // stalled scroll proves that the source pagination has finished.
+    // Exhaustion must come from a validated provider pagination response.
     if (Number(snapshot.videoElements || 0) > 0 && !(snapshot.urls || []).length) {
       layoutUnsupported = true;
     }
@@ -603,6 +666,7 @@ async function discoverOnPage(ws, url, stopKeys = new Set(), minimumItems = 0) {
   }
 
   try {
+  try {
     await cdpCall(ws, { id: nextCdpId(), method: 'Page.navigate', params: { url } }, 8000);
   } catch (error) {
     if (ACCOUNT_STOPS.has(error.code)) throw error;
@@ -613,7 +677,7 @@ async function discoverOnPage(ws, url, stopKeys = new Set(), minimumItems = 0) {
   await sleep(7500);
   await collectVisibleLinks();
   for (let i = 0; i < scrollRounds; i++) {
-    if (reachedKnownVideo || (minimumItems > 0 && collected.size >= minimumItems) || stagnantRounds >= 3) break;
+    if (pipelinePage || reachedKnownVideo || (minimumItems > 0 && collected.size >= minimumItems) || stagnantRounds >= 3) break;
     await cdpCall(ws, {
       id: nextCdpId(),
       method: 'Runtime.evaluate',
@@ -624,8 +688,9 @@ async function discoverOnPage(ws, url, stopKeys = new Set(), minimumItems = 0) {
   }
   return {
     urls: Array.from(collected).filter(isSupportedVideoUrl),
-    layoutUnsupported, titleCandidates
+    layoutUnsupported, titleCandidates, sourceExhausted: proof.exhausted, emptyConfirmed: proof.exhausted && collected.size === 0, pipelinePage, pipelineLoginGate
   };
+  } finally { ws.removeListener('message', paginationEvent); }
 }
 
 async function discoverWithRecovery(
@@ -1109,7 +1174,7 @@ async function startBrowser(profile, executable = chromePath) {
       'about:blank'
     ], {
       stdio: ['ignore', 'ignore', 'pipe'],
-      detached: process.platform !== 'win32',
+      detached: process.platform !== 'win32' && process.env.HM_PIPELINE_DEFER_MEDIA !== '1',
       windowsHide: true
     });
     chrome.once('error', error => { launchError = error; });
@@ -1404,6 +1469,7 @@ module.exports = {
   classifyDiscoveryFailure,
   discoveryExpression,
   discoverWithRecovery,
+  discoverOnPage,
   existingVideoState,
   isSupportedVideoUrl,
   isYtDlpArchived,

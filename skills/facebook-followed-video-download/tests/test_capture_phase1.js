@@ -73,7 +73,7 @@ test('healthy discovery navigates once without an unconditional refresh',async t
    methods.push(msg.method);
    return {result:{result:{value:msg.method==='Runtime.evaluate'?JSON.stringify({urls:['https://www.facebook.com/reel/123']}):null}}};
  };`,context);
- await vm.runInContext(`discoverOnPage({},'https://www.facebook.com/creator',new Set(['123']),1)`,context);
+ await vm.runInContext(`discoverOnPage({on(){},removeListener(){}},'https://www.facebook.com/creator',new Set(['123']),1)`,context);
  assert.equal(vm.runInContext(`methods.filter(x=>x==='Page.navigate').length`,context),1);
  assert.equal(vm.runInContext(`methods.filter(x=>x==='Page.reload').length`,context),0);
 });

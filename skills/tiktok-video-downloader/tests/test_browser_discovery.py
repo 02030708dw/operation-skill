@@ -92,6 +92,20 @@ class BrowserTests(unittest.TestCase):
             result = d.run(SOURCE,output,10,True,extractor,'ffmpeg',output/'report.json')
             self.assertEqual(result['status'],'PARTIAL')
             self.assertIsNone(result['counts']['unattempted'])
+    def test_source_exhaustion_requires_profile_bound_pagination(self):
+        url='https://www.tiktok.com/api/post/item_list/?secUid=own&cursor=0'
+        payload={'statusCode':0,'hasMore':False,'cursor':'0','itemList':[]}
+        self.assertTrue(b.pagination_page(payload,url,'example','own')['exhausted'])
+        self.assertIsNone(b.pagination_page(payload,url,'example','someone-else'))
+        self.assertIsNone(b.pagination_page(payload,url.replace('/post/','/recommend/'),'example','own'))
+        payload['itemList']=[{'id':'1','author':{'uniqueId':'other'},'video':{'id':'1'}}]
+        self.assertIsNone(b.pagination_page(payload,url,'example','own'))
+    def test_confirmed_empty_pagination_is_success_without_login(self):
+        result=self.discover([{'entries':[],'sourceExhausted':True}])
+        self.assertTrue(result['sourceExhausted']);self.assertTrue(result['emptyConfirmed'])
+    def test_captions_cannot_prove_pagination_exhaustion(self):
+        result=self.discover([{'entries':[row(1)],'text':'no more videos'}])
+        self.assertFalse(result.get('sourceExhausted',False))
     def test_startup_failure_cleans_temporary_profile(self):
         with tempfile.TemporaryDirectory() as temp:
             with patch.object(b,'chromium_binary',return_value='/missing/chromium'):
@@ -100,3 +114,26 @@ class BrowserTests(unittest.TestCase):
             self.assertEqual(list(Path(temp).iterdir()),[])
 
 if __name__ == '__main__': unittest.main()
+
+
+class DurablePageTests(unittest.TestCase):
+    def test_saved_provider_cursor_resumes_without_replaying_prefix(self):
+        class Pager(FakeBrowser):
+            post_template='https://www.tiktok.com/api/post/item_list/?secUid=own&cursor=0'
+            post_pages={}
+            def snapshot(self, account):return {'host':'www.tiktok.com','secUid':'own','entries':[]}
+            def fetch_page(self, account, cursor, sec_uid):
+                self.requested=cursor
+                return {'start':cursor,'cursor':'9000','entries':[row(2001)],'exhausted':False}
+        result=b.discover_page(SOURCE,{'providerCursor':'8000'},None,Pager,pause=0)
+        self.assertEqual('8000',Pager.last.requested)
+        self.assertEqual('9000',result['providerCursor']);self.assertEqual([row(2001)],result['entries'])
+        self.assertFalse(result['sourceExhausted'])
+
+    def test_stalled_cursor_cannot_count_as_complete(self):
+        class Pager(FakeBrowser):
+            post_template='template';post_pages={}
+            def snapshot(self, account):return {'host':'www.tiktok.com','secUid':'own'}
+            def fetch_page(self, account, cursor, sec_uid):return {'start':cursor,'cursor':cursor,'entries':[],'exhausted':False}
+        with self.assertRaises(b.BrowserFailure) as raised:b.discover_page(SOURCE,{'providerCursor':'8000'},None,Pager,pause=0)
+        self.assertEqual('DISCOVERY_INCOMPLETE',raised.exception.code)

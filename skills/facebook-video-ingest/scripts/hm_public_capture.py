@@ -34,6 +34,7 @@ MESSAGES = {
     'ACCOUNT_SUSPENDED':'平台提示账号受限，已停止本批次。',
     'RATE_LIMITED':'平台请求受限，已停止本批次并等待冷却。',
     'NETWORK_ERROR':'请求超时或网络异常，本次尝试已结束。',
+    'DISCOVERY_INCOMPLETE':'主页分页证据不完整，保留继续点，不能计为成功检查。',
     'DISCOVERY_EMPTY':'来源页未发现可下载视频，未能枚举本次视频列表。',
     'DOWNLOAD_FAILED':'未获得可验证的视频文件，请检查链接或查看平台访问情况。',
     'PROFILE_ID_UNAVAILABLE':'主页未返回可解析的账号编号，未能枚举；不等同于需要登录。',
@@ -56,6 +57,32 @@ class Failure(Exception):
     def __init__(self, code):
         self.code=code
         super().__init__(MESSAGES.get(code,MESSAGES['DOWNLOAD_FAILED']))
+
+
+def retry_after(error):
+    """Preserve provider Retry-After evidence through exception wrappers."""
+    from email.utils import parsedate_to_datetime
+    seen=set();current=error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        value=getattr(current,'retry_after_seconds',None)
+        if value is None:
+            headers=getattr(current,'headers',None) or getattr(getattr(current,'response',None),'headers',None) or {}
+            value=headers.get('Retry-After') or headers.get('retry-after')
+        if value is not None:
+            try:return min(86400,max(0,int(value)))
+            except (TypeError,ValueError):
+                try:return min(86400,max(0,int(parsedate_to_datetime(value).timestamp()-time.time())))
+                except (TypeError,ValueError,OverflowError):pass
+        current=getattr(current,'cause',None) or getattr(current,'__cause__',None)
+    return None
+
+
+def wrapped_failure(code,error):
+    failure=Failure(code)
+    delay=retry_after(error)
+    if delay is not None:failure.retry_after_seconds=delay
+    return failure
 
 
 def classify(error):
@@ -127,7 +154,7 @@ def attempt(operation,config,platform,attempts,stage):
         result=operation({});public['result']='PASSED';return result
     except Exception as error:
         code=classify(error);public.update(result='FAILED',reasonCode=code)
-        if code!='LOGIN_REQUIRED':raise Failure(code)
+        if code!='LOGIN_REQUIRED':raise wrapped_failure(code,error)
     auth={'stage':stage,'mode':'AUTHENTICATED','result':'NOT_ATTEMPTED'};attempts.append(auth)
     try:
         with authenticated_session(config,platform) as credentials:
@@ -139,13 +166,13 @@ def attempt(operation,config,platform,attempts,stage):
                 # Content permissions are not evidence that the browser session expired.
                 if code=='LOGIN_REQUIRED':code='ACCESS_DENIED'
                 auth.update(result='FAILED',reasonCode=code)
-                account_outcome(config,platform,code);raise Failure(code)
+                account_outcome(config,platform,code);raise wrapped_failure(code,error)
             auth['result']='PASSED'
             if stage=='DOWNLOAD' and isinstance(result,dict) and result.get('status')=='downloaded':account_outcome(config,platform,None)
             return result
     except Exception as error:
         code=classify(error);auth.setdefault('reasonCode',code)
-        raise Failure(code) from None
+        raise wrapped_failure(code,error) from None
 
 
 def requires_login(code, attempts):
@@ -231,7 +258,7 @@ def download_item(platform,item,output,credentials):
             path=Path(info['filepath'])
             if not path.is_file() or path.stat().st_size==0:raise Failure('DOWNLOAD_FAILED')
             captured.append(dict(id=str(info['id']),url=item['url'],title=info.get('title') or str(info['id']),
-                upload_date=info.get('upload_date'),duration=info.get('duration'),path=str(path),bytes=path.stat().st_size))
+                upload_date=info.get('upload_date'),duration=info.get('duration'),path=str(path),bytes=path.stat().st_size,expectAudio=info.get('acodec') not in (None,'none')))
             return [],info
     options=dict(common_options(credentials),noplaylist=True,continuedl=True,overwrites=False,
         ffmpeg_location=resolve_ffmpeg(output),merge_output_format='mp4',

@@ -45,7 +45,7 @@ def validate_spec(spec: dict) -> dict:
     for key in ("dispatchId", "attempt", "slot"):
         if type(result[key]) is not int or result[key] < 1:
             raise ValueError(f"Invalid {key}")
-    if result["kind"] not in {"CAPTURE", "UPLOAD", "DELETE", "GENERATION", "TITLE"}:
+    if result["kind"] not in {"CAPTURE", "UPLOAD", "DELETE", "GENERATION", "TITLE", "PIPELINE"}:
         raise ValueError("Invalid server work kind")
     limit = int(os.getenv("HM_CAPTURE_SLOTS", "8")) if result["kind"] == "CAPTURE" else 1
     if result["slot"] > limit:
@@ -176,6 +176,8 @@ def launch(spec: dict) -> None:
 
 def command(spec: dict) -> list[str]:
     scripts = Path(__file__).resolve().parent
+    if spec["kind"] == "PIPELINE":
+        return [sys.executable, str(scripts / "hm_capture_pipeline_worker.py")]
     if spec["kind"] == "TITLE":
         return [sys.executable, str(scripts / "hm_video_title_worker.py")]
     if spec["kind"] == "GENERATION":
@@ -228,6 +230,10 @@ def run(spec: dict) -> int:
     slots = [spec["slot"]]
     if spec.get("tenant") and spec["kind"] in {"CAPTURE", "TITLE"}:
         slots += [slot for slot in range(1, int(os.getenv("HM_CAPTURE_SLOTS", "8")) + 1) if slot != spec["slot"]]
+    if spec["kind"] in {"CAPTURE", "TITLE"}:
+        guard=lock_file(root / "locks" / "PIPELINE-1.lock")
+        if guard: guard.close()
+        else: slots=[slot for slot in slots if slot>2]
     slot_lock = None
     maintenance_lock = None
     for slot in slots:
@@ -236,6 +242,9 @@ def run(spec: dict) -> int:
             spec = dict(spec, slot=slot)
             break
     environment = worker_environment(spec)
+    if spec["kind"] == "PIPELINE" and slot_lock:
+        environment['HM_PIPELINE_GLOBAL_ROOT'] = str(root)
+        environment['HM_PIPELINE_GUARD_FD'] = str(slot_lock.fileno())
     if account:
         if spec.get("platform")=="YouTube": environment["HM_GOOGLE_COOKIES"]=str(account_lock.profile/"youtube-cookies.txt")
         else: environment["HM_FACEBOOK_PROFILE"] = str(account_lock.profile)

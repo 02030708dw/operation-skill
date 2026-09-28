@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""One shared fair dispatcher, fenced region-local jobs and restart-safe stage receipts."""
+from __future__ import annotations
+import collections
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+import hm_server_worker as runner
+
+REGIONS = ('ph', 'th', 'vn', 'id')
+PLATFORMS = ('Facebook', 'YouTube', 'TikTok')
+PREFIX = '/api/internal/capture/pipeline'
+
+
+def atomic_json(path, value):
+    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix('.tmp')
+    with temporary.open('w') as output:
+        json.dump(value, output, sort_keys=True); output.flush(); os.fsync(output.fileno())
+    temporary.replace(path)
+
+
+def request(config, path, body):
+    payload = dict(body, workerId=config['workerId'], storageNode=config['workerId'])
+    req = urllib.request.Request(config['backendUrl'].rstrip('/')+PREFIX+path,
+        json.dumps(payload).encode(), headers={'Content-Type':'application/json',
+        'X-HM-Worker-Token':config['workerToken']}, method='POST')
+    with urllib.request.urlopen(req, timeout=12) as response:
+        return json.load(response).get('data')
+
+
+class Rotation:
+    """A successful claim always advances the region; empty capacity is borrowed."""
+    def __init__(self, regions):
+        self.regions = collections.deque(regions)
+        self.platforms = {region:collections.deque(PLATFORMS) for region in regions}
+
+    def candidates(self):
+        for _ in range(len(self.regions)):
+            region = self.regions[0]; self.regions.rotate(-1)
+            queue = self.platforms[region]
+            for _ in range(len(queue)):
+                platform = queue[0]; queue.rotate(-1)
+                yield region, platform
+
+
+def slots(stage):
+    total = min(8, max(1, int(os.getenv('HM_CAPTURE_SLOTS', '8'))))
+    checks = min(2, total)
+    return range(1, checks+1) if stage == 'CHECK' else range(checks+1, total+1)
+
+
+def stage_lock(root, stage):
+    if stage == 'MEDIA':
+        import hm_media_capacity
+        for number in range(1, hm_media_capacity.limit()+1):
+            held = runner.lock_file(root/'locks'/f'PIPELINE-MEDIA-{number}.lock')
+            if held: return number, held
+        return None, None
+    for number in slots(stage):
+        held = runner.lock_file(root/'locks'/f'CAPTURE-{number}.lock')
+        if held: return number, held
+    return None, None
+
+
+def terminate(child):
+    if child.poll() is None:
+        os.killpg(child.pid, signal.SIGTERM)
+        try: child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(child.pid, signal.SIGKILL); child.wait()
+
+
+def supervise():
+    # The outer trusted runner holds PIPELINE-1 globally. Children inherit it,
+    # so a replacement coordinator cannot race surviving children after a crash.
+    root = Path(os.environ['HM_PIPELINE_GLOBAL_ROOT'])
+    os.environ['HM_SERVER_STATE_DIR'] = str(root)
+    configs = json.loads(Path(os.environ['HM_TENANT_CONFIG']).read_text())
+    rotations = {stage:Rotation([r for r in REGIONS if r in configs]) for stage in ('CHECK','DOWNLOAD','MEDIA')}
+    active = []; stopping = False; states={};checked_at=0
+    def stop(*_):
+        nonlocal stopping
+        stopping = True
+    signal.signal(signal.SIGTERM, stop); signal.signal(signal.SIGINT, stop)
+    try:
+        while not stopping or active:
+            if time.monotonic()-checked_at>5:
+                checked_at=time.monotonic()
+                for region in configs:
+                    try:states[region]=request(configs[region],'/status',{})
+                    except (OSError,ValueError):states[region]=None
+                if states and all(s is not None and not s['enabled'] for s in states.values()):stopping=True
+            for item in list(active):
+                child, held, log, _, _, _ = item
+                if child.poll() is not None:
+                    held.close(); log.close(); active.remove(item)
+            if stopping:
+                time.sleep(.5); continue
+            for stage, rotation in rotations.items():
+                slot, held = stage_lock(root, stage)
+                if held is None: continue
+                try:
+                    for region, platform in rotation.candidates():
+                        config = configs[region]
+                        state=states.get(region)
+                        if not state or not state['enabled'] or state.get('pauseClaims') or (stage=='CHECK' and not state['acceptNew']):continue
+                        if platform not in config.get('enabledPlatforms', ['Facebook']): continue
+                        ready=[r for r in state.get('ready',[]) if r['stage']==stage and r['platform']==platform]
+                        if 'ready' in state and not any(r['count']>0 for r in ready):continue
+                        if config.get('capturePolicy') != 'PUBLIC_FIRST': continue
+                        # Keep platform pressure bounded across checking AND downloading.
+                        limit = 2 if platform == 'Facebook' else 1
+                        if stage != 'MEDIA' and sum(x[3]==region and x[4]==platform and x[5]!='MEDIA' for x in active)>=limit: continue
+                        cooldown = root/'tenants'/region/'public-cooldown'/(platform+'.json')
+                        if stage!='MEDIA' and cooldown.exists() and json.loads(cooldown.read_text()).get('until',0)>time.time(): continue
+                        if stage=='DOWNLOAD':
+                            import shutil
+                            if shutil.disk_usage(config['mediaRoot']).free < int(os.getenv('HM_MIN_FREE_DISK_BYTES',str(20*1024**3))): continue
+                        try: job = request(config, f'/{stage}/claim', {'platform':platform,
+                            'allowHistory':not any(s and s['enabled'] and s.get('realtimeWaiting',0)>0 for s in states.values())})
+                        except (OSError, ValueError): continue
+                        if not job:
+                            for hint in ready:hint['count']=0
+                            continue
+                        for hint in ready:hint['count']=max(0,hint['count']-1)
+                        directory = root/'tenants'/region/'pipeline'/job['jobNo']
+                        directory.mkdir(parents=True, exist_ok=True)
+                        spec = directory/(str(job['leaseVersion'])+'.json')
+                        atomic_json(spec, dict(job, tenant=region))
+                        environment = runner.worker_environment(dict(tenant=region,kind='PIPELINE',slot=slot,
+                            dispatchId='pipeline-'+job['jobNo'], platform=platform))
+                        # Isolate browser profiles by stage; MEDIA slot 1 must not
+                        # reuse CHECK slot 1's temporary directory.
+                        environment['TMPDIR'] = str(directory/'tmp')
+                        environment['HM_PIPELINE_DEFER_MEDIA']='1'
+                        environment['HM_MEDIA_COMPAT_ENABLED']='1'
+                        Path(environment['TMPDIR']).mkdir(parents=True, exist_ok=True)
+                        log = (directory/(str(job['leaseVersion'])+'.log')).open('ab')
+                        inherited = [held.fileno()]
+                        outer = os.getenv('HM_PIPELINE_GUARD_FD')
+                        if outer: inherited.append(int(outer))
+                        child = subprocess.Popen([sys.executable,__file__,'job',str(spec)], env=environment,
+                            stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=True,pass_fds=tuple(inherited))
+                        active.append((child,held,log,region,platform,stage));held=None
+                        break
+                finally:
+                    if held: held.close()
+            time.sleep(1)
+    finally:
+        for child, held, log, *_ in active:
+            terminate(child); held.close(); log.close()
+
+
+def result_file(job_file):
+    return job_file.with_suffix('.result.json')
+
+
+def run_job(job_file):
+    job_file = Path(job_file); job = json.loads(job_file.read_text())
+    config = runner.tenant_config(job)
+    heartbeat = {'leaseVersion':job['leaseVersion']}
+    receipt = result_file(job_file)
+    # The child executes one stage. This supervisor owns its fenced heartbeat.
+    child = None
+    try:
+        request(config, '/jobs/'+job['jobNo']+'/heartbeat', heartbeat)
+        if not receipt.exists():
+            child = subprocess.Popen([sys.executable,__file__,'stage',str(job_file)])
+        last_ack=time.monotonic(); last_heartbeat=last_ack
+        while child is not None and child.poll() is None:
+            time.sleep(.5)
+            if time.monotonic()-last_heartbeat<25: continue
+            last_heartbeat=time.monotonic()
+            try:
+                request(config, '/jobs/'+job['jobNo']+'/heartbeat', heartbeat); last_ack=time.monotonic()
+            except urllib.error.HTTPError as error:
+                if error.code in (401,403,409): return 2
+            except OSError: pass
+            if time.monotonic()-last_ack>85: return 2
+        if not receipt.exists():
+            atomic_json(receipt, dict(heartbeat,outcome='FAILED',errorCode='STAGE_PROCESS_FAILED'))
+        payload=json.loads(receipt.read_text())
+        # A lost acknowledgement retries the SAME durable receipt, never the work.
+        while time.monotonic()-last_ack<85:
+            try:
+                request(config, '/jobs/'+job['jobNo']+'/complete', payload)
+                return 0
+            except urllib.error.HTTPError as error:
+                if error.code in (400,401,403,409): return 2
+            except OSError: pass
+            time.sleep(2)
+        return 2
+    finally:
+        if child is not None and child.poll() is None:
+            # The stage shares our process group; killing just it does not stop
+            # ffmpeg/Chromium. Exit the entire fenced group on lease loss.
+            os.killpg(os.getpgrp(),signal.SIGTERM)
+
+
+def execute_stage(job_file):
+    import hm_public_capture as public
+    job_file=Path(job_file);job=json.loads(job_file.read_text());config=runner.tenant_config(job)
+    attempts=[];result={'leaseVersion':job['leaseVersion']}
+    try:
+        if job['stage']=='CHECK':
+            from hm_pipeline_discovery import check
+            def discover(credentials):
+                try:return check(job,credentials)
+                except public.Failure as error:
+                    # Accessible public videos may be discovered before a login
+                    # wall. Keep them, but never convert that attempt to coverage.
+                    if getattr(error,'entries',None):result['entries']=error.entries
+                    raise
+            result.update(public.attempt(discover,config,job['platform'],attempts,'DISCOVERY'))
+        else:
+            directory=Path(config['mediaRoot'])/'pipeline'/job['subjectKey']
+            directory.mkdir(parents=True,exist_ok=True)
+            saved=directory/('download.json' if job['stage']=='DOWNLOAD' else 'media.json')
+            video=None
+            if saved.exists():
+                candidate=json.loads(saved.read_text());path=Path(candidate.get('localPath',''))
+                if path.is_file() and digest(path)==candidate.get('fileSha256'):video=candidate
+            if video is None and job['stage']=='DOWNLOAD':
+                for candidate in job.get('reuseCandidates',[]):
+                    try:
+                        source=Path(candidate['localPath']).resolve(strict=True)
+                        if not source.is_relative_to(Path(config['mediaRoot']).resolve()) or digest(source)!=candidate['fileSha256']:continue
+                        # Own immutable copy: another review/delete queue may unlink
+                        # the old ownership immediately after this check.
+                        import shutil
+                        target=directory/('reused'+source.suffix)
+                        temporary=target.with_suffix('.copying');shutil.copyfile(source,temporary)
+                        if digest(temporary)!=candidate['fileSha256']:
+                            temporary.unlink(missing_ok=True);continue
+                        temporary.replace(target)
+                        video=dict(candidate,localPath=str(target),fileSize=target.stat().st_size,
+                            platformVideoId=job['entry']['id'],originalUrl=job['entry']['url'],canonicalUrl=job['entry']['url'],
+                            reused=True,attempts=[])
+                        break
+                    except (OSError,KeyError):continue
+            if video is None and job['stage']=='DOWNLOAD':
+                item=public.attempt(lambda credentials:public.download_item(job['platform'],job['entry'],directory,credentials),config,job['platform'],attempts,'DOWNLOAD')
+                if item.get('status') in ('filtered-duration','unsupported'):
+                    result.update(outcome='FILTERED',errorCode=item.get('errorCode','DURATION_FILTERED'))
+                else:
+                    path=Path(item['path']).resolve(strict=True)
+                    if not path.is_relative_to(Path(config['mediaRoot']).resolve()):raise ValueError('REGION_PATH_INVALID')
+                    video=dict(originalUrl=job['entry']['url'],canonicalUrl=job['entry']['url'],
+                        platformVideoId=job['entry']['id'],title=str(item.get('title') or job['entry']['id'])[:300],
+                        localPath=str(path),fileName=path.name,fileSize=path.stat().st_size,fileSha256=digest(path),
+                        durationSeconds=int(item.get('duration') or 0),expectAudio=bool(item.get('expectAudio')),attempts=attempts)
+            elif video is None:
+                import hm_media_compat as compat
+                video=dict(job['download'])
+                path=Path(video['localPath']).resolve(strict=True)
+                if not path.is_relative_to(Path(config['mediaRoot']).resolve()) or digest(path)!=video['fileSha256']:raise ValueError('FILE_CHANGED')
+                compat.prepare_record(video)
+                if video.get('status')=='download-failed' or video.get('downloadStatus')=='DOWNLOAD_FAILED' or not video.get('mediaCompatibility'):raise public.Failure('MEDIA_COMPAT_FAILED')
+                if video.get('expectAudio') and not any(s.get('codec_type')=='audio' for s in compat.probe(video['localPath'])['streams']):raise public.Failure('VALIDATION_FAILED')
+                video['fileSha256']=digest(video['localPath'])
+            if video:
+                if job['stage']=='MEDIA':
+                    # Immutable canonical cache stays in pipeline/. Each ownership
+                    # receives its own hard link, so review cleanup cannot destroy
+                    # another owner's source or a later reuse of the same video.
+                    import shutil
+                    paths=dict(video.get('deliveryPaths') or {})
+                    for task_id in job.get('taskIds',[]):
+                        target=Path(config['mediaRoot'])/'executions'/('pipeline-'+job['subjectKey']+'-'+str(task_id))/'video.mp4'
+                        target.parent.mkdir(parents=True,exist_ok=True)
+                        if not target.is_file() or digest(target)!=video['fileSha256']:
+                            temporary=target.with_suffix('.tmp')
+                            temporary.unlink(missing_ok=True)
+                            try:os.link(video['localPath'],temporary)
+                            except OSError:shutil.copyfile(video['localPath'],temporary)
+                            temporary.replace(target)
+                        paths[str(task_id)]=str(target)
+                    video['deliveryPaths']=paths
+                atomic_json(saved,video);result.update(outcome='SUCCESS',video=video)
+        result['attempts']=attempts
+    except Exception as error:
+        code=public.classify(error)
+        result.update(outcome='RATE_LIMITED' if code=='RATE_LIMITED' else 'LOGIN_REQUIRED' if public.requires_login(code,attempts) else 'FAILED',errorCode=code,attempts=attempts)
+        delay=max(1800,public.retry_after(error) or 0)
+        if code=='RATE_LIMITED':result['retryAfterSeconds']=delay
+        if code in public.STOP:
+            cooldown=Path(os.environ['HM_SERVER_STATE_DIR'])/'public-cooldown'/(job['platform']+'.json')
+            atomic_json(cooldown,{'until':time.time()+delay,'reasonCode':code})
+    atomic_json(result_file(job_file),result)
+
+
+def digest(path):
+    value=hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for chunk in iter(lambda:stream.read(1024*1024),b''):value.update(chunk)
+    return value.hexdigest()
+
+
+if __name__=='__main__':
+    if len(sys.argv)==1:supervise()
+    elif sys.argv[1]=='job':raise SystemExit(run_job(sys.argv[2]))
+    elif sys.argv[1]=='stage':execute_stage(sys.argv[2])
