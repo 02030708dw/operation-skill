@@ -55,7 +55,7 @@ def try_lock(path):
 
 
 @contextlib.contextmanager
-def slot(path, *, blocking=False):
+def slot(path, *, blocking=False, max_slots=None):
     """Slot one retains the legacy filename so old and new Workers cannot overlap it."""
     path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
     secondary = Path(str(path)+'.2')
@@ -63,7 +63,7 @@ def slot(path, *, blocking=False):
     while held is None:
         with Path(str(path)+'.admission').open('a') as admission:
             fcntl.flock(admission, fcntl.LOCK_EX)
-            slots = limit()
+            slots = min(limit(), max_slots) if max_slots is not None else limit()
             if slots == 1:
                 # On 2 -> 1, drain a running secondary before admitting new work.
                 barrier = try_lock(secondary)

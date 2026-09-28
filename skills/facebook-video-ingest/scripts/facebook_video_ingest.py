@@ -1193,70 +1193,45 @@ def drain_upload_jobs(
             payload = json.loads(pending.read_text(encoding="utf-8"))
             if payload.get("workerId") == worker_id:
                 results.append(process_upload_job(args, backend, token, worker_id, payload["job"]))
-    import hm_media_capacity
-    if hm_media_capacity.limit() == 2:
-        return results + drain_parallel_compatibility(args, backend, token, worker_id, task_no)
-    # Amortize scheduler startup without monopolizing the shared regional slot.
-    # Finish the current durable operation, then yield after 30 seconds.
-    batch_deadline = time.monotonic() + 30 if os.getenv("HM_SERVER_COMPONENT") == "UPLOAD" else float("inf")
-    for _ in range(10000):
-        if time.monotonic() >= batch_deadline:
-            break
-        import hm_media_jobs
-        compat_processed = hm_media_jobs.process_one(args, backend, token, worker_id, sys.modules[__name__])
-        import hm_review_storage
-        review_processed = hm_review_storage.process_one(args, backend, token, worker_id, sys.modules[__name__])
-        job = claim_upload(backend, token, worker_id, task_no)
-        if job is None:
-            if review_processed or compat_processed:
-                continue
-            break
-        try:
-            results.append(process_upload_job(args, backend, token, worker_id, job))
-        except BackendError:
-            # The durable journal is replayed on the next poll. Stop claiming
-            # new work until backend connectivity is healthy.
-            raise
-        except Exception as exc:
-            print(
-                f"Approved upload failed ({job.get('jobNo')}): {exc}",
-                file=sys.stderr,
-                flush=True,
-            )
-    return results
+    return results + drain_parallel_compatibility(args, backend, token, worker_id, task_no)
 
 
 def drain_parallel_compatibility(args, backend, token, worker_id, task_no=""):
-    """Two bounded compatibility workers; publish completed files while a peer encodes."""
+    """Inspect compatible files while a separate bounded lane converts others."""
     from concurrent.futures import ThreadPoolExecutor
-    import hm_media_capacity
     import hm_media_jobs
     import hm_review_storage
     results = []
     deadline = time.monotonic() + 30
-    next_submit = 0
+    next_submit = {'INSPECT': 0, 'CONVERT': 0}
     next_publish = 0
-    futures = set()
+    futures = {}
+    idle = 0
     with ThreadPoolExecutor(max_workers=2, thread_name_prefix='media-compat') as pool:
         while True:
-            for future in list(futures):
+            worked = False
+            for lane, future in list(futures.items()):
                 if future.done():
-                    futures.remove(future)
-                    future.result()  # Surface failed callbacks; durable journals survive.
+                    del futures[lane]
+                    worked = future.result() or worked  # Durable journals survive failed callbacks.
             now = time.monotonic()
-            accepting = now < deadline and hm_media_capacity.limit() == 2
-            if accepting and now >= next_submit:
-                while len(futures) < 2:
-                    futures.add(pool.submit(hm_media_jobs.process_one, args, backend, token, worker_id, sys.modules[__name__]))
-                next_submit = now + 1  # Contending regions must not busy-poll APIs.
+            converting = 'CONVERT' in futures
+            for lane in ('INSPECT', 'CONVERT'):
+                if lane == 'CONVERT' and now >= deadline: continue
+                if lane == 'INSPECT' and now >= deadline and not converting: continue
+                if lane not in futures and now >= next_submit[lane]:
+                    futures[lane] = pool.submit(hm_media_jobs.process_one, args, backend, token,
+                                                worker_id, sys.modules[__name__], lane)
+                    next_submit[lane] = now + 1
             job = None
             if now >= next_publish:
-                hm_review_storage.process_one(args, backend, token, worker_id, sys.modules[__name__])
+                worked = hm_review_storage.process_one(args, backend, token, worker_id, sys.modules[__name__]) or worked
                 job = claim_upload(backend, token, worker_id, task_no)
                 if job is not None:
                     results.append(process_upload_job(args, backend, token, worker_id, job))
                 next_publish = time.monotonic() + 1
-            if not accepting and not futures:
+            idle = 0 if worked or job is not None else idle + 1
+            if not futures and (now >= deadline or idle >= 4):
                 break
             if job is None:
                 time.sleep(.2)

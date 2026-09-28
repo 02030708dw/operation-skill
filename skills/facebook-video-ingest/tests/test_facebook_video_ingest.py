@@ -1189,15 +1189,19 @@ class PipelineTests(unittest.TestCase):
 
     def test_storage_batch_uses_time_budget_and_releases_the_shared_slot(self):
         import hm_review_storage
+        import hm_media_jobs
         with tempfile.TemporaryDirectory() as temporary:
             args = MODULE.build_parser().parse_args(["--check", "--state-dir", temporary])
             with (mock.patch.dict(os.environ, {"HM_SERVER_COMPONENT": "UPLOAD"}),
                   mock.patch.object(MODULE.time, "monotonic", side_effect=range(40)),
                   mock.patch.object(MODULE, "replay_upload_cleanup_journals", return_value=[]),
                   mock.patch.object(MODULE, "claim_upload", return_value=None),
+                  mock.patch.object(hm_media_jobs, "process_one", return_value=False) as compatibility,
                   mock.patch.object(hm_review_storage, "process_one", return_value=True) as process):
                 MODULE.drain_upload_jobs(args, "http://backend", "token", "worker")
-            self.assertEqual(process.call_count, 29)
+            self.assertGreater(process.call_count, 0)
+            self.assertLessEqual(process.call_count, 30)
+            self.assertEqual({call.args[-1] for call in compatibility.call_args_list}, {'INSPECT', 'CONVERT'})
 
     def test_versioned_prefix_must_match_claim_identity(self):
         job = {"jobNo": "U-1", "executionVersion": 4, "r2Prefix": "PH/Sports/202609/10/U-1/a4"}

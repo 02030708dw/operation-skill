@@ -33,8 +33,15 @@ class MediaCompatibilityTest(unittest.TestCase):
         return path
     def test_compatible_skip(self):
         path=self.fixture('libx264'); before=media.sha256(path)
-        result=media.normalize(path)
+        with mock.patch('hm_media_capacity.encoder_slot',side_effect=AssertionError('compatible file must not wait for encoder')):
+            result=media.normalize(path,allow_conversion=False)
         self.assertFalse(result['converted']); self.assertEqual(result['path'],str(path.resolve())); self.assertEqual(before,result['sha256'])
+    def test_inspection_routes_incompatible_file_without_encoding(self):
+        path=self.fixture(); original=media.sha256(path)
+        with mock.patch('hm_media_capacity.encoder_slot',side_effect=AssertionError('inspection must not encode')):
+            with self.assertRaises(media.ConversionRequired): media.normalize(path,allow_conversion=False)
+        self.assertEqual(media.sha256(path),original)
+        self.assertFalse(list((self.root/'.hm-compatible').glob('*.mp4')))
     def test_vp9_portrait_audio_and_idempotence(self):
         path=self.fixture(); original=media.sha256(path); result=media.normalize(path)
         self.assertTrue(result['converted']); self.assertEqual(media.sha256(path),original)

@@ -17,6 +17,10 @@ class CompatibilityError(RuntimeError):
     pass
 
 
+class ConversionRequired(CompatibilityError):
+    """The inspection lane found media that needs a separate conversion job."""
+
+
 def sha256(path):
     h = hashlib.sha256()
     with Path(path).open('rb') as stream:
@@ -118,14 +122,11 @@ def validate(source, target):
         raise CompatibilityError('MEDIA_COMPAT_AV_SYNC_MISMATCH')
 
 
-def normalize(source):
-    # All tenants and ingress paths share the same encoder budget.
-    import hm_media_capacity
-    with hm_media_capacity.encoder_slot():
-        return _normalize(source)
+def normalize(source, *, allow_conversion=True):
+    return _normalize(source, allow_conversion=allow_conversion)
 
 
-def _normalize(source):
+def _normalize(source, *, allow_conversion=True):
     source = Path(source).resolve(strict=True)
     source_hash = sha256(source)
     cache = source.parent / '.hm-compatible'
@@ -145,6 +146,8 @@ def _normalize(source):
             result = dict(path=str(source), sha256=source_hash, fileSize=source.stat().st_size,
                           durationSeconds=float(original['format']['duration']), converted=False)
         else:
+            if not allow_conversion:
+                raise ConversionRequired('MEDIA_COMPAT_CONVERSION_REQUIRED')
             fd, name = tempfile.mkstemp(prefix=key + '-', suffix='.mp4', dir=cache)
             os.close(fd)
             temporary = Path(name)
@@ -164,10 +167,14 @@ def _normalize(source):
                     '-preset', 'medium', '-crf', '20', '-pix_fmt', 'yuv420p', '-profile:v', 'high']
                 audio_args = ['-c:a', 'copy'] if copy_audio else [
                     '-c:a', 'aac', '-profile:a', 'aac_low', '-b:a', '160k', '-ac', '2', '-threads:a', '2']
-                run([os.environ.get('FFMPEG', 'ffmpeg'), '-nostdin', '-v', 'error', '-xerror', '-y',
-                     '-threads', '2', '-i', str(source), '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn',
-                     *video_args, '-tag:v', 'avc1', *audio_args,
-                     '-movflags', '+faststart', str(temporary)])
+                # Only the encoding/remuxing step occupies the shared encoder.
+                # Inspection and verification of other videos can continue.
+                import hm_media_capacity
+                with hm_media_capacity.encoder_slot():
+                    run([os.environ.get('FFMPEG', 'ffmpeg'), '-nostdin', '-v', 'error', '-xerror', '-y',
+                         '-threads', '2', '-i', str(source), '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn',
+                         *video_args, '-tag:v', 'avc1', *audio_args,
+                         '-movflags', '+faststart', str(temporary)])
                 info = probe(temporary)
                 if not compatible(temporary, info): raise CompatibilityError('MEDIA_COMPAT_OUTPUT_UNSUPPORTED')
                 validate(original, info)

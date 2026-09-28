@@ -107,7 +107,7 @@ def refetch(job, base, source, guard):
     return candidate
 
 
-def execute(job, args, pipeline, guard):
+def execute(job, args, pipeline, guard, lane=None):
     if job.get('ruleVersion') != media.VERSION:
         raise JobFailure('RULE_VERSION_MISMATCH')
     region, bucket = job['region'], job['bucket']
@@ -143,12 +143,16 @@ def execute(job, args, pipeline, guard):
     if source.stat().st_size != int(job['fileSize']) or (job.get('sha256') and original_sha != job['sha256']):
         raise JobFailure('SOURCE_HASH_MISMATCH')
     recovered = False
+    def normalize(path):
+        return media.normalize(path, allow_conversion=False) if lane == 'INSPECT' else media.normalize(path)
     try:
-        normalized = media.normalize(source)
+        normalized = normalize(source)
+    except media.ConversionRequired:
+        raise
     except media.CompatibilityError:
         guard()
         candidate = refetch(job, base, source, guard)
-        normalized = media.normalize(candidate)
+        normalized = normalize(candidate)
         recovered = True
     guard()
     changed = normalized['sha256'] != original_sha
@@ -210,7 +214,7 @@ def execute(job, args, pipeline, guard):
     return result
 
 
-def process_one(args, backend, token, worker_id, pipeline):
+def process_one(args, backend, token, worker_id, pipeline, lane=None):
     if not os.environ.get('HM_REVIEW_KEY_FILE'):
         return False
     root = args.state_dir/'media-compat-jobs'; root.mkdir(parents=True, exist_ok=True)
@@ -233,8 +237,9 @@ def process_one(args, backend, token, worker_id, pipeline):
             cleanup_cache(saved['receipt'])
     # Both job admission and actual encoders obey the same global capacity.
     lock_path = Path(os.environ.get('HM_MEDIA_JOB_LOCK', '/opt/data/media-compat-job.lock'))
+    if lane == 'INSPECT': lock_path = Path(str(lock_path)+'.inspect')
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with capacity.slot(lock_path) as lock:
+    with capacity.slot(lock_path, max_slots=1 if lane else None) as lock:
         if lock is None: return False
         with journal_lock(root):
             for path in sorted(root.glob('*.json')):
@@ -260,13 +265,20 @@ def process_one(args, backend, token, worker_id, pipeline):
                     priority_only = True
             if capacity.restore_if_drained(observed, pending_regions, registry):
                 return False
-        job = call('claim', {'priorityOnly': priority_only, 'maxConcurrentJobs': capacity.limit()})
+        claim = {'priorityOnly': priority_only, 'maxConcurrentJobs': 1 if lane else capacity.limit()}
+        if lane: claim['lane'] = lane
+        job = call('claim', claim)
         if not job: return False
         receipt = {'executionVersion': job['executionVersion'], 'status': 'SUCCEEDED'}
         try:
             with storage.lease(lambda: call(job['jobNo']+'/check', {'executionVersion': job['executionVersion']})) as guard:
-                receipt.update(execute(job, args, pipeline, guard))
+                receipt.update(execute(job, args, pipeline, guard, lane))
                 guard()
+        except media.ConversionRequired:
+            # Release the inspection lease immediately. Its durable job retains
+            # the source snapshot and is claimed by the conversion lane later.
+            call(job['jobNo']+'/convert', {'executionVersion': job['executionVersion']})
+            return True
         except Exception as exc:
             code = str(exc) if isinstance(exc, (JobFailure, media.CompatibilityError, storage.StorageFailure)) else 'MEDIA_COMPAT_IO_FAILED'
             retryable = getattr(exc, 'retryable', not isinstance(exc, (JobFailure, media.CompatibilityError)))

@@ -1,4 +1,5 @@
 import io
+import contextlib
 import os
 import sys
 import tempfile
@@ -50,6 +51,29 @@ class MediaJobsTest(unittest.TestCase):
     def test_compatible_reuses_object_without_upload(self):
         with mock.patch.object(media,'normalize',side_effect=lambda p:self.normalized(p,b'original')):result=jobs.execute(self.job,self.args,self.pipeline,lambda:None)
         self.assertEqual(result['targetKey'],self.job['key']);self.assertEqual(self.s3.writes,0)
+    def test_inspection_routes_conversion_without_upload(self):
+        with mock.patch.object(media,'normalize',side_effect=media.ConversionRequired('MEDIA_COMPAT_CONVERSION_REQUIRED')) as normalize:
+            with self.assertRaises(media.ConversionRequired):jobs.execute(self.job,self.args,self.pipeline,lambda:None,'INSPECT')
+        self.assertFalse(self.s3.writes)
+        self.assertEqual(normalize.call_args.kwargs,{'allow_conversion':False})
+    def test_inspection_releases_lease_to_conversion_lane(self):
+        calls=[]
+        def api(_backend,_token,_method,path,body,**_kwargs):
+            calls.append((path,body))
+            if path.endswith('/claim'):return {'jobNo':'M-route','executionVersion':4}
+            if path.endswith('/convert'):return {'acknowledged':True,'routed':True}
+            raise AssertionError(path)
+        pipeline=SimpleNamespace(api_call=api,BackendError=RuntimeError)
+        with mock.patch.dict(os.environ,{'HM_REVIEW_KEY_FILE':'configured','HM_TENANT_CONFIG':'',
+                'HM_MEDIA_JOB_LOCK':str(self.base/'jobs.lock')}), \
+                mock.patch.object(jobs.capacity,'slot',return_value=contextlib.nullcontext(object())), \
+                mock.patch.object(jobs.storage,'lease',return_value=contextlib.nullcontext(lambda:None)), \
+                mock.patch.object(jobs,'execute',side_effect=media.ConversionRequired('MEDIA_COMPAT_CONVERSION_REQUIRED')):
+            self.assertTrue(jobs.process_one(self.args,'backend','token','worker',pipeline,'INSPECT'))
+        self.assertEqual(calls[0][1]['lane'],'INSPECT')
+        self.assertEqual(calls[-1],('/api/internal/capture/media-compat/M-route/convert',
+                                   {'workerId':'worker','executionVersion':4}))
+        self.assertFalse(list((self.base/'media-compat-jobs').glob('*.json')))
     def test_corrupt_source_refetch_and_second_failure_never_uploads(self):
         with mock.patch.object(media,'normalize',side_effect=media.CompatibilityError('BROKEN')),mock.patch.object(jobs,'refetch',return_value=self.base/'recovered.mp4') as refetch:
             with self.assertRaises(media.CompatibilityError):jobs.execute(self.job,self.args,self.pipeline,lambda:None)
