@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 import shutil
 import subprocess
+import socket
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -15,6 +16,32 @@ import hm_server_worker as runner
 
 
 class PipelineTests(unittest.TestCase):
+    def test_stage_browser_socket_fits_even_with_long_inherited_job_directory(self):
+        roots=[]
+        def stage(_):
+            root=Path(os.environ['TMPDIR']);roots.append(root)
+            self.assertEqual(0o700,root.stat().st_mode & 0o777)
+            socket_path=root/'org.chromium.Chromium.abcdef'/'SingletonSocket'
+            socket_path.parent.mkdir()
+            with socket.socket(socket.AF_UNIX) as connection:
+                connection.bind(str(socket_path))
+        inherited='/tmp/'+'long-pipeline-job-directory/'*8
+        with patch.dict(os.environ,{'TMPDIR':inherited}),patch.object(pipeline,'_execute_stage',side_effect=stage):
+            pipeline.execute_stage('first.json');pipeline.execute_stage('second.json')
+            self.assertEqual(inherited,os.environ['TMPDIR'])
+        self.assertNotEqual(roots[0],roots[1])
+        self.assertTrue(all(not root.exists() for root in roots))
+
+    def test_failed_stage_cleans_private_browser_temp_and_restores_environment(self):
+        roots=[]
+        def stage(_):
+            roots.append(Path(os.environ['TMPDIR']))
+            raise RuntimeError('stage failed')
+        with patch.dict(os.environ,{'TMPDIR':'/tmp/original'}),patch.object(pipeline,'_execute_stage',side_effect=stage):
+            with self.assertRaisesRegex(RuntimeError,'stage failed'):pipeline.execute_stage('failed.json')
+            self.assertEqual('/tmp/original',os.environ['TMPDIR'])
+        self.assertFalse(roots[0].exists())
+
     def test_round_robin_regions_and_platforms_borrow_empty_shares(self):
         rotation=pipeline.Rotation(pipeline.REGIONS)
         first=[]

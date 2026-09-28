@@ -9,6 +9,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -207,6 +208,20 @@ def run_job(job_file):
 
 
 def execute_stage(job_file):
+    # Chromium creates its SingletonSocket under TMPDIR (Unix path limit 108
+    # bytes). Job/lease directories are too deep. Keep durable receipts/media
+    # there, but give each stage a private short-lived, short browser temp root.
+    previous = os.environ.get('TMPDIR')
+    with tempfile.TemporaryDirectory(prefix='hm-pipe-', dir='/tmp') as temporary:
+        os.environ['TMPDIR'] = temporary
+        try:
+            _execute_stage(job_file)
+        finally:
+            if previous is None: os.environ.pop('TMPDIR', None)
+            else: os.environ['TMPDIR'] = previous
+
+
+def _execute_stage(job_file):
     import hm_public_capture as public
     job_file=Path(job_file);job=json.loads(job_file.read_text());config=runner.tenant_config(job)
     attempts=[];result={'leaseVersion':job['leaseVersion']}
