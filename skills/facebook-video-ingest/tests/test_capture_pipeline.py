@@ -79,6 +79,37 @@ class PipelineTests(unittest.TestCase):
         result=discovery.page_result([],exhausted=True,validated=True,cursor={},frontier=set())
         self.assertEqual('SUCCESS',result['outcome'])
 
+    def test_latest_ten_uses_only_validated_first_feed_page(self):
+        import hm_public_capture as public
+        rows=[{'id':str(i),'url':'https://www.youtube.com/watch?v=abcdefghijk'} for i in range(50)]
+        page={'outcome':'INCOMPLETE','complete':False,'validated':True,'entries':rows}
+        job={'platform':'YouTube','sourceUrl':'https://www.youtube.com/@fixture','latestTen':True}
+        with patch.object(public,'single_source',return_value=None),patch.object(discovery,'youtube',return_value=page) as youtube:
+            result=discovery.check(job,{})
+        self.assertEqual('SUCCESS',result['outcome']);self.assertEqual(10,len(result['entries']))
+        self.assertEqual('VALIDATED_LATEST_TEN',result['evidence'])
+        self.assertEqual({},youtube.call_args.args[1])
+        self.assertEqual(10,youtube.call_args.args[-1])
+        with patch.object(public,'single_source',return_value=None),patch.object(discovery,'youtube',return_value=dict(page,entries=rows[:9])):
+            with self.assertRaises(public.Failure):discovery.check(job,{})
+
+    def test_windowed_review_upload_returns_verified_bucket_receipt_without_local_path(self):
+        import hm_review_storage as storage
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/'video.mp4';path.write_bytes(b'video-source')
+            video={'localPath':str(path),'fileSize':path.stat().st_size,'fileSha256':pipeline.digest(path)}
+            class Bucket:
+                def upload_file(self,*args,**kwargs):pass
+            with patch.dict(os.environ,{'CLOUDFLARE_R2_BUCKET':'fixture-bucket'}),\
+                patch.object(storage,'configuration',return_value={'activeVersion':'v1'}),\
+                patch.object(storage,'client',return_value=Bucket()),\
+                patch.object(storage,'encryption',return_value={}),\
+                patch.object(storage,'head',side_effect=[None,{'ContentLength':path.stat().st_size,'Metadata':{'hm-sha256':video['fileSha256']}}]),\
+                patch('hm_media_compat.probe',return_value={'streams':[{'codec_type':'video'}]}):
+                receipt=pipeline.store_review_original(video,'ph','key1')
+            self.assertIsNone(receipt['localPath']);self.assertEqual('fixture-bucket',receipt['reviewBucket'])
+            self.assertTrue(receipt['reviewObjectKey'].startswith('review/PH/pipeline/key1/'))
+
     def test_even_three_pinned_known_items_cannot_prove_complete_coverage(self):
         rows=[{'id':str(i)} for i in range(6)]
         def check(known):
@@ -114,6 +145,23 @@ class PipelineTests(unittest.TestCase):
             with patch.object(runner,'tenant_config',return_value={}),patch.object(pipeline,'request',side_effect=api),patch.object(pipeline.time,'sleep'),patch.object(pipeline.subprocess,'Popen') as launch:
                 self.assertEqual(0,pipeline.run_job(path));launch.assert_not_called()
             self.assertEqual(calls[-1][1],calls[-2][1])
+
+    def test_windowed_ack_removes_only_its_verified_local_cache(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);job_dir=root/'jobs'/'P-clean';job_dir.mkdir(parents=True)
+            media_dir=root/'media'/'pipeline'/'video-key';media_dir.mkdir(parents=True)
+            (media_dir/'source.mp4').write_bytes(b'temporary')
+            path=job_dir/'1.json'
+            pipeline.atomic_json(path,{'jobNo':'P-clean','leaseVersion':1,'tenant':'ph',
+                'stage':'DOWNLOAD','subjectKey':'video-key','windowedMode':True})
+            pipeline.atomic_json(pipeline.result_file(path),{'leaseVersion':1,'outcome':'SUCCESS'})
+            with patch.object(runner,'tenant_config',return_value={'mediaRoot':str(root/'media')}):
+                with patch.object(pipeline,'request',return_value={'accepted':True}):
+                    with patch.object(pipeline.subprocess,'Popen') as launch:
+                        self.assertEqual(0,pipeline.run_job(path))
+                        launch.assert_not_called()
+            self.assertFalse(media_dir.exists())
+            self.assertFalse(job_dir.exists())
 
     def test_partial_public_discovery_is_retained_when_more_requires_login(self):
         import hm_public_capture as public

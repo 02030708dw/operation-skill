@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import time
 from urllib.parse import quote, urlparse
 import hm_media_compat as media
 import hm_review_storage as storage
@@ -150,6 +151,10 @@ def execute(job, args, pipeline, guard, lane=None):
     except media.ConversionRequired:
         raise
     except media.CompatibilityError:
+        if job.get('windowedMode'):
+            # The review object remains the source for both passes. A media
+            # failure must not silently fetch the platform video again.
+            raise
         guard()
         candidate = refetch(job, base, source, guard)
         normalized = normalize(candidate)
@@ -235,12 +240,16 @@ def process_one(args, backend, token, worker_id, pipeline, lane=None):
         path.unlink()
         if saved['receipt'].get('status') == 'SUCCEEDED' and ack.get('backupVerified'):
             cleanup_cache(saved['receipt'])
+        elif saved['receipt'].get('status') == 'FAILED' and saved.get('job'):
+            try:cleanup_failed_cache(saved['job'])
+            except Exception as error:print('media temporary cleanup deferred:',type(error).__name__,flush=True)
     # Both job admission and actual encoders obey the same global capacity.
     lock_path = Path(os.environ.get('HM_MEDIA_JOB_LOCK', '/opt/data/media-compat-job.lock'))
     if lane == 'INSPECT': lock_path = Path(str(lock_path)+'.inspect')
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with capacity.slot(lock_path, max_slots=1 if lane else None) as lock:
         if lock is None: return False
+        cleanup_stale_cache(args.state_dir, worker_id, call)
         with journal_lock(root):
             for path in sorted(root.glob('*.json')):
                 saved = json.loads(path.read_text())
@@ -285,8 +294,9 @@ def process_one(args, backend, token, worker_id, pipeline, lane=None):
             receipt.update(status='FAILED', errorCode=code, retryable=retryable)
         path = root/(job['jobNo']+'-a'+str(job['executionVersion'])+'.json')
         with journal_lock(root):
-            storage.write_journal(path, {'jobNo': job['jobNo'], 'workerId': worker_id, 'receipt': receipt})
-            deliver(path, {'jobNo': job['jobNo'], 'workerId': worker_id, 'receipt': receipt})
+            saved={'jobNo': job['jobNo'], 'workerId': worker_id, 'receipt': receipt, 'job': job}
+            storage.write_journal(path, saved)
+            deliver(path, saved)
         return True
 
 
@@ -297,6 +307,48 @@ def cleanup_cache(receipt):
     base = Path(receipt['backupPath']).parent.resolve()
     root = Path(os.environ.get('HM_MEDIA_BACKUP_ROOT', '/opt/data/media-compat-backups')).resolve()
     if root not in base.parents or not base.name.startswith('M-'): return
+    unlink_cache_files(base)
+
+
+def unlink_cache_files(base):
     for path in base.rglob('*'):
-        if path.is_file() and path.suffix in ('.mp4', '.part', '.webm', '.mkv'):
+        if path.is_file() and path.suffix in ('.mp4', '.part', '.webm', '.mkv', '.mov', '.m4v', '.avi'):
             path.unlink()
+
+
+def cleanup_failed_cache(job):
+    """Keep the original in the bucket; remove only verified local derivatives."""
+    key=job.get('key')
+    if not key or not job.get('sourceETag'): return False
+    region=job['region'];config=storage.configuration(region)
+    review=not bool(job.get('catalog'))
+    regional_key(key,region,review)
+    extra=storage.encryption(config,job['keyVersion']) if review else {}
+    head=storage.head(storage.client(),job['bucket'],key,extra)
+    if not head or head.get('ETag')!=job['sourceETag'] or head.get('ContentLength')!=int(job['fileSize']):
+        return False
+    base=Path(os.environ.get('HM_MEDIA_BACKUP_ROOT','/opt/data/media-compat-backups')).resolve()/region/job['jobNo']
+    root=Path(os.environ.get('HM_MEDIA_BACKUP_ROOT','/opt/data/media-compat-backups')).resolve()
+    if root not in base.parents or not base.name.startswith('M-'):return False
+    if base.is_dir():unlink_cache_files(base)
+    return True
+
+
+def cleanup_stale_cache(state_dir,worker_id,call):
+    """Lease-check old interrupted jobs before removing R2-backed temporary files."""
+    root=Path(os.environ.get('HM_MEDIA_BACKUP_ROOT','/opt/data/media-compat-backups')).resolve()
+    marker=Path(state_dir)/('media-cache-sweep-'+worker_id+'.stamp')
+    marker.parent.mkdir(parents=True,exist_ok=True)
+    with marker.open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        if time.time()-marker.stat().st_mtime<3600:return
+        for source in list(root.glob('*/M-*/source.json'))[:100]:
+            if time.time()-source.stat().st_mtime<3600:continue
+            try:
+                job=json.loads(source.read_text())
+                if job.get('workerId')!=worker_id or not job.get('key'):continue
+                status=call(job['jobNo']+'/check',{'executionVersion':job['executionVersion']})
+                if not status.get('active'):cleanup_failed_cache(job)
+            except Exception:
+                continue
+        marker.touch()

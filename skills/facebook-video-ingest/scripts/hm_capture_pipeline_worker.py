@@ -204,6 +204,12 @@ def run_job(job_file):
         while time.monotonic()-last_ack<85:
             try:
                 request(config, '/jobs/'+job['jobNo']+'/complete', payload)
+                if job.get('windowedMode'):
+                    import shutil
+                    if job['stage']=='DOWNLOAD':
+                        media_dir=Path(config['mediaRoot'])/'pipeline'/job['subjectKey']
+                        shutil.rmtree(media_dir,ignore_errors=True)
+                    shutil.rmtree(job_file.parent,ignore_errors=True)
                 return 0
             except urllib.error.HTTPError as error:
                 if error.code in (400,401,403,409): return 2
@@ -235,6 +241,7 @@ def _execute_stage(job_file):
     import hm_public_capture as public
     job_file=Path(job_file);job=json.loads(job_file.read_text());config=runner.tenant_config(job)
     attempts=[];result={'leaseVersion':job['leaseVersion']}
+    phase=job['stage']
     try:
         if job['stage']=='CHECK':
             from hm_pipeline_discovery import check
@@ -250,10 +257,24 @@ def _execute_stage(job_file):
             directory=Path(config['mediaRoot'])/'pipeline'/job['subjectKey']
             directory.mkdir(parents=True,exist_ok=True)
             saved=directory/('download.json' if job['stage']=='DOWNLOAD' else 'media.json')
+            if job.get('manualRetry'):
+                cleanup_pipeline_media(directory,saved)
+                saved.unlink(missing_ok=True)
             video=None
             if saved.exists():
                 candidate=json.loads(saved.read_text());path=Path(candidate.get('localPath',''))
-                if path.is_file() and digest(path)==candidate.get('fileSha256'):video=candidate
+                if job.get('windowedMode') and candidate.get('reviewObjectKey'):
+                    phase='REVIEW_STORAGE'
+                    try:verify_review_receipt(candidate,job['tenant'])
+                    except Exception:
+                        cleanup_pipeline_media(directory,saved)
+                        raise
+                    video=dict(candidate,localPath=None)
+                    atomic_json(saved,video)
+                elif path.is_file() and digest(path)==candidate.get('fileSha256'):video=candidate
+            if video is None and job.get('recoveryOnly'):
+                cleanup_pipeline_media(directory,saved)
+                raise public.Failure('RECEIPT_MISSING')
             if video is None and job['stage']=='DOWNLOAD':
                 for candidate in job.get('reuseCandidates',[]):
                     try:
@@ -296,6 +317,18 @@ def _execute_stage(job_file):
                 # Persisted downloads and media receipts may predate the title
                 # limit fix; normalize them before either stage reports success.
                 video['title']=backend_title(video.get('title') or video.get('platformVideoId') or job['subjectKey'])
+                if job.get('windowedMode') and job['stage']=='DOWNLOAD':
+                    try:
+                        if not video.get('reviewObjectKey'):
+                            phase='REVIEW_STORAGE'
+                            video=store_review_original(video,job['tenant'],job['subjectKey'],saved)
+                            atomic_json(saved,video)
+                        result.update(outcome='SUCCESS',video=video)
+                    finally:
+                        # The verified bucket object is the source of truth. Failed
+                        # uploads are terminal and must not strand large files.
+                        cleanup_pipeline_media(directory,saved)
+                    video=None
                 if job['stage']=='MEDIA':
                     # Immutable canonical cache stays in pipeline/. Each ownership
                     # receives its own hard link, so review cleanup cannot destroy
@@ -316,14 +349,62 @@ def _execute_stage(job_file):
                 atomic_json(saved,video);result.update(outcome='SUCCESS',video=video)
         result['attempts']=attempts
     except Exception as error:
+        if job.get('windowedMode') and job['stage']=='DOWNLOAD':
+            cleanup_pipeline_media(directory,saved)
         code=public.classify(error)
+        if job.get('windowedMode') and error.__class__.__name__=='StorageFailure':
+            code=str(error) if str(error).replace('_','').isalnum() and len(str(error))<=80 else 'REVIEW_STORAGE_FAILED'
         result.update(outcome='RATE_LIMITED' if code=='RATE_LIMITED' else 'LOGIN_REQUIRED' if public.requires_login(code,attempts) else 'FAILED',errorCode=code,attempts=attempts)
+        if job.get('windowedMode') and job['stage']=='DOWNLOAD':
+            result['failureStage']='VALIDATION' if code=='VIDEO_TRACK_MISSING' else phase
         delay=max(1800,public.retry_after(error) or 0)
         if code=='RATE_LIMITED':result['retryAfterSeconds']=delay
         if code in public.STOP:
             cooldown=Path(os.environ['HM_SERVER_STATE_DIR'])/'public-cooldown'/(job['platform']+'.json')
             atomic_json(cooldown,{'until':time.time()+delay,'reasonCode':code})
     atomic_json(result_file(job_file),result)
+
+
+def verify_review_receipt(video, tenant):
+    import hm_review_storage as storage
+    region=tenant.upper();config=storage.configuration(region)
+    key=video['reviewObjectKey'];storage.require_review_key(region,key)
+    if video['reviewBucket']!=os.environ['CLOUDFLARE_R2_BUCKET']:
+        raise storage.StorageFailure('BUCKET_MISMATCH')
+    s3=storage.client();extra=storage.encryption(config,video['reviewKeyVersion'])
+    storage.verify(storage.head(s3,video['reviewBucket'],key,extra),video)
+
+
+def store_review_original(video, tenant, video_key, intent_path=None):
+    import hm_review_storage as storage
+    import hm_media_compat as compat
+    region=tenant.upper();config=storage.configuration(region)
+    path=Path(video['localPath']).resolve(strict=True)
+    if not any(stream.get('codec_type')=='video' for stream in compat.probe(str(path))['streams']):
+        raise storage.StorageFailure('VIDEO_TRACK_MISSING')
+    name='source'+(path.suffix.lower() if path.suffix.lower() in ('.mp4','.webm','.mkv','.mov','.m4v') else '.bin')
+    key=f"review/{region}/pipeline/{video_key}/{video['fileSha256'][:16]}/{name}"
+    storage.require_review_key(region,key)
+    bucket=os.environ['CLOUDFLARE_R2_BUCKET'];version=config['activeVersion']
+    extra=storage.encryption(config,version);s3=storage.client()
+    receipt=dict(video,reviewObjectKey=key,reviewKeyVersion=version,reviewBucket=bucket)
+    if intent_path is not None:atomic_json(intent_path,receipt)
+    existing=storage.head(s3,bucket,key,extra)
+    if existing is None:
+        from boto3.s3.transfer import TransferConfig
+        s3.upload_file(str(path),bucket,key,ExtraArgs={**extra,'ContentType':'video/mp4' if name.endswith('.mp4') else 'application/octet-stream',
+                       'Metadata':{'hm-sha256':video['fileSha256']}},Config=TransferConfig(max_concurrency=2))
+    storage.verify(storage.head(s3,bucket,key,extra),receipt)
+    receipt['localPath']=None
+    return receipt
+
+
+def cleanup_pipeline_media(directory, receipt):
+    import shutil
+    for path in directory.iterdir():
+        if path==receipt:continue
+        if path.is_dir():shutil.rmtree(path)
+        else:path.unlink(missing_ok=True)
 
 
 def digest(path):

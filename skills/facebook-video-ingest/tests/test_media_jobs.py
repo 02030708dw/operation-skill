@@ -82,6 +82,13 @@ class MediaJobsTest(unittest.TestCase):
         with mock.patch.object(media,'normalize',side_effect=[media.CompatibilityError('BROKEN'),self.normalized(None)]),mock.patch.object(jobs,'refetch',return_value=self.base/'recovered.mp4'):
             result=jobs.execute(self.job,self.args,self.pipeline,lambda:None)
         self.assertTrue(result['recovered']);self.assertEqual(self.job['fileName'],'原标题.mp4')
+    def test_windowed_conversion_failure_never_redownloads_from_platform(self):
+        self.job['windowedMode']=True
+        with mock.patch.object(media,'normalize',side_effect=media.CompatibilityError('BROKEN')),mock.patch.object(jobs,'refetch') as refetch:
+            with self.assertRaisesRegex(media.CompatibilityError,'BROKEN'):
+                jobs.execute(self.job,self.args,self.pipeline,lambda:None)
+        refetch.assert_not_called()
+        self.assertEqual(self.s3.writes,0)
     def test_changed_source_and_cross_region_are_rejected(self):
         self.job['sourceETag']='wrong'
         with self.assertRaises(jobs.JobFailure):jobs.execute(self.job,self.args,self.pipeline,lambda:None)
@@ -96,6 +103,33 @@ class MediaJobsTest(unittest.TestCase):
         with mock.patch.object(media,'normalize',side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):jobs.execute(self.job,self.args,self.pipeline,lambda:None)
         self.assertTrue(list(self.base.rglob('*.original.mp4')));self.assertEqual(self.s3.writes,0)
+
+    def test_failed_job_cleans_local_copy_only_after_bucket_source_is_verified(self):
+        cache=self.base/'TH'/'M-test';cache.mkdir(parents=True)
+        local=cache/'source.mp4';local.write_bytes(b'original')
+        self.assertTrue(jobs.cleanup_failed_cache(self.job))
+        self.assertFalse(local.exists())
+        local.write_bytes(b'original')
+        self.s3.values.pop(self.job['key'])
+        self.assertFalse(jobs.cleanup_failed_cache(self.job))
+        self.assertTrue(local.exists())
+
+    def test_interrupted_cache_sweep_checks_lease_before_cleanup(self):
+        cache=self.base/'TH'/'M-test';cache.mkdir(parents=True)
+        job=dict(self.job,workerId='worker')
+        source=cache/'source.json';source.write_text(__import__('json').dumps(job))
+        local=cache/'source.mp4';local.write_bytes(b'original')
+        old=__import__('time').time()-7200
+        os.utime(source,(old,old))
+        calls=[]
+        def status(path,body):
+            calls.append(path);return {'active':False}
+        jobs.cleanup_stale_cache(self.base,'worker',status)
+        marker=self.base/'media-cache-sweep-worker.stamp'
+        os.utime(marker,(old,old))
+        jobs.cleanup_stale_cache(self.base,'worker',status)
+        self.assertEqual(['M-test/check'],calls)
+        self.assertFalse(local.exists())
 
 class RecoveryIdentityTest(unittest.TestCase):
     def run_recovery(self, returned_id='123', duration=1):
