@@ -139,6 +139,15 @@ class PipelineTests(unittest.TestCase):
             failed=json.loads(pipeline.result_file(spec).read_text())
             self.assertEqual('FAILED',failed['outcome']);self.assertEqual('LEGACY_FILE_CHANGED',failed['errorCode'])
             self.assertTrue(source.exists())
+            source.unlink();pipeline.result_file(spec).unlink()
+            alternate=directory/'originals'/'moved.mp4';alternate.parent.mkdir()
+            alternate.write_bytes(b'legacy-source')
+            with patch.object(runner,'tenant_config',return_value={'mediaRoot':str(root)}),\
+                patch.object(pipeline,'store_review_original',return_value=receipt) as upload:
+                pipeline.execute_stage(spec)
+            self.assertEqual('SUCCESS',json.loads(pipeline.result_file(spec).read_text())['outcome'])
+            self.assertEqual(str(alternate.resolve()),upload.call_args.args[0]['localPath'])
+            self.assertTrue(alternate.exists())
 
     def test_even_three_pinned_known_items_cannot_prove_complete_coverage(self):
         rows=[{'id':str(i)} for i in range(6)]

@@ -380,16 +380,33 @@ def adopt_legacy_original(job, config):
             receipt['localPath']=None
             return receipt
     video=dict(job['download'])
-    try:
-        path=Path(video['localPath']).resolve(strict=True)
-    except (KeyError,OSError):
-        raise storage.StorageFailure('LEGACY_FILE_MISSING')
-    if not path.is_relative_to(directory) or path.stat().st_size!=video.get('fileSize') or digest(path)!=video.get('fileSha256'):
-        raise storage.StorageFailure('LEGACY_FILE_CHANGED')
+    path=legacy_source_path(video,directory)
+    video['localPath']=str(path)
     directory.mkdir(parents=True,exist_ok=True)
     receipt=store_review_original(video,job['tenant'],job['subjectKey'],receipt_path)
     atomic_json(receipt_path,receipt)
     return receipt
+
+
+def legacy_source_path(video, directory):
+    import hm_review_storage as storage
+    try:
+        original=Path(video['localPath']).resolve(strict=True)
+    except (KeyError,OSError):
+        original=None
+    if original is not None:
+        if not original.is_relative_to(directory) or original.stat().st_size!=video.get('fileSize') or digest(original)!=video.get('fileSha256'):
+            raise storage.StorageFailure('LEGACY_FILE_CHANGED')
+        return original
+    # Old media preparation sometimes moved the validated original within its
+    # private video directory. Search only this key, and accept an exact hash.
+    if directory.is_dir():
+        for candidate in directory.rglob('*'):
+            if not candidate.is_file() or candidate.stat().st_size!=video.get('fileSize'):continue
+            resolved=candidate.resolve()
+            if resolved.is_relative_to(directory) and digest(resolved)==video.get('fileSha256'):
+                return resolved
+    raise storage.StorageFailure('LEGACY_FILE_MISSING')
 
 
 def verify_review_receipt(video, tenant):
