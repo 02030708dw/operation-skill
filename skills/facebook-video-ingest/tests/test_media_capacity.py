@@ -135,6 +135,26 @@ class CapacityTest(unittest.TestCase):
             self.assertEqual(ingest.drain_parallel_compatibility(None,'backend','token','worker'),[{'ok':True}])
         self.assertGreaterEqual(len(calls),2);self.assertTrue(finished.is_set())
 
+    def test_two_conversion_lanes_run_concurrently(self):
+        import threading
+        import facebook_video_ingest as ingest
+        import hm_media_jobs as jobs
+        import hm_review_storage as storage
+        both=threading.Barrier(2);seen=[];mutex=threading.Lock()
+        def process(*args):
+            if args[-1] != 'CONVERT':return False
+            with mutex:
+                seen.append(args[-1]);first_two=len(seen)<=2
+            if first_two:both.wait(timeout=3)
+            return first_two
+        with patch.object(capacity,'limit',return_value=2), \
+                patch.object(jobs,'process_one',side_effect=process), \
+                patch.object(jobs,'restore_capacity_if_idle',return_value=False), \
+                patch.object(storage,'process_one',return_value=False), \
+                patch.object(ingest,'claim_upload',return_value=None):
+            self.assertEqual(ingest.drain_parallel_compatibility(None,'backend','token','worker'),[])
+        self.assertGreaterEqual(len(seen),2)
+
     def test_two_job_completions_keep_separate_journals(self):
         import threading
         from types import SimpleNamespace

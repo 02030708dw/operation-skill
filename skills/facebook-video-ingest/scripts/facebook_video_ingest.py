@@ -1203,26 +1203,28 @@ def drain_parallel_compatibility(args, backend, token, worker_id, task_no=""):
     import hm_review_storage
     results = []
     deadline = time.monotonic() + 30
-    next_submit = {'INSPECT': 0, 'CONVERT': 0}
+    next_submit = {}
     next_publish = 0
     futures = {}
     idle = 0
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix='media-compat') as pool:
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix='media-compat') as pool:
         while True:
             worked = False
-            for lane, future in list(futures.items()):
+            for key, future in list(futures.items()):
                 if future.done():
-                    del futures[lane]
+                    del futures[key]
                     worked = future.result() or worked  # Durable journals survive failed callbacks.
             now = time.monotonic()
-            converting = 'CONVERT' in futures
-            for lane in ('INSPECT', 'CONVERT'):
+            converting = any(key.startswith('CONVERT-') for key in futures)
+            lanes = ['INSPECT'] + [f'CONVERT-{index}' for index in range(hm_media_jobs.capacity.limit())]
+            for key in lanes:
+                lane = 'INSPECT' if key == 'INSPECT' else 'CONVERT'
                 if lane == 'CONVERT' and now >= deadline: continue
                 if lane == 'INSPECT' and now >= deadline and not converting: continue
-                if lane not in futures and now >= next_submit[lane]:
-                    futures[lane] = pool.submit(hm_media_jobs.process_one, args, backend, token,
-                                                worker_id, sys.modules[__name__], lane)
-                    next_submit[lane] = now + 1
+                if key not in futures and now >= next_submit.get(key, 0):
+                    futures[key] = pool.submit(hm_media_jobs.process_one, args, backend, token,
+                                               worker_id, sys.modules[__name__], lane)
+                    next_submit[key] = now + 1
             job = None
             if now >= next_publish:
                 worked = hm_review_storage.process_one(args, backend, token, worker_id, sys.modules[__name__]) or worked

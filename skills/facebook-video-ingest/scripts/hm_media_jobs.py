@@ -247,7 +247,7 @@ def process_one(args, backend, token, worker_id, pipeline, lane=None):
     lock_path = Path(os.environ.get('HM_MEDIA_JOB_LOCK', '/opt/data/media-compat-job.lock'))
     if lane == 'INSPECT': lock_path = Path(str(lock_path)+'.inspect')
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with capacity.slot(lock_path, max_slots=1 if lane else None) as lock:
+    with capacity.slot(lock_path, max_slots=1 if lane == 'INSPECT' else None) as lock:
         if lock is None: return False
         cleanup_stale_cache(args.state_dir, worker_id, call)
         with journal_lock(root):
@@ -274,7 +274,7 @@ def process_one(args, backend, token, worker_id, pipeline, lane=None):
                     priority_only = True
             if capacity.restore_if_drained(observed, pending_regions, registry):
                 return False
-        claim = {'priorityOnly': priority_only, 'maxConcurrentJobs': 1 if lane else capacity.limit()}
+        claim = {'priorityOnly': priority_only, 'maxConcurrentJobs': 1 if lane == 'INSPECT' else capacity.limit()}
         if lane: claim['lane'] = lane
         job = call('claim', claim)
         if not job: return False

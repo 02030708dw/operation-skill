@@ -74,6 +74,19 @@ class MediaJobsTest(unittest.TestCase):
         self.assertEqual(calls[-1],('/api/internal/capture/media-compat/M-route/convert',
                                    {'workerId':'worker','executionVersion':4}))
         self.assertFalse(list((self.base/'media-compat-jobs').glob('*.json')))
+    def test_conversion_claim_uses_configured_two_slot_limit(self):
+        calls=[]
+        def api(_backend,_token,_method,path,body,**_kwargs):
+            calls.append((path,body))
+            return None
+        pipeline=SimpleNamespace(api_call=api,BackendError=RuntimeError)
+        capacity_file=self.base/'capacity.json';capacity_file.write_text('{"limit":2}')
+        with mock.patch.dict(os.environ,{'HM_REVIEW_KEY_FILE':'configured','HM_TENANT_CONFIG':'',
+                'HM_MEDIA_JOB_LOCK':str(self.base/'jobs.lock'),'HM_MEDIA_CAPACITY_FILE':str(capacity_file)}):
+            self.assertFalse(jobs.process_one(self.args,'backend','token','worker',pipeline,'CONVERT'))
+        claim=next(body for path,body in calls if path.endswith('/claim'))
+        self.assertEqual(claim['lane'],'CONVERT')
+        self.assertEqual(claim['maxConcurrentJobs'],2)
     def test_corrupt_source_refetch_and_second_failure_never_uploads(self):
         with mock.patch.object(media,'normalize',side_effect=media.CompatibilityError('BROKEN')),mock.patch.object(jobs,'refetch',return_value=self.base/'recovered.mp4') as refetch:
             with self.assertRaises(media.CompatibilityError):jobs.execute(self.job,self.args,self.pipeline,lambda:None)
