@@ -110,6 +110,36 @@ class PipelineTests(unittest.TestCase):
             self.assertIsNone(receipt['localPath']);self.assertEqual('fixture-bucket',receipt['reviewBucket'])
             self.assertTrue(receipt['reviewObjectKey'].startswith('review/PH/pipeline/key1/'))
 
+    def test_legacy_download_is_imported_without_network_or_early_file_cleanup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);directory=root/'pipeline'/'old-key';directory.mkdir(parents=True)
+            source=directory/'original.mp4';source.write_bytes(b'legacy-source')
+            job={'jobNo':'P-adopt','leaseVersion':1,'tenant':'ph','stage':'MEDIA','platform':'Facebook',
+                'subjectKey':'old-key','legacyAdopt':True,'windowedMode':True,
+                'download':{'localPath':str(source),'fileSize':source.stat().st_size,'fileSha256':pipeline.digest(source)}}
+            spec=root/'job.json';pipeline.atomic_json(spec,job)
+            receipt=dict(job['download'],localPath=None,reviewObjectKey='review/PH/pipeline/old-key/source.mp4')
+            with patch.object(runner,'tenant_config',return_value={'mediaRoot':str(root)}),\
+                patch.object(pipeline,'store_review_original',return_value=receipt) as upload,\
+                patch('hm_public_capture.download_item',side_effect=AssertionError('must not download')):
+                pipeline.execute_stage(spec)
+            self.assertEqual('SUCCESS',json.loads(pipeline.result_file(spec).read_text())['outcome'])
+            upload.assert_called_once();self.assertTrue(source.exists())
+            pipeline.result_file(spec).unlink()
+            source.write_bytes(b'changed')
+            with patch.object(runner,'tenant_config',return_value={'mediaRoot':str(root)}),\
+                patch.object(pipeline,'verify_review_receipt',return_value=None),\
+                patch.object(pipeline,'store_review_original',side_effect=AssertionError('must not upload')):
+                pipeline.execute_stage(spec)
+            self.assertEqual('SUCCESS',json.loads(pipeline.result_file(spec).read_text())['outcome'])
+            (directory/'media.json').unlink();pipeline.result_file(spec).unlink()
+            with patch.object(runner,'tenant_config',return_value={'mediaRoot':str(root)}),\
+                patch.object(pipeline,'store_review_original',side_effect=AssertionError('must not upload')):
+                pipeline.execute_stage(spec)
+            failed=json.loads(pipeline.result_file(spec).read_text())
+            self.assertEqual('FAILED',failed['outcome']);self.assertEqual('LEGACY_FILE_CHANGED',failed['errorCode'])
+            self.assertTrue(source.exists())
+
     def test_even_three_pinned_known_items_cannot_prove_complete_coverage(self):
         rows=[{'id':str(i)} for i in range(6)]
         def check(known):

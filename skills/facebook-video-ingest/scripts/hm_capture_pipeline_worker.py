@@ -206,7 +206,7 @@ def run_job(job_file):
                 request(config, '/jobs/'+job['jobNo']+'/complete', payload)
                 if job.get('windowedMode'):
                     import shutil
-                    if job['stage']=='DOWNLOAD':
+                    if job['stage']=='DOWNLOAD' or (job.get('legacyAdopt') and payload.get('outcome')=='SUCCESS'):
                         media_dir=Path(config['mediaRoot'])/'pipeline'/job['subjectKey']
                         shutil.rmtree(media_dir,ignore_errors=True)
                     shutil.rmtree(job_file.parent,ignore_errors=True)
@@ -253,6 +253,9 @@ def _execute_stage(job_file):
                     if getattr(error,'entries',None):result['entries']=error.entries
                     raise
             result.update(public.attempt(discover,config,job['platform'],attempts,'DISCOVERY'))
+        elif job.get('legacyAdopt'):
+            phase='REVIEW_STORAGE'
+            result.update(outcome='SUCCESS',video=adopt_legacy_original(job,config))
         else:
             directory=Path(config['mediaRoot'])/'pipeline'/job['subjectKey']
             directory.mkdir(parents=True,exist_ok=True)
@@ -352,10 +355,10 @@ def _execute_stage(job_file):
         if job.get('windowedMode') and job['stage']=='DOWNLOAD':
             cleanup_pipeline_media(directory,saved)
         code=public.classify(error)
-        if job.get('windowedMode') and error.__class__.__name__=='StorageFailure':
+        if job.get('windowedMode') and (job['stage']=='DOWNLOAD' or job.get('legacyAdopt')) and error.__class__.__name__=='StorageFailure':
             code=str(error) if str(error).replace('_','').isalnum() and len(str(error))<=80 else 'REVIEW_STORAGE_FAILED'
         result.update(outcome='RATE_LIMITED' if code=='RATE_LIMITED' else 'LOGIN_REQUIRED' if public.requires_login(code,attempts) else 'FAILED',errorCode=code,attempts=attempts)
-        if job.get('windowedMode') and job['stage']=='DOWNLOAD':
+        if job.get('windowedMode') and (job['stage']=='DOWNLOAD' or job.get('legacyAdopt')):
             result['failureStage']='VALIDATION' if code=='VIDEO_TRACK_MISSING' else phase
         delay=max(1800,public.retry_after(error) or 0)
         if code=='RATE_LIMITED':result['retryAfterSeconds']=delay
@@ -363,6 +366,30 @@ def _execute_stage(job_file):
             cooldown=Path(os.environ['HM_SERVER_STATE_DIR'])/'public-cooldown'/(job['platform']+'.json')
             atomic_json(cooldown,{'until':time.time()+delay,'reasonCode':code})
     atomic_json(result_file(job_file),result)
+
+
+def adopt_legacy_original(job, config):
+    """Move a verified old download into review storage without fetching it again."""
+    import hm_review_storage as storage
+    directory=Path(config['mediaRoot']).resolve()/'pipeline'/job['subjectKey']
+    receipt_path=directory/'media.json'
+    if receipt_path.exists():
+        receipt=json.loads(receipt_path.read_text())
+        if receipt.get('reviewObjectKey'):
+            verify_review_receipt(receipt,job['tenant'])
+            receipt['localPath']=None
+            return receipt
+    video=dict(job['download'])
+    try:
+        path=Path(video['localPath']).resolve(strict=True)
+    except (KeyError,OSError):
+        raise storage.StorageFailure('LEGACY_FILE_MISSING')
+    if not path.is_relative_to(directory) or path.stat().st_size!=video.get('fileSize') or digest(path)!=video.get('fileSha256'):
+        raise storage.StorageFailure('LEGACY_FILE_CHANGED')
+    directory.mkdir(parents=True,exist_ok=True)
+    receipt=store_review_original(video,job['tenant'],job['subjectKey'],receipt_path)
+    atomic_json(receipt_path,receipt)
+    return receipt
 
 
 def verify_review_receipt(video, tenant):
