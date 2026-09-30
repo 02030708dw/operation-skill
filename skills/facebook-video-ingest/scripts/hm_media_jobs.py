@@ -288,6 +288,12 @@ def process_one(args, backend, token, worker_id, pipeline, lane=None):
         except media.ConversionRequired:
             # Release the inspection lease immediately. Its durable job retains
             # the source snapshot and is claimed by the conversion lane later.
+            # Verify and release the R2-backed prefetch while this inspection
+            # lease is still owned. The conversion lane downloads on demand.
+            # Never discard a local-only source or stop routing on HEAD failure.
+            try: cleanup_failed_cache(job)
+            except Exception as error:
+                print('media prefetch cleanup deferred:', type(error).__name__, flush=True)
             call(job['jobNo']+'/convert', {'executionVersion': job['executionVersion']})
             return True
         except Exception as exc:

@@ -57,10 +57,13 @@ class MediaJobsTest(unittest.TestCase):
         self.assertFalse(self.s3.writes)
         self.assertEqual(normalize.call_args.kwargs,{'allow_conversion':False})
     def test_inspection_releases_lease_to_conversion_lane(self):
+        cache=self.base/'TH'/'M-route';cache.mkdir(parents=True)
+        original=cache/'source.mp4';original.write_bytes(b'original')
         calls=[]
         def api(_backend,_token,_method,path,body,**_kwargs):
+            if path.endswith('/convert'):self.assertFalse(original.exists())
             calls.append((path,body))
-            if path.endswith('/claim'):return {'jobNo':'M-route','executionVersion':4}
+            if path.endswith('/claim'):return dict(self.job, jobNo='M-route', executionVersion=4)
             if path.endswith('/convert'):return {'acknowledged':True,'routed':True}
             raise AssertionError(path)
         pipeline=SimpleNamespace(api_call=api,BackendError=RuntimeError)
@@ -143,6 +146,18 @@ class MediaJobsTest(unittest.TestCase):
         local.write_bytes(b'original')
         self.s3.values.pop(self.job['key'])
         self.assertFalse(jobs.cleanup_failed_cache(self.job))
+        self.assertTrue(local.exists())
+
+    def test_local_only_source_is_never_discarded_on_handoff(self):
+        cache=self.base/'TH'/'M-test';cache.mkdir(parents=True)
+        local=cache/'local.original.mp4';local.write_bytes(b'original')
+        self.assertFalse(jobs.cleanup_failed_cache(dict(self.job,key=None)))
+        self.assertTrue(local.exists())
+
+    def test_changed_bucket_source_is_never_discarded(self):
+        cache=self.base/'TH'/'M-test';cache.mkdir(parents=True)
+        local=cache/'source.mp4';local.write_bytes(b'original')
+        self.assertFalse(jobs.cleanup_failed_cache(dict(self.job,sourceETag='changed')))
         self.assertTrue(local.exists())
 
     def test_interrupted_cache_sweep_checks_lease_before_cleanup(self):
