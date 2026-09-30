@@ -122,6 +122,15 @@ class MediaCompatibilityTest(unittest.TestCase):
         self.assertEqual(media.sha256(path),original); self.assertFalse(list(self.root.rglob('*.json')))
         self.assertFalse(list((self.root/'.hm-compatible').glob('*.mp4')))
         self.assertTrue(media.normalize(path)['converted'])
+    def test_encoder_failure_is_distinct_from_source_or_recovery_failure(self):
+        path=self.fixture();real=media.run
+        def fail_encoder(argv):
+            if 'libx264' in argv:raise media.CompatibilityError('MEDIA_COMPAT_PROCESS_FAILED')
+            return real(argv)
+        with mock.patch.object(media,'run',side_effect=fail_encoder):
+            with self.assertRaisesRegex(media.CompatibilityError,'^TRANSCODE_PROCESS_FAILED$'):
+                media.normalize(path)
+        self.assertTrue(path.exists())
     def test_tampered_cache_is_rebuilt(self):
         path=self.fixture(); result=media.normalize(path); Path(result['path']).write_bytes(b'bad')
         self.assertEqual(media.normalize(path)['sha256'],result['sha256'])

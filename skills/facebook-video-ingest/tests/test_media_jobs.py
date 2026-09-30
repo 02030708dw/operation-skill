@@ -87,6 +87,18 @@ class MediaJobsTest(unittest.TestCase):
         claim=next(body for path,body in calls if path.endswith('/claim'))
         self.assertEqual(claim['lane'],'CONVERT')
         self.assertEqual(claim['maxConcurrentJobs'],2)
+    def test_regional_conversion_claim_is_one_even_with_legacy_global_two(self):
+        calls=[]
+        def api(_backend,_token,_method,path,body,**_kwargs):
+            calls.append((path,body));return None
+        pipeline=SimpleNamespace(api_call=api,BackendError=RuntimeError)
+        capacity_file=self.base/'capacity.json';capacity_file.write_text('{"limit":2}')
+        with mock.patch.dict(os.environ,{'HM_CAPTURE_TENANT':'th','HM_REVIEW_KEY_FILE':'configured',
+                'HM_TENANT_CONFIG':'','HM_MEDIA_JOB_LOCK':str(self.base/'jobs.lock'),
+                'HM_MEDIA_CAPACITY_FILE':str(capacity_file)}):
+            self.assertFalse(jobs.process_one(self.args,'backend','token','worker',pipeline,'CONVERT'))
+        claim=next(body for path,body in calls if path.endswith('/claim'))
+        self.assertEqual(claim['maxConcurrentJobs'],1)
     def test_corrupt_source_refetch_and_second_failure_never_uploads(self):
         with mock.patch.object(media,'normalize',side_effect=media.CompatibilityError('BROKEN')),mock.patch.object(jobs,'refetch',return_value=self.base/'recovered.mp4') as refetch:
             with self.assertRaises(media.CompatibilityError):jobs.execute(self.job,self.args,self.pipeline,lambda:None)
@@ -100,6 +112,12 @@ class MediaJobsTest(unittest.TestCase):
         with mock.patch.object(media,'normalize',side_effect=media.CompatibilityError('BROKEN')),mock.patch.object(jobs,'refetch') as refetch:
             with self.assertRaisesRegex(media.CompatibilityError,'BROKEN'):
                 jobs.execute(self.job,self.args,self.pipeline,lambda:None)
+        refetch.assert_not_called()
+        self.assertEqual(self.s3.writes,0)
+    def test_transcode_failure_never_refetches_even_on_legacy_job(self):
+        with mock.patch.object(media,'normalize',side_effect=media.CompatibilityError('TRANSCODE_PROCESS_FAILED')),mock.patch.object(jobs,'refetch') as refetch:
+            with self.assertRaisesRegex(media.CompatibilityError,'TRANSCODE_PROCESS_FAILED'):
+                jobs.execute(self.job,self.args,self.pipeline,lambda:None,'CONVERT')
         refetch.assert_not_called()
         self.assertEqual(self.s3.writes,0)
     def test_changed_source_and_cross_region_are_rejected(self):

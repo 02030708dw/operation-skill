@@ -1216,7 +1216,8 @@ def drain_parallel_compatibility(args, backend, token, worker_id, task_no=""):
                     worked = future.result() or worked  # Durable journals survive failed callbacks.
             now = time.monotonic()
             converting = any(key.startswith('CONVERT-') for key in futures)
-            lanes = ['INSPECT'] + [f'CONVERT-{index}' for index in range(hm_media_jobs.capacity.limit())]
+            conversion_slots = 1 if hm_media_jobs.capacity.tenant() else hm_media_jobs.capacity.limit()
+            lanes = ['INSPECT'] + [f'CONVERT-{index}' for index in range(conversion_slots)]
             for key in lanes:
                 lane = 'INSPECT' if key == 'INSPECT' else 'CONVERT'
                 if lane == 'CONVERT' and now >= deadline: continue

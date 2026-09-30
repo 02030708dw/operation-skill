@@ -22,6 +22,7 @@ def journal_lock(root):
 
 
 def restore_capacity_if_idle(pipeline):
+    if capacity.tenant(): return False
     observed = capacity.configuration()
     registry_path = os.environ.get('HM_TENANT_CONFIG')
     if observed['limit'] != 2 or not registry_path: return False
@@ -150,8 +151,8 @@ def execute(job, args, pipeline, guard, lane=None):
         normalized = normalize(source)
     except media.ConversionRequired:
         raise
-    except media.CompatibilityError:
-        if job.get('windowedMode'):
+    except media.CompatibilityError as exc:
+        if job.get('windowedMode') or str(exc).startswith('TRANSCODE_'):
             # The review object remains the source for both passes. A media
             # failure must not silently fetch the platform video again.
             raise
@@ -243,11 +244,12 @@ def process_one(args, backend, token, worker_id, pipeline, lane=None):
         elif saved['receipt'].get('status') == 'FAILED' and saved.get('job'):
             try:cleanup_failed_cache(saved['job'])
             except Exception as error:print('media temporary cleanup deferred:',type(error).__name__,flush=True)
-    # Both job admission and actual encoders obey the same global capacity.
+    # Both job admission and actual encoders use this region's capacity.
     lock_path = Path(os.environ.get('HM_MEDIA_JOB_LOCK', '/opt/data/media-compat-job.lock'))
     if lane == 'INSPECT': lock_path = Path(str(lock_path)+'.inspect')
+    lock_path = capacity.regional_path(lock_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with capacity.slot(lock_path, max_slots=1 if lane == 'INSPECT' else None) as lock:
+    with capacity.slot(lock_path, max_slots=1 if lane == 'INSPECT' or capacity.tenant() else None) as lock:
         if lock is None: return False
         cleanup_stale_cache(args.state_dir, worker_id, call)
         with journal_lock(root):
@@ -259,7 +261,7 @@ def process_one(args, backend, token, worker_id, pipeline, lane=None):
         observed = capacity.configuration()
         pending_regions = {}
         registry_path = os.environ.get('HM_TENANT_CONFIG')
-        if registry_path:
+        if registry_path and not capacity.tenant():
             registry = json.loads(Path(registry_path).read_text())
             for region, other in registry.items():
                 if other.get('workerId') == worker_id and observed['limit'] == 1: continue
@@ -274,7 +276,7 @@ def process_one(args, backend, token, worker_id, pipeline, lane=None):
                     priority_only = True
             if capacity.restore_if_drained(observed, pending_regions, registry):
                 return False
-        claim = {'priorityOnly': priority_only, 'maxConcurrentJobs': 1 if lane == 'INSPECT' else capacity.limit()}
+        claim = {'priorityOnly': priority_only, 'maxConcurrentJobs': 1 if lane == 'INSPECT' or capacity.tenant() else capacity.limit()}
         if lane: claim['lane'] = lane
         job = call('claim', claim)
         if not job: return False

@@ -171,14 +171,20 @@ def _normalize(source, *, allow_conversion=True):
                 # Inspection and verification of other videos can continue.
                 import hm_media_capacity
                 with hm_media_capacity.encoder_slot():
-                    run([os.environ.get('FFMPEG', 'ffmpeg'), '-nostdin', '-v', 'error', '-xerror', '-y',
-                         '-threads', '2', '-i', str(source), '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn',
-                         *video_args, '-tag:v', 'avc1', *audio_args,
-                         '-movflags', '+faststart', str(temporary)])
-                info = probe(temporary)
-                if not compatible(temporary, info): raise CompatibilityError('MEDIA_COMPAT_OUTPUT_UNSUPPORTED')
-                validate(original, info)
-                decode(temporary)
+                    try:
+                        run([os.environ.get('FFMPEG', 'ffmpeg'), '-nostdin', '-v', 'error', '-xerror', '-y',
+                             '-threads', '2', '-i', str(source), '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn',
+                             *video_args, '-tag:v', 'avc1', *audio_args,
+                             '-movflags', '+faststart', str(temporary)])
+                    except CompatibilityError as exc:
+                        raise CompatibilityError('TRANSCODE_PROCESS_FAILED') from exc
+                try:
+                    info = probe(temporary)
+                    if not compatible(temporary, info): raise CompatibilityError('MEDIA_COMPAT_OUTPUT_UNSUPPORTED')
+                    validate(original, info)
+                    decode(temporary)
+                except CompatibilityError as exc:
+                    raise CompatibilityError('TRANSCODE_'+str(exc).removeprefix('MEDIA_COMPAT_')) from exc
                 if sha256(source) != source_hash: raise CompatibilityError('MEDIA_COMPAT_SOURCE_CHANGED')
                 result = dict(path=str(output), sha256=sha256(temporary), fileSize=temporary.stat().st_size,
                               durationSeconds=float(info['format']['duration']), converted=True,

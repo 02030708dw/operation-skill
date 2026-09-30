@@ -22,6 +22,24 @@ def occupy(payload):
             with mutex: counts['active'] -= 1
 
 
+def occupy_regional(payload):
+    root, region, counts, mutex = payload
+    with patch.dict(os.environ, {'HM_CAPTURE_TENANT':region,
+            'HM_MEDIA_CAPACITY_FILE':str(Path(root)/'capacity.json'),
+            'HM_MEDIA_ENCODER_LOCK':str(Path(root)/'encoder.lock')}):
+        with capacity.encoder_slot():
+            with mutex:
+                counts['active'] += 1
+                counts['peak'] = max(counts['peak'], counts['active'])
+                key = 'active_'+region
+                counts[key] += 1
+                counts['peak_'+region] = max(counts['peak_'+region], counts[key])
+            time.sleep(.08)
+            with mutex:
+                counts['active'] -= 1
+                counts[key] -= 1
+
+
 class CapacityTest(unittest.TestCase):
     def test_parallel_media_requests_serialize_database_calls(self):
         import threading
@@ -84,6 +102,21 @@ class CapacityTest(unittest.TestCase):
                 path.write_text('{"limit":1}')
                 with capacity.slot(lock) as new:self.assertIsNone(new)
             with capacity.slot(lock) as first:self.assertIsNotNone(first)
+
+    def test_each_region_has_one_independent_encoder_slot(self):
+        import multiprocessing
+        context=multiprocessing.get_context('fork')
+        with tempfile.TemporaryDirectory() as temp, context.Manager() as manager:
+            Path(temp,'capacity.json').write_text('{"limit":2}')
+            regions=('ph','th','vn','id')
+            counts=manager.dict({'active':0,'peak':0,**{'active_'+r:0 for r in regions},
+                                 **{'peak_'+r:0 for r in regions}})
+            mutex=manager.Lock()
+            with ProcessPoolExecutor(max_workers=8,mp_context=context) as pool:
+                list(pool.map(occupy_regional,[(temp,regions[i%4],counts,mutex) for i in range(40)]))
+            self.assertGreaterEqual(counts['peak'],3)
+            self.assertLessEqual(counts['peak'],4)
+            for region in regions:self.assertEqual(counts['peak_'+region],1)
 
     def test_restore_requires_all_regions_empty_and_same_activation(self):
         with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ,{'HM_MEDIA_CAPACITY_FILE':temp+'/capacity.json'}):

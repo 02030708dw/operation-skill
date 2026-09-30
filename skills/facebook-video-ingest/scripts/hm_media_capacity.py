@@ -26,6 +26,18 @@ def limit():
     return configuration()['limit']
 
 
+def tenant():
+    value = os.environ.get('HM_CAPTURE_TENANT', '').lower()
+    if value and value not in ('ph', 'th', 'vn', 'id'):
+        raise ValueError('Invalid media tenant')
+    return value or None
+
+
+def regional_path(path):
+    region = tenant()
+    return Path(str(path) + '.' + region) if region else Path(path)
+
+
 def restore_if_drained(observed, pending, expected_regions):
     if (observed.get('limit') != 2 or not observed.get('untilBacklogCleared')
             or not observed.get('runId') or set(pending) != set(expected_regions) or not pending
@@ -80,4 +92,5 @@ def slot(path, *, blocking=False, max_slots=None):
 
 
 def encoder_slot():
-    return slot(os.environ.get('HM_MEDIA_ENCODER_LOCK', '/tmp/hm-media-encoder.lock'), blocking=True)
+    path = regional_path(os.environ.get('HM_MEDIA_ENCODER_LOCK', '/tmp/hm-media-encoder.lock'))
+    return slot(path, blocking=True, max_slots=1 if tenant() else None)
