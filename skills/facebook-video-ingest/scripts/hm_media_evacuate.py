@@ -72,7 +72,10 @@ def main():
     args=p.parse_args()
     if args.limit<=0:raise ValueError('limit must be positive')
     config=runner.tenant_config({'tenant':args.region});region=args.region.upper()
-    def call(action,body):return runner.api_call(config['backendUrl'],config['workerToken'],'POST','/api/internal/capture/local-media/'+action,dict(body,workerId=config['workerId']))
+    os.environ.update(HM_BACKEND_URL=config['backendUrl'],HM_WORKER_TOKEN=config['workerToken'],
+                      HM_WORKER_ID=config['workerId'],HM_R2_KEY_PREFIX=config['r2Prefix'],
+                      HM_REVIEW_KEY_FILE=config['reviewKeyFile'])
+    def call(action,body):return runner.api('/api/internal/capture/local-media/'+action,dict(body,workerId=config['workerId']))
     with maintenance(args.apply):evacuate(args,region,call)
 
 def evacuate(args,region,call,roots=None):

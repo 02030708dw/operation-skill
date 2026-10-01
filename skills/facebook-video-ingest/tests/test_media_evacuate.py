@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import json
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
 import hm_media_evacuate as evacuation
@@ -23,6 +24,19 @@ class S3:
     def get_object(self,**kw):return {'Body':Body(self.data)}
 
 class EvacuationTests(unittest.TestCase):
+    def test_command_uses_real_worker_http_api_and_regional_storage_configuration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            key=Path(tmp)/'key.json';key.write_text(json.dumps({'region':'PH','publicReadDenied':True,'activeVersion':'v1'}));key.chmod(0o600)
+            config=dict(backendUrl='https://backend.test',workerToken='private-test-token',workerId='hm-server-ph',r2Prefix='PH',reviewKeyFile=str(key))
+            def evaluate(args,region,call):
+                self.assertEqual(evacuation.storage.configuration(region)['activeVersion'],'v1')
+                self.assertEqual(call('inventory',{}),{'running':0})
+            response=contextlib.nullcontext(io.BytesIO(b'{"data":{"running":0}}'))
+            with patch.dict(os.environ,{},clear=False),patch.object(sys,'argv',['evacuate','--region','ph']),patch.object(evacuation.runner,'tenant_config',return_value=config),patch.object(evacuation,'evacuate',side_effect=evaluate),patch.object(evacuation.runner.urllib.request,'urlopen',return_value=response) as request:
+                evacuation.main()
+                req=request.call_args.args[0]
+                self.assertEqual(req.full_url,'https://backend.test/api/internal/capture/local-media/inventory')
+                self.assertEqual(json.loads(req.data),{'workerId':'hm-server-ph'})
     def fixture(self):
         tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup)
         path=Path(tmp.name)/'original.mp4';path.write_bytes(b'only reliable source');s3=S3()
