@@ -86,6 +86,12 @@ def wrapped_failure(code,error):
 
 
 def classify(error):
+    import hm_media_workspace
+    failure=hm_media_workspace.storage_failure(error)
+    if failure:return str(failure)
+    if error.__class__.__module__=='hm_media_workspace':return str(error)
+    if 'MEDIA_EXCEEDS_WORKSPACE_LIMIT' in str(error):return 'MEDIA_EXCEEDS_WORKSPACE_LIMIT'
+    if 'MEDIA_WORKSPACE_BUSY' in str(error):return 'MEDIA_WORKSPACE_BUSY'
     if isinstance(error,Failure): return error.code
     if error.__class__.__module__ == 'hm_tiktok_download': return error.code
     text=str(error).lower()
@@ -264,10 +270,13 @@ def download_item(platform,item,output,credentials):
         ffmpeg_location=resolve_ffmpeg(output),merge_output_format='mp4',
         format='bv*[height<=1920][vcodec^=avc1]+ba[acodec^=mp4a]/b[height<=1920][ext=mp4]/bv*[height<=1920]+ba/b[height<=1920]',
         windowsfilenames=True,outtmpl=str(output/'%(id)s.%(ext)s'))
+    import hm_media_workspace as workspace
+    if os.getenv('HM_JOB_MEDIA_ROOT'):options['progress_hooks']=[workspace.download_progress]
     with yt_dlp.YoutubeDL(options) as ydl:
         ydl.add_post_processor(CaptureFile(ydl),when='after_move')
         info=ydl.extract_info(item['url'],download=False)
         if (info.get('duration') or 0)>1200:return dict(item,status='filtered-duration')
+        workspace.reserve_input(info.get('filesize') or info.get('filesize_approx') or sum(f.get('filesize') or f.get('filesize_approx') or 0 for f in info.get('requested_formats',[])))
         ydl.process_ie_result(info,download=True)
     if not captured:raise Failure('DOWNLOAD_FAILED')
     return dict(captured[-1],status='downloaded')

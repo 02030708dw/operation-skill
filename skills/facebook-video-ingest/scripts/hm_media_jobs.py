@@ -63,6 +63,15 @@ def download(s3, bucket, key, etag, extra, target, guard):
         temporary.unlink(missing_ok=True)
 
 
+def remote_sha256(s3,bucket,key,etag,extra,guard):
+    response=s3.get_object(Bucket=bucket,Key=key,IfMatch=etag,**extra)
+    digest=hashlib.sha256()
+    try:
+        for chunk in response['Body'].iter_chunks(chunk_size=1024*1024):
+            guard(); digest.update(chunk)
+    finally:response['Body'].close()
+    return digest.hexdigest()
+
 def refetch(job, base, source, guard):
     """Use the existing authorized account lease; never ingest or change metadata."""
     import hm_public_capture as capture
@@ -94,6 +103,9 @@ def refetch(job, base, source, guard):
             config, platform, attempts, 'DOWNLOAD')
     except Exception as error:
         code = capture.classify(error)
+        if code in ('MEDIA_WORKSPACE_BUSY','MEDIA_EXCEEDS_WORKSPACE_LIMIT'):
+            import hm_media_workspace
+            raise hm_media_workspace.WorkspaceFailure(code,code=='MEDIA_WORKSPACE_BUSY') from None
         raise JobFailure('RECOVERY_'+code, code in ('NETWORK_ERROR','ACCOUNT_BUSY')) from None
     storage.write_journal(base/'recovery-attempts.json', {'attempts': attempts})
     guard()
@@ -119,9 +131,9 @@ def execute(job, args, pipeline, guard, lane=None):
     no = job['jobNo']
     if not no.startswith('M-') or not no[2:].isalnum():
         raise JobFailure('INVALID_JOB_ID')
-    base = Path(os.environ.get('HM_MEDIA_BACKUP_ROOT', '/opt/data/media-compat-backups'))/region/no
+    base = Path(os.environ.get('HM_JOB_MEDIA_ROOT') or (Path(os.environ.get('HM_MEDIA_BACKUP_ROOT', '/opt/data/media-compat-backups'))/region/no))
     base.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if shutil.disk_usage(base).free < max(10*1024**3, int(job['fileSize'])*4):
+    if not os.getenv('HM_JOB_MEDIA_ROOT') and shutil.disk_usage(base).free < max(10*1024**3, int(job['fileSize'])*4):
         raise JobFailure('MEDIA_CACHE_SPACE_LOW', True)
     storage.write_journal(base/'source.json', job)
     s3 = storage.client()
@@ -133,6 +145,8 @@ def execute(job, args, pipeline, guard, lane=None):
         before = s3.head_object(Bucket=bucket, Key=source_key, **source_extra)
         if before['ETag'] != source_etag:
             raise JobFailure('SOURCE_CHANGED')
+        import hm_media_workspace
+        hm_media_workspace.verified()
         source = base/(hashlib.sha256((source_key+source_etag).encode()).hexdigest()+'.original.mp4')
         if not source.exists():
             download(s3, bucket, source_key, source_etag, source_extra, source, guard)
@@ -178,11 +192,8 @@ def execute(job, args, pipeline, guard, lane=None):
         raise JobFailure('TARGET_HASH_MISMATCH')
     # Verify persisted bytes, not just user-supplied object metadata.
     if target != source_key:
-        verify_file = base/'verified.mp4'
-        download(s3, bucket, target, after['ETag'], target_extra, verify_file, guard)
-        if media.sha256(verify_file) != normalized['sha256']:
+        if remote_sha256(s3,bucket,target,after['ETag'],target_extra,guard) != normalized['sha256']:
             raise JobFailure('TARGET_HASH_MISMATCH')
-        verify_file.unlink()
     if source_key and s3.head_object(Bucket=bucket, Key=source_key, **source_extra)['ETag'] != source_etag:
         raise JobFailure('SOURCE_CHANGED')
     if not source_key:
@@ -206,17 +217,16 @@ def execute(job, args, pipeline, guard, lane=None):
     backup = s3.head_object(Bucket=bucket, Key=backup_key, **backup_extra)
     if backup['ContentLength'] != source.stat().st_size or backup.get('Metadata', {}).get('hm-sha256') != original_sha:
         raise JobFailure('BACKUP_VERIFY_FAILED')
-    verified_backup = base/'backup-verified.mp4'
-    download(s3, bucket, backup_key, backup['ETag'], backup_extra, verified_backup, guard)
-    if media.sha256(verified_backup) != original_sha:
+    if remote_sha256(s3,bucket,backup_key,backup['ETag'],backup_extra,guard) != original_sha:
         raise JobFailure('BACKUP_VERIFY_FAILED')
-    verified_backup.unlink()
     result = dict(normalized, targetKey=target, targetETag=after['ETag'], keyVersion=version,
         sourceETag=source_etag, backupPath=str(source), backupKey=backup_key,
         backupKeyVersion=backup_version, backupETag=backup['ETag'], sourceSha256=original_sha,
         ruleVersion=media.VERSION, decoded=True,
         recovered=recovered, converted=changed)
     storage.write_journal(base/'verified.json', result)
+    import hm_media_workspace
+    hm_media_workspace.verified()
     return result
 
 
@@ -282,10 +292,12 @@ def process_one(args, backend, token, worker_id, pipeline, lane=None):
         if not job: return False
         receipt = {'executionVersion': job['executionVersion'], 'status': 'SUCCEEDED'}
         try:
-            with storage.lease(lambda: call(job['jobNo']+'/check', {'executionVersion': job['executionVersion']})) as guard:
+            import hm_media_workspace as workspace
+            required=int(job['fileSize'])*(1 if lane=='INSPECT' else 3)+64*1024**2
+            with workspace.job(job['region'],job['jobNo'],required), storage.lease(lambda: call(job['jobNo']+'/check', {'executionVersion': job['executionVersion']})) as guard:
                 receipt.update(execute(job, args, pipeline, guard, lane))
                 guard()
-        except media.ConversionRequired:
+        except media.ConversionRequired as error:
             # Release the inspection lease immediately. Its durable job retains
             # the source snapshot and is claimed by the conversion lane later.
             # Verify and release the R2-backed prefetch while this inspection
@@ -294,11 +306,14 @@ def process_one(args, backend, token, worker_id, pipeline, lane=None):
             try: cleanup_failed_cache(job)
             except Exception as error:
                 print('media prefetch cleanup deferred:', type(error).__name__, flush=True)
-            call(job['jobNo']+'/convert', {'executionVersion': job['executionVersion']})
+            conversion={'executionVersion':job['executionVersion']}
+            if getattr(error,'source_inspection',None):conversion['sourceInspection']=error.source_inspection
+            call(job['jobNo']+'/convert',conversion)
             return True
         except Exception as exc:
-            code = str(exc) if isinstance(exc, (JobFailure, media.CompatibilityError, storage.StorageFailure)) else 'MEDIA_COMPAT_IO_FAILED'
-            retryable = getattr(exc, 'retryable', not isinstance(exc, (JobFailure, media.CompatibilityError)))
+            failure=workspace.storage_failure(exc) or exc
+            code = str(failure) if isinstance(failure, (JobFailure, media.CompatibilityError, storage.StorageFailure, workspace.WorkspaceFailure)) else 'MEDIA_COMPAT_IO_FAILED'
+            retryable = getattr(failure, 'retryable', not isinstance(failure, (JobFailure, media.CompatibilityError)))
             receipt.update(status='FAILED', errorCode=code, retryable=retryable)
         path = root/(job['jobNo']+'-a'+str(job['executionVersion'])+'.json')
         with journal_lock(root):

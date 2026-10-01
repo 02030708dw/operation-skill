@@ -41,6 +41,10 @@ def discover(url, limit):
 def download(item, output):
     engine = provider()
     current = source(item['url'])
+    if os.getenv('HM_JOB_MEDIA_ROOT'):
+        import hm_media_workspace as workspace
+        original_options=engine.options
+        engine.options=lambda:dict(original_options(),progress_hooks=[workspace.download_progress])
     reason = downloader.unsupported(current)
     if reason: return dict(item, status='unsupported', errorCode=reason)
     raw = output / 'originals'
@@ -49,6 +53,7 @@ def download(item, output):
     archive = json.loads(archive_file.read_text()) if archive_file.exists() else {}
     if current['id'] not in archive and not (raw / '.pending' / (current['id']+'.json')).exists():
         info = engine.inspect(current)
+        if os.getenv('HM_JOB_MEDIA_ROOT'):workspace.reserve_input(info.get('filesize') or info.get('filesize_approx'))
         reason = downloader.unsupported(current, info)
         if reason: return dict(item, status='unsupported', errorCode=reason)
         if (info.get('duration') or 0) > 1200:

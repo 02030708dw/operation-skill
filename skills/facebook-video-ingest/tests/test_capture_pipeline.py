@@ -105,7 +105,7 @@ class PipelineTests(unittest.TestCase):
                 patch.object(storage,'client',return_value=Bucket()),\
                 patch.object(storage,'encryption',return_value={}),\
                 patch.object(storage,'head',side_effect=[None,{'ContentLength':path.stat().st_size,'Metadata':{'hm-sha256':video['fileSha256']}}]),\
-                patch('hm_media_compat.probe',return_value={'streams':[{'codec_type':'video'}]}):
+                patch('hm_media_compat.probe',return_value={'streams':[{'codec_type':'video','codec_name':'h264','codec_tag_string':'avc1','width':16,'height':16,'pix_fmt':'yuv420p','profile':'Main','level':42,'avg_frame_rate':'30/1'}],'format':{'format_name':'mp4','duration':'1'}}):
                 receipt=pipeline.store_review_original(video,'ph','key1')
             self.assertIsNone(receipt['localPath']);self.assertEqual('fixture-bucket',receipt['reviewBucket'])
             self.assertTrue(receipt['reviewObjectKey'].startswith('review/PH/pipeline/key1/'))

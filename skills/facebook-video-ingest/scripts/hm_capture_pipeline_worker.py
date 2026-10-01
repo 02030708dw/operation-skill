@@ -2,6 +2,7 @@
 """One shared fair dispatcher, fenced region-local jobs and restart-safe stage receipts."""
 from __future__ import annotations
 import collections
+import contextlib
 import hashlib
 import json
 import os
@@ -135,7 +136,7 @@ def supervise():
                         if stage!='MEDIA' and cooldown.exists() and json.loads(cooldown.read_text()).get('until',0)>time.time(): continue
                         if stage=='DOWNLOAD':
                             import shutil
-                            if shutil.disk_usage(config['mediaRoot']).free < int(os.getenv('HM_MIN_FREE_DISK_BYTES',str(20*1024**3))): continue
+                            if not os.getenv('HM_EPHEMERAL_MEDIA_ROOT') and shutil.disk_usage(config['mediaRoot']).free < int(os.getenv('HM_MIN_FREE_DISK_BYTES',str(20*1024**3))): continue
                         try: job = request(config, f'/{stage}/claim', {'platform':platform,
                             'allowHistory':not any(s and s['enabled'] and s.get('realtimeWaiting',0)>0 for s in states.values())})
                         except (OSError, ValueError): continue
@@ -228,18 +229,28 @@ def execute_stage(job_file):
     # bytes). Job/lease directories are too deep. Keep durable receipts/media
     # there, but give each stage a private short-lived, short browser temp root.
     previous = os.environ.get('TMPDIR')
-    with tempfile.TemporaryDirectory(prefix='hm-pipe-', dir='/tmp') as temporary:
-        os.environ['TMPDIR'] = temporary
-        try:
-            _execute_stage(job_file)
-        finally:
-            if previous is None: os.environ.pop('TMPDIR', None)
-            else: os.environ['TMPDIR'] = previous
+    import hm_media_workspace as workspace
+    enabled=bool(os.getenv('HM_EPHEMERAL_MEDIA_ROOT'))
+    job_data=json.loads(Path(job_file).read_text()) if enabled else {}
+    required=64*1024**2 if job_data.get('stage')=='CHECK' else max(512*1024**2,int(job_data.get('download',{}).get('fileSize',0))*3+64*1024**2)
+    admission=workspace.job(job_data['tenant'],job_data['jobNo'],required) if enabled else contextlib.nullcontext()
+    try:
+        with admission, tempfile.TemporaryDirectory(prefix='hp-', dir=workspace.temporary_root()) as temporary:
+            os.environ['TMPDIR'] = temporary
+            try:
+                _execute_stage(job_file)
+            finally:
+                if previous is None: os.environ.pop('TMPDIR', None)
+                else: os.environ['TMPDIR'] = previous
+    except workspace.WorkspaceFailure as error:
+        atomic_json(result_file(Path(job_file)),dict(leaseVersion=job_data['leaseVersion'],outcome='RESOURCE_WAIT' if error.retryable else 'FAILED',errorCode=str(error),failureStage='MEDIA_WORKSPACE'))
+
 
 
 def _execute_stage(job_file):
     import hm_public_capture as public
-    job_file=Path(job_file);job=json.loads(job_file.read_text());config=runner.tenant_config(job)
+    job_file=Path(job_file);job=json.loads(job_file.read_text());config=dict(runner.tenant_config(job));config['legacyMediaRoot']=config.get('mediaRoot')
+    if os.getenv('HM_JOB_MEDIA_ROOT'):config['mediaRoot']=os.environ['HM_JOB_MEDIA_ROOT']
     attempts=[];result={'leaseVersion':job['leaseVersion']}
     phase=job['stage']
     try:
@@ -260,20 +271,23 @@ def _execute_stage(job_file):
             directory=Path(config['mediaRoot'])/'pipeline'/job['subjectKey']
             directory.mkdir(parents=True,exist_ok=True)
             saved=directory/('download.json' if job['stage']=='DOWNLOAD' else 'media.json')
-            if job.get('manualRetry'):
+            if job.get('manualRetry') and not os.getenv('HM_JOB_MEDIA_ROOT'):
                 cleanup_pipeline_media(directory,saved)
                 saved.unlink(missing_ok=True)
             video=None
             if saved.exists():
-                candidate=json.loads(saved.read_text());path=Path(candidate.get('localPath',''))
+                candidate=json.loads(saved.read_text());path=Path(candidate.get('localPath') or '')
                 if job.get('windowedMode') and candidate.get('reviewObjectKey'):
                     phase='REVIEW_STORAGE'
                     try:verify_review_receipt(candidate,job['tenant'])
                     except Exception:
-                        cleanup_pipeline_media(directory,saved)
-                        raise
-                    video=dict(candidate,localPath=None)
-                    atomic_json(saved,video)
+                        if path.is_file() and digest(path)==candidate.get('fileSha256'):video=candidate
+                        else:raise
+                    else:
+                        video=dict(candidate,localPath=None)
+                        import hm_media_workspace
+                        hm_media_workspace.verified()
+                        atomic_json(saved,video)
                 elif path.is_file() and digest(path)==candidate.get('fileSha256'):video=candidate
             if video is None and job.get('recoveryOnly'):
                 cleanup_pipeline_media(directory,saved)
@@ -330,7 +344,7 @@ def _execute_stage(job_file):
                     finally:
                         # The verified bucket object is the source of truth. Failed
                         # uploads are terminal and must not strand large files.
-                        cleanup_pipeline_media(directory,saved)
+                        if video.get('localPath') is None:cleanup_pipeline_media(directory,saved)
                     video=None
                 if job['stage']=='MEDIA':
                     # Immutable canonical cache stays in pipeline/. Each ownership
@@ -352,12 +366,12 @@ def _execute_stage(job_file):
                 atomic_json(saved,video);result.update(outcome='SUCCESS',video=video)
         result['attempts']=attempts
     except Exception as error:
-        if job.get('windowedMode') and job['stage']=='DOWNLOAD':
+        if job.get('windowedMode') and job['stage']=='DOWNLOAD' and not os.getenv('HM_JOB_MEDIA_ROOT'):
             cleanup_pipeline_media(directory,saved)
         code=public.classify(error)
         if job.get('windowedMode') and (job['stage']=='DOWNLOAD' or job.get('legacyAdopt')) and error.__class__.__name__=='StorageFailure':
             code=str(error) if str(error).replace('_','').isalnum() and len(str(error))<=80 else 'REVIEW_STORAGE_FAILED'
-        result.update(outcome='RATE_LIMITED' if code=='RATE_LIMITED' else 'LOGIN_REQUIRED' if public.requires_login(code,attempts) else 'FAILED',errorCode=code,attempts=attempts)
+        result.update(outcome='RESOURCE_WAIT' if code=='MEDIA_WORKSPACE_BUSY' else 'RATE_LIMITED' if code=='RATE_LIMITED' else 'LOGIN_REQUIRED' if public.requires_login(code,attempts) else 'FAILED',errorCode=code,attempts=attempts)
         if job.get('windowedMode') and (job['stage']=='DOWNLOAD' or job.get('legacyAdopt')):
             result['failureStage']='VALIDATION' if code=='VIDEO_TRACK_MISSING' else phase
         delay=max(1800,public.retry_after(error) or 0)
@@ -371,7 +385,7 @@ def _execute_stage(job_file):
 def adopt_legacy_original(job, config):
     """Move a verified old download into review storage without fetching it again."""
     import hm_review_storage as storage
-    directory=Path(config['mediaRoot']).resolve()/'pipeline'/job['subjectKey']
+    directory=Path(config.get('legacyMediaRoot',config['mediaRoot'])).resolve()/'pipeline'/job['subjectKey']
     receipt_path=directory/'media.json'
     if receipt_path.exists():
         receipt=json.loads(receipt_path.read_text())
@@ -383,7 +397,7 @@ def adopt_legacy_original(job, config):
     path=legacy_source_path(video,directory)
     video['localPath']=str(path)
     directory.mkdir(parents=True,exist_ok=True)
-    receipt=store_review_original(video,job['tenant'],job['subjectKey'],receipt_path)
+    receipt=store_review_original(video,job['tenant'],job['subjectKey'],receipt_path,protect=False)
     atomic_json(receipt_path,receipt)
     return receipt
 
@@ -419,13 +433,17 @@ def verify_review_receipt(video, tenant):
     storage.verify(storage.head(s3,video['reviewBucket'],key,extra),video)
 
 
-def store_review_original(video, tenant, video_key, intent_path=None):
+def store_review_original(video, tenant, video_key, intent_path=None, protect=True):
     import hm_review_storage as storage
     import hm_media_compat as compat
     region=tenant.upper();config=storage.configuration(region)
     path=Path(video['localPath']).resolve(strict=True)
-    if not any(stream.get('codec_type')=='video' for stream in compat.probe(str(path))['streams']):
+    info=compat.probe(str(path))
+    if not any(stream.get('codec_type')=='video' for stream in info['streams']):
         raise storage.StorageFailure('VIDEO_TRACK_MISSING')
+    video['sourceInspection']=compat.inspect_source(path,info,source_sha=video['fileSha256'])
+    import hm_media_workspace
+    hm_media_workspace.protect_source(path,video['fileSha256']) if protect else None
     name='source'+(path.suffix.lower() if path.suffix.lower() in ('.mp4','.webm','.mkv','.mov','.m4v') else '.bin')
     key=f"review/{region}/pipeline/{video_key}/{video['fileSha256'][:16]}/{name}"
     storage.require_review_key(region,key)
@@ -440,6 +458,8 @@ def store_review_original(video, tenant, video_key, intent_path=None):
                        'Metadata':{'hm-sha256':video['fileSha256']}},Config=TransferConfig(max_concurrency=2))
     storage.verify(storage.head(s3,bucket,key,extra),receipt)
     receipt['localPath']=None
+    import hm_media_workspace
+    hm_media_workspace.verified()
     return receipt
 
 

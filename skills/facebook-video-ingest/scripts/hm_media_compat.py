@@ -33,6 +33,9 @@ def run(argv):
     try:
         return subprocess.run(argv, check=True, capture_output=True, timeout=7200).stdout
     except (OSError, subprocess.SubprocessError) as exc:
+        import hm_media_workspace
+        full=hm_media_workspace.storage_failure(exc)
+        if full:raise full from None
         # Do not leak input URLs, paths or ffmpeg stderr into public worker messages.
         raise CompatibilityError('MEDIA_COMPAT_PROCESS_FAILED') from exc
 
@@ -122,6 +125,15 @@ def validate(source, target):
         raise CompatibilityError('MEDIA_COMPAT_AV_SYNC_MISMATCH')
 
 
+def inspect_source(source, info=None, source_sha=None):
+    """Format decision only: preserve original evidence before any replacement."""
+    source=Path(source); info=info or probe(source)
+    reencode=not compatible_video(info) or not compatible_audio(info)
+    remux=not compatible(source,info) and not reencode
+    return dict(sourceSha256=source_sha or sha256(source),ruleVersion=VERSION,
+                needsReencode=reencode,needsRemux=remux,
+                reason='REENCODE_REQUIRED' if reencode else 'REMUX_REQUIRED' if remux else 'DIRECT_UPLOAD')
+
 def normalize(source, *, allow_conversion=True):
     return _normalize(source, allow_conversion=allow_conversion)
 
@@ -141,13 +153,16 @@ def _normalize(source, *, allow_conversion=True):
             if candidate.is_file() and sha256(candidate) == saved['sha256']:
                 return saved
         original = probe(source)
+        source_inspection = inspect_source(source,original,source_hash)
         if compatible(source, original):
             decode(source)
             result = dict(path=str(source), sha256=source_hash, fileSize=source.stat().st_size,
                           durationSeconds=float(original['format']['duration']), converted=False)
         else:
             if not allow_conversion:
-                raise ConversionRequired('MEDIA_COMPAT_CONVERSION_REQUIRED')
+                error=ConversionRequired('MEDIA_COMPAT_CONVERSION_REQUIRED')
+                error.source_inspection=inspect_source(source,original,source_hash)
+                raise error
             fd, name = tempfile.mkstemp(prefix=key + '-', suffix='.mp4', dir=cache)
             os.close(fd)
             temporary = Path(name)
@@ -193,10 +208,11 @@ def _normalize(source, *, allow_conversion=True):
             finally:
                 temporary.unlink(missing_ok=True)
         if sha256(source) != source_hash: raise CompatibilityError('MEDIA_COMPAT_SOURCE_CHANGED')
-        result.update(sourcePath=str(source), sourceSha256=source_hash, version=VERSION)
+        result.update(sourcePath=str(source), sourceSha256=source_hash, version=VERSION, sourceInspection=source_inspection)
         temp_receipt = receipt.with_suffix('.tmp')
         temp_receipt.write_text(json.dumps(result))
         temp_receipt.replace(receipt)
+        result['sourceInspection']=source_inspection
         return result
 
 
