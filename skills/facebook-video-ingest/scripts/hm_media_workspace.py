@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import tempfile
 import time
 
@@ -34,16 +35,35 @@ def root():
         raise WorkspaceFailure('MEDIA_WORKSPACE_UNBOUNDED')
     return path
 
-def bytes_used(path):
+def bytes_used(path, browser_temporary=False):
     total, seen = 0, set()
     for item in path.rglob('*'):
-        if item.is_symlink():
-            raise WorkspaceFailure('MEDIA_WORKSPACE_LINK')
-        if item.is_file():
-            stat = item.stat(); identity = (stat.st_dev, stat.st_ino)
+        try: info = item.lstat()
+        except FileNotFoundError: continue  # Chromium removes its temporary files concurrently.
+        if stat.S_ISLNK(info.st_mode):
+            if not browser_temporary or item.name not in {'SingletonLock','SingletonSocket','SingletonCookie'}:
+                raise WorkspaceFailure('MEDIA_WORKSPACE_LINK')
+            # Browser lock metadata is counted without following its target.
+            total += info.st_blocks * 512
+        elif stat.S_ISREG(info.st_mode):
+            identity = (info.st_dev, info.st_ino)
             if identity not in seen:
-                seen.add(identity); total += stat.st_blocks * 512
+                seen.add(identity); total += info.st_blocks * 512
     return total
+
+def browser_directory(workspace, lease):
+    name = lease.get('browserTemporary')
+    if not name:return None
+    if Path(name).name != name or not name.startswith('b-'):
+        raise WorkspaceFailure('MEDIA_WORKSPACE_LINK')
+    path = workspace/'t'/name
+    if path.is_symlink():raise WorkspaceFailure('MEDIA_WORKSPACE_LINK')
+    return path
+
+def lease_bytes(workspace, name, lease):
+    folder = workspace/'work'/name
+    temporary = browser_directory(workspace, lease)
+    return (bytes_used(folder) if folder.exists() else 0) + (bytes_used(temporary, True) if temporary and temporary.exists() else 0)
 
 def process_identity(pid):
     try:
@@ -91,34 +111,49 @@ def job(tenant, identifier, required):
         existing = leases.get(key)
         if existing and existing.get('active',True) and process_identity(existing['pid']) == existing['identity']:
             raise WorkspaceFailure('MEDIA_WORKSPACE_BUSY', True)
+        if existing:
+            old_temporary = browser_directory(workspace, existing)
+            if old_temporary:shutil.rmtree(old_temporary,ignore_errors=True)
         reserved = 0
         for name, lease in list(leases.items()):
             if name == key: continue
             folder = workspace/'work'/name
             active = lease.get('active',True) and process_identity(lease['pid']) == lease['identity']
+            if not active:
+                temporary = browser_directory(workspace, lease)
+                if temporary:shutil.rmtree(temporary,ignore_errors=True)
+                lease.pop('browserTemporary',None)
             if not active and (lease.get('verified') or not (folder/'.source-protected.json').exists()):
                 shutil.rmtree(folder,ignore_errors=True); del leases[name]
             else:
-                reserved += max(int(lease['reserved']),bytes_used(folder) if folder.exists() else 0)
+                reserved += max(int(lease['reserved']),lease_bytes(workspace,name,lease))
         occupied = bytes_used(directory) if directory.exists() else 0
         requested = max(required,occupied)
         available = os.statvfs(workspace).f_bavail * os.statvfs(workspace).f_frsize
         if reserved + requested + MARGIN > CAPACITY or available < max(0,requested-occupied)+MARGIN:
             raise WorkspaceFailure('MEDIA_WORKSPACE_BUSY', True)
         directory.mkdir(mode=0o700,exist_ok=True)
-        leases[key] = dict(pid=os.getpid(),identity=identity,reserved=requested,verified=False,active=True,createdAt=time.time())
+        # Keep Chromium's Unix socket path short, but fenced by the same job lease.
+        browser_temporary = Path(tempfile.mkdtemp(prefix='b-',dir=workspace/'t'))
+        leases[key] = dict(pid=os.getpid(),identity=identity,reserved=requested,verified=False,active=True,createdAt=time.time(),browserTemporary=browser_temporary.name)
         journal(lease_file,leases)
     previous = os.environ.get('HM_JOB_MEDIA_ROOT')
+    previous_temporary = os.environ.get('HM_JOB_TEMP_ROOT')
     os.environ['HM_JOB_MEDIA_ROOT'] = str(directory)
+    os.environ['HM_JOB_TEMP_ROOT'] = str(browser_temporary)
     try:
         yield directory
     finally:
         if previous is None: os.environ.pop('HM_JOB_MEDIA_ROOT',None)
         else: os.environ['HM_JOB_MEDIA_ROOT']=previous
+        if previous_temporary is None:os.environ.pop('HM_JOB_TEMP_ROOT',None)
+        else:os.environ['HM_JOB_TEMP_ROOT']=previous_temporary
         with lock(workspace):
             leases = json.loads(lease_file.read_text())
             lease = leases.get(key)
             if lease and lease['pid']==os.getpid() and lease['identity']==identity:
+                shutil.rmtree(browser_temporary,ignore_errors=True)
+                lease.pop('browserTemporary',None)
                 # Source verification is explicitly recorded before unlinking.
                 verified = (directory/'.r2-verified').exists()
                 protected = (directory/'.source-protected.json').exists()
@@ -138,7 +173,7 @@ def reserve_input(size):
     with lock(workspace):
         leases=json.loads((workspace/'.leases.json').read_text());current=leases[key]
         if required<=current['reserved']:return
-        reserved=sum(max(int(lease['reserved']),bytes_used(workspace/'work'/name)) for name,lease in leases.items() if name!=key)
+        reserved=sum(max(int(lease['reserved']),lease_bytes(workspace,name,lease)) for name,lease in leases.items() if name!=key)
         if reserved+required+MARGIN>CAPACITY:raise WorkspaceFailure('MEDIA_WORKSPACE_BUSY',True)
         current['reserved']=required;journal(workspace/'.leases.json',leases)
 
@@ -179,4 +214,4 @@ def protect_source(path, sha):
 def temporary_root():
     workspace=root()
     if workspace is None:return '/tmp'
-    target=Path(os.environ.get('HM_JOB_MEDIA_ROOT') or workspace/'t')/'t';target.mkdir(exist_ok=True);return str(target)
+    target=Path(os.environ.get('HM_JOB_TEMP_ROOT') or workspace/'t');target.mkdir(exist_ok=True);return str(target)

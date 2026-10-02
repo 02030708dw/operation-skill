@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import tempfile
 import subprocess
+import socket
 import unittest
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
@@ -86,5 +87,41 @@ class WorkspaceTest(unittest.TestCase):
                 self.assertTrue(failure.retryable);self.assertEqual(str(failure),'MEDIA_WORKSPACE_BUSY')
             with patch.dict(os.environ,{'HM_JOB_MEDIA_ROOT':str(self.root)}),patch.object(ws,'bytes_used',return_value=ws.CAPACITY):
                 self.assertFalse(ws.storage_failure(OSError(errno.ENOSPC,'full')).retryable)
+    def test_browser_lock_links_allow_parallel_admission_without_following_targets(self):
+        with ws.job('ph','browser',1024**2) as media:
+            temporary=Path(ws.temporary_root());profile=temporary/'profile';profile.mkdir()
+            (profile/'cache').write_bytes(b'cache')
+            for name in ('SingletonLock','SingletonSocket','SingletonCookie'):
+                (profile/name).symlink_to('/outside-the-workspace')
+            key=ws.key_for('ph','browser');lease=json.loads((self.root/'.leases.json').read_text())[key]
+            self.assertGreater(ws.lease_bytes(self.root,key,lease),0)
+            with ws.job('th','parallel',1024**2):self.assertTrue(temporary.exists())
+            self.assertEqual(str(temporary),os.environ['HM_JOB_TEMP_ROOT'])
+            self.assertEqual(str(media),os.environ['HM_JOB_MEDIA_ROOT'])
+        self.assertFalse(temporary.exists())
+        self.assertEqual(json.loads((self.root/'.leases.json').read_text()),{})
+    def test_media_links_and_unknown_browser_links_remain_rejected(self):
+        with ws.job('ph','links',1024) as media:
+            link=media/'SingletonLock';link.symlink_to('/outside')
+            with self.assertRaises(ws.WorkspaceFailure):ws.bytes_used(media)
+            link.unlink()
+            temporary=Path(ws.temporary_root());(temporary/'arbitrary').symlink_to('/outside')
+            with self.assertRaises(ws.WorkspaceFailure):ws.bytes_used(temporary,True)
+    def test_short_browser_root_fits_actual_unix_socket_and_is_cleaned(self):
+        with tempfile.TemporaryDirectory(prefix='hmb-',dir='/tmp') as short,patch.object(ws,'root',return_value=Path(short)):
+            with ws.job('id','socket',1024):
+                with tempfile.TemporaryDirectory(prefix='hp-',dir=ws.temporary_root()) as temporary:
+                    path=Path(temporary)/'org.chromium.Chromium.abcdef'/'SingletonSocket';path.parent.mkdir()
+                    self.assertLess(len(str(path).encode()),108)
+                    with socket.socket(socket.AF_UNIX) as connection:connection.bind(str(path))
+            self.assertEqual(list((Path(short)/'t').iterdir()),[])
+    def test_dead_browser_temp_is_reclaimed_without_deleting_protected_media(self):
+        (self.root/'work').mkdir();folder=self.root/'work'/'dead';folder.mkdir()
+        (folder/'source.mp4').write_bytes(b'only copy');(folder/'.source-protected.json').write_text('{}')
+        temporary=self.root/'t'/'b-dead';temporary.mkdir(parents=True)
+        (temporary/'SingletonLock').symlink_to('old-browser-pid')
+        (self.root/'.leases.json').write_text(json.dumps({'dead':dict(pid=os.getpid(),identity='old',reserved=1024,verified=False,browserTemporary=temporary.name)}))
+        with ws.job('ph','next',1024):pass
+        self.assertFalse(temporary.exists());self.assertTrue((folder/'source.mp4').exists())
 
 if __name__=='__main__':unittest.main()
