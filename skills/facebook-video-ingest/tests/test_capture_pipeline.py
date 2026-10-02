@@ -110,6 +110,57 @@ class PipelineTests(unittest.TestCase):
             self.assertIsNone(receipt['localPath']);self.assertEqual('fixture-bucket',receipt['reviewBucket'])
             self.assertTrue(receipt['reviewObjectKey'].startswith('review/PH/pipeline/key1/'))
 
+    def test_windowed_download_keeps_verified_video_in_completion_receipt(self):
+        import hm_public_capture as public
+        import hm_review_storage as storage
+        for cached in (False, True):
+            with self.subTest(cached=cached), tempfile.TemporaryDirectory() as temp:
+                root=Path(temp);directory=root/'pipeline'/'video-key';directory.mkdir(parents=True)
+                source=directory/'original.mp4';source.write_bytes(b'original-media')
+                spec=root/'jobs'/'1.json'
+                job={'jobNo':'P-download','leaseVersion':1,'tenant':'ph','stage':'DOWNLOAD',
+                     'platform':'Facebook','subjectKey':'video-key','windowedMode':True,
+                     'entry':{'id':'123','url':'https://www.facebook.com/reel/123'}}
+                pipeline.atomic_json(spec,job)
+                sha=pipeline.digest(source)
+                stored=[]
+                class Bucket:
+                    def upload_file(self, path, bucket, key, **kwargs):
+                        stored.append((Path(path).read_bytes(),key))
+                def head(*args):
+                    return {'ContentLength':len(b'original-media'),'Metadata':{'hm-sha256':sha}} if stored or cached else None
+                if cached:
+                    pipeline.atomic_json(directory/'download.json',dict(localPath=None,
+                        platformVideoId='123',fileSize=source.stat().st_size,fileSha256=sha,title='123',
+                        reviewObjectKey='review/PH/pipeline/video-key/source.mp4',reviewBucket='fixture',reviewKeyVersion='v1'))
+                with patch.dict(os.environ,{'CLOUDFLARE_R2_BUCKET':'fixture'}),\
+                     patch.object(runner,'tenant_config',return_value={'mediaRoot':str(root)}),\
+                     patch.object(public,'attempt',side_effect=lambda action,*_:action({})),\
+                     patch.object(public,'download_item',return_value={'path':str(source),'title':'123','duration':1}) as download,\
+                     patch.object(storage,'configuration',return_value={'activeVersion':'v1'}),\
+                     patch.object(storage,'client',return_value=Bucket()),\
+                     patch.object(storage,'encryption',return_value={}),\
+                     patch.object(storage,'head',side_effect=head),\
+                     patch('hm_media_compat.probe',return_value={'streams':[{'codec_type':'video','codec_name':'h264',
+                         'codec_tag_string':'avc1','width':16,'height':16,'pix_fmt':'yuv420p','profile':'Main','level':42,
+                         'avg_frame_rate':'30/1'}],'format':{'format_name':'mp4','duration':'1'}}):
+                    pipeline.execute_stage(spec)
+                    receipt=json.loads(pipeline.result_file(spec).read_text())
+                    self.assertEqual('SUCCESS',receipt['outcome'])
+                    self.assertIsInstance(receipt['video'],dict)
+                    self.assertEqual(sha,receipt['video']['fileSha256'])
+                    self.assertIsNone(receipt['video']['localPath'])
+                    self.assertEqual(receipt['video'],json.loads((directory/'download.json').read_text()))
+                    if cached:download.assert_not_called()
+                    else:self.assertEqual(b'original-media',stored[0][0])
+                    received=[]
+                    with patch.object(pipeline,'request',side_effect=lambda config,url,body:received.append((url,body)) or {'accepted':True}),\
+                         patch.object(pipeline.subprocess,'Popen') as launch:
+                        self.assertEqual(0,pipeline.run_job(spec))
+                        launch.assert_not_called()
+                    self.assertEqual(receipt,received[-1][1])
+                    self.assertFalse(source.exists())
+
     def test_legacy_download_is_imported_without_network_or_early_file_cleanup(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);directory=root/'pipeline'/'old-key';directory.mkdir(parents=True)

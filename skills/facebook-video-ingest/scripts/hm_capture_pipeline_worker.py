@@ -345,7 +345,8 @@ def _execute_stage(job_file):
                         # The verified bucket object is the source of truth. Failed
                         # uploads are terminal and must not strand large files.
                         if video.get('localPath') is None:cleanup_pipeline_media(directory,saved)
-                    video=None
+                    # Keep the verified R2 receipt for the shared persistence and
+                    # completion below; localPath is already cleared by storage.
                 if job['stage']=='MEDIA':
                     # Immutable canonical cache stays in pipeline/. Each ownership
                     # receives its own hard link, so review cleanup cannot destroy
