@@ -2,7 +2,7 @@
 const readline=require('readline');
 const engine=require('../../facebook-followed-video-download/scripts/facebook_followed_video_engine');
 const interactive=require('../../facebook-followed-video-download/scripts/facebook_interactive_browser');
-const {closeBrowser,confirmPersistedSession}=require('../../facebook-followed-video-download/scripts/facebook_browser_shutdown');
+const {startBrowser,closeBrowser,confirmPersistedSession}=require('./hm_x_browser');
 const hosts=['x.com','www.x.com','twitter.com','api.x.com'];let seq=980000;
 const call=(b,method,params)=>engine.cdpCall(b.ws,{id:seq++,method,params},10000);
 const emit=value=>console.log('HM_ACCOUNT_RESULT '+JSON.stringify(value));
@@ -20,7 +20,7 @@ async function inspect(browser){
  return {state:'COOLDOWN',reasonCode:'X_SESSION_UNKNOWN'};
 }
 async function main(){
- const profile=process.argv[2];interactive.privatePreferences(profile);const browser=await engine.startBrowser(profile);
+ const profile=process.argv[2];interactive.privatePreferences(profile);const browser=await startBrowser(profile);
  try{
   for await(const line of readline.createInterface({input:process.stdin})){
    let input;

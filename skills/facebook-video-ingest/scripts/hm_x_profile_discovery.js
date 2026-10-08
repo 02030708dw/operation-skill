@@ -1,13 +1,13 @@
 // A fresh official media-page visit per scan; no private response bodies are logged.
 const engine=require('../../facebook-followed-video-download/scripts/facebook_followed_video_engine');
-const {closeBrowser}=require('../../facebook-followed-video-download/scripts/facebook_browser_shutdown');
+const {startBrowser,closeBrowser}=require('./hm_x_browser');
 const {parseFeed}=require('./hm_x_feed');
 let seq=970000;
 const call=(b,method,params={})=>engine.cdpCall(b.ws,{id:seq++,method,params},10000);
 async function discover(url,limit,profile){
  const u=new URL(url);const match=/^\/([A-Za-z0-9_]{1,15})\/media$/.exec(u.pathname);
  if(u.origin!=='https://x.com'||u.search||u.hash||!match||!Number.isInteger(limit)||limit<1||limit>10)throw Error('INVALID_SOURCE');
- const handle=match[1],browser=await engine.startBrowser(profile);
+ const handle=match[1],browser=await startBrowser(profile);
  const pending=new Set(),finished=new Set(),entries=new Map();let validated=false,sourceExhausted=false,errorCode;
  const event=data=>{try{
   const e=JSON.parse(data),p=e.params||{};

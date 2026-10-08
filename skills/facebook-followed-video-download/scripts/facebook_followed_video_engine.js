@@ -1156,7 +1156,7 @@ function removeTree(directory) {
   fs.rmdirSync(directory, { recursive: true, maxRetries: 3, retryDelay: 100 });
 }
 
-async function startBrowser(profile, executable = chromePath) {
+async function startBrowser(profile, executable = chromePath, options = {}) {
   const activePortFile = path.join(profile, 'DevToolsActivePort');
   let lastError;
   for (let attempt = 1; attempt <= 2; attempt++) {
@@ -1167,13 +1167,14 @@ async function startBrowser(profile, executable = chromePath) {
     const chrome = spawn(executable, [
       `--remote-debugging-port=${CONFIGURED_CDP_PORT > 0 ? CONFIGURED_CDP_PORT : 0}`,
       `--user-data-dir=${profile}`,
-      attempt === 1 ? '--headless=new' : '--headless',
+      ...(options.headless === false ? [] : [attempt === 1 ? '--headless=new' : '--headless']),
       '--disable-gpu',
       '--no-first-run',
       '--no-default-browser-check',
       'about:blank'
     ], {
       stdio: ['ignore', 'ignore', 'pipe'],
+      env: { ...process.env, ...options.env },
       detached: process.platform !== 'win32' && process.env.HM_PIPELINE_DEFER_MEDIA !== '1',
       windowsHide: true
     });
