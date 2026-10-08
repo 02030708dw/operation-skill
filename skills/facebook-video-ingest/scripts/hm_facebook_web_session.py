@@ -47,6 +47,13 @@ def maintenance_locks():
                     handle=google.acquire(account)
                     if handle is None:raise RuntimeError('Busy')
                     handles.append(handle)
+        import hm_x_account as x
+        for config in json.loads(Path(os.environ['HM_TENANT_CONFIG']).read_text()).values():
+            account=x.account_config(config)
+            if account:
+                handle=x.acquire(account)
+                if handle is None:raise RuntimeError('Busy')
+                handles.append(handle)
         return handles
     except Exception:
         for handle in handles: handle.close()
@@ -109,7 +116,7 @@ def run(tenant):
             staging = root / ('login.' + uuid.uuid4().hex); staging.mkdir(mode=0o700)
         profile = staging or root / 'profile'; profile.mkdir(exist_ok=True, mode=0o700)
         accounts.recover_profile(profile)
-        script = Path(__file__).resolve().parents[2] / ('youtube-video-downloader/scripts/google_admin_session.js' if accounts.__name__=='hm_google_account' else 'facebook-followed-video-download/scripts/facebook_admin_session.js')
+        script = Path(__file__).resolve().parents[2] / ('facebook-video-ingest/scripts/x_admin_session.js' if accounts.__name__=='hm_x_account' else 'youtube-video-downloader/scripts/google_admin_session.js' if accounts.__name__=='hm_google_account' else 'facebook-followed-video-download/scripts/facebook_admin_session.js')
         child = subprocess.Popen(['node', str(script), str(profile)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.DEVNULL, text=True, bufsize=1, start_new_session=True)
         child.stdin.write(json.dumps(initial) + '\n'); child.stdin.flush(); initial = None
@@ -164,6 +171,10 @@ def run(tenant):
 
 
 if __name__ == '__main__':
+    if len(sys.argv)==3 and sys.argv[2]=='x':
+        if sys.argv[1] not in ('ph','th','vn','id'):raise SystemExit(2)
+        import hm_x_account as accounts
+        run(sys.argv[1]);raise SystemExit(0)
     if len(sys.argv)==3 and sys.argv[2]=='google':
         if sys.argv[1] not in ('ph', 'th', 'vn', 'id'):raise SystemExit(2)
         sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'youtube-video-downloader/scripts'))

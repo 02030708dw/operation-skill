@@ -271,7 +271,16 @@ def _execute_stage(job_file):
                     # wall. Keep them, but never convert that attempt to coverage.
                     if getattr(error,'entries',None):result['entries']=error.entries
                     raise
-            if job.get('windowedMode'):
+            from hm_x_capture import source as x_source, profile_check
+            if job['platform']=='X' and x_source(job['sourceUrl']).get('kind')=='profile':
+                attempt={'stage':'DISCOVERY','mode':'AUTHENTICATED'};attempts.append(attempt)
+                try:result.update(profile_check(job,config))
+                except Exception as error:
+                    attempt.update(result='FAILED',reasonCode=public.classify(error))
+                    if getattr(error,'entries',None):result['entries']=error.entries
+                    raise
+                attempt['result']='PASSED'
+            elif job.get('windowedMode'):
                 attempt={'stage':'DISCOVERY','mode':'PUBLIC'};attempts.append(attempt)
                 try:
                     discovered=public_check(job)

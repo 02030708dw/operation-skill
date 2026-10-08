@@ -21,6 +21,18 @@ def job(**changes):
 
 
 class PublicDiscoveryTests(unittest.TestCase):
+    def test_windowed_x_profile_reads_its_x_session_and_queues_media_identities(self):
+        import hm_x_capture as x
+        entry={'id':'456','url':'https://x.com/creator/status/123'}
+        config={'xAccount':{'key':'x-ph'}}
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/'job.json';value=job();value.update(platform='X',sourceUrl='https://x.com/creator/media');pipeline.atomic_json(path,value)
+            with patch.object(runner,'tenant_config',return_value=config),patch.object(x,'profile_check',return_value=dict(outcome='SUCCESS',complete=True,validated=True,entries=[entry],scope='LATEST_TEN',evidence='VALIDATED_LATEST_TEN')) as profile,patch.object(public,'authenticated_session') as unrelated:
+                pipeline.execute_stage(path)
+            result=json.loads(pipeline.result_file(path).read_text())
+            profile.assert_called_once();unrelated.assert_not_called()
+            self.assertEqual([entry],result['entries']);self.assertEqual('AUTHENTICATED',result['attempts'][0]['mode']);self.assertTrue(result['complete'])
+
     def test_login_gated_feed_keeps_valid_deduplicated_links_without_authenticated_discovery(self):
         entries=[{'id':'123','url':'https://www.facebook.com/reel/123'},
                  {'id':'123','url':'https://www.facebook.com/watch/?v=123'},

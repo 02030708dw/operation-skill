@@ -1,10 +1,17 @@
-"""Anonymous native X video posts, including multiple videos in one post."""
+"""Native X posts and bounded, authorized profile media discovery."""
 import itertools
 import re
+import json
+import os
+from pathlib import Path
+import subprocess
+import time
 from urllib.parse import urlsplit
 
 HOSTS = {'x.com', 'www.x.com', 'twitter.com', 'www.twitter.com', 'mobile.twitter.com'}
 POST = re.compile(r'/(?:[A-Za-z0-9_]{1,15}|i/web)/status/([0-9]{1,20})(?:/video/[1-9][0-9]?)?/?')
+PROFILE = re.compile(r'/([A-Za-z0-9_]{1,15})(?:/media)?/?')
+RESERVED = {'i','home','explore','settings','messages','search','notifications','compose','login','logout','signup','tos','privacy','account','accounts','hashtag','share'}
 
 
 def source(url):
@@ -12,9 +19,13 @@ def source(url):
     try:
         parsed = urlsplit(url.strip())
         match = POST.fullmatch(parsed.path)
-        if parsed.scheme != 'https' or parsed.netloc not in HOSTS or not match:
+        if parsed.scheme != 'https' or parsed.netloc not in HOSTS:
             raise ValueError('Invalid X post')
-        return {'id': match[1], 'url': 'https://x.com' + parsed.path.rstrip('/')}
+        if match:return {'id': match[1], 'url': 'https://x.com' + parsed.path.rstrip('/')}
+        profile = PROFILE.fullmatch(parsed.path)
+        if profile and profile[1].lower() not in RESERVED:
+            return {'kind':'profile', 'handle':profile[1].lower(), 'url':'https://x.com/'+profile[1].lower()+'/media'}
+        raise ValueError('Invalid X source')
     except (ValueError, AttributeError):
         raise public.Failure('UNSUPPORTED_CONTENT') from None
 
@@ -40,10 +51,52 @@ def select_info(info, media_id):
     raise public.Failure('EXTRACTION_ERROR')
 
 
-def discover(url, limit):
+def discover_profile(url, limit, profile):
+    import hm_public_capture as public
+    if not profile:raise public.Failure('LOGIN_REQUIRED')
+    helper=Path(__file__).with_name('hm_x_profile_discovery.js')
+    proc=subprocess.run(['node',str(helper),source(url)['url'],str(min(limit,10)),str(profile)],
+        env=public.clean_environment(os.environ),capture_output=True,text=True,timeout=140)
+    lines=[line for line in proc.stdout.splitlines() if line.startswith('HM_X_DISCOVERY ')]
+    if not lines:raise public.Failure('NETWORK_ERROR')
+    data=json.loads(lines[-1].split(' ',1)[1])
+    entries=[];seen=set()
+    for row in data.get('entries') or []:
+        if not isinstance(row,dict) or not re.fullmatch(r'[0-9]{1,20}',str(row.get('id',''))):raise public.Failure('EXTRACTION_ERROR')
+        post=source(row.get('url',''))
+        if post.get('kind')=='profile':raise public.Failure('EXTRACTION_ERROR')
+        identity=str(row['id'])
+        if identity not in seen:entries.append(dict(id=identity,url=post['url']));seen.add(identity)
+    code=data.get('errorCode')
+    if code or not data.get('validated') or not (len(entries)>=min(limit,10) or data.get('sourceExhausted')):
+        error=public.Failure(code if code in public.MESSAGES else 'DISCOVERY_INCOMPLETE');error.entries=entries;raise error
+    return entries[:min(limit,10)]
+
+
+def profile_check(job, config):
+    import hm_public_capture as public
+    import hm_x_account as accounts
+    account=accounts.account_config(config)
+    if not account:raise public.Failure('ACCOUNT_NOT_CONFIGURED')
+    state=accounts.read_state(account)
+    if state.get('state')!='LOGGED_IN' and not (state.get('state')=='COOLDOWN' and (state.get('nextCheckAt') or 0)<=time.time()):raise public.Failure('LOGIN_REQUIRED')
+    lease=accounts.acquire_capture(account)
+    if lease is None:raise public.Failure('ACCOUNT_BUSY')
+    try:
+        entries=discover_profile(job['sourceUrl'],10,lease.profile)
+        return dict(outcome='SUCCESS',complete=True,validated=True,entries=entries,evidence='VALIDATED_LATEST_TEN',scope='LATEST_TEN')
+    except public.Failure as error:
+        if error.code in ('LOGIN_REQUIRED','VERIFICATION_REQUIRED','RATE_LIMITED','ACCOUNT_SUSPENDED'):
+            accounts.save_result(config,'',dict(state='LOGIN_REQUIRED' if error.code=='LOGIN_REQUIRED' else 'COOLDOWN' if error.code=='RATE_LIMITED' else 'VERIFICATION_REQUIRED',reasonCode='X_'+error.code))
+        raise
+    finally:lease.close()
+
+
+def discover(url, limit, profile=None):
     import hm_public_capture as public
     import yt_dlp
     post = source(url)
+    if post.get('kind')=='profile':return discover_profile(url,limit,profile)
     with yt_dlp.YoutubeDL(dict(public.common_options({}), skip_download=True, noplaylist=True)) as ydl:
         info = ydl.extract_info(post['url'], download=False)
     if not info:

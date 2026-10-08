@@ -1,6 +1,9 @@
 import sys
 from pathlib import Path
 import unittest
+import json
+import tempfile
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
@@ -10,14 +13,39 @@ import hm_pipeline_discovery as discovery
 
 
 class XCaptureTests(unittest.TestCase):
-    def test_normalizes_posts_but_rejects_profiles_and_untrusted_urls(self):
+    def test_normalizes_profiles_posts_and_rejects_untrusted_routes(self):
         self.assertEqual({'id': '123', 'url': 'https://x.com/Creator/status/123'},
             x.source('https://mobile.twitter.com/Creator/status/123/?s=20#video'))
-        for url in ('https://x.com/Creator/media', 'https://x.com/Creator',
+        self.assertEqual({'kind':'profile','handle':'creator','url':'https://x.com/creator/media'},x.source('https://twitter.com/Creator/?s=20'))
+        self.assertIsNone(public.single_source('X','https://x.com/Creator/media'))
+        for url in ('https://x.com/home', 'https://x.com/Creator/likes',
                     'http://x.com/Creator/status/123', 'https://x.com.evil/Creator/status/123',
                     'https://secret@x.com/Creator/status/123', 'https://x.com:443/Creator/status/123',
                     'https://x.com/Creator/%73tatus/123'):
             with self.assertRaises(public.Failure, msg=url): x.source(url)
+
+    def test_partial_profile_result_retains_video_identities_but_is_never_complete(self):
+        entries=[{'id':'456','url':'https://x.com/creator/status/123'}]
+        proc=SimpleNamespace(stdout='HM_X_DISCOVERY '+json.dumps(dict(entries=entries,validated=True,sourceExhausted=False)))
+        with patch.object(x.subprocess,'run',return_value=proc) as run:
+            with self.assertRaises(public.Failure) as caught:x.discover_profile('https://x.com/creator/media',10,'/private/profile')
+        self.assertEqual('DISCOVERY_INCOMPLETE',caught.exception.code);self.assertEqual(entries,caught.exception.entries)
+        self.assertIn('/private/profile',run.call_args.args[0]);self.assertEqual(140,run.call_args.kwargs['timeout'])
+        with self.assertRaises(public.Failure) as caught:x.discover_profile('https://x.com/creator',10,None)
+        self.assertEqual('LOGIN_REQUIRED',caught.exception.code)
+
+    def test_profile_uses_only_its_regional_x_session_and_releases_the_lease(self):
+        import hm_x_account as accounts
+        config={'xAccount':{'key':'x-th'},'facebookAccount':{'key':'fb-th'},'googleAccount':{'key':'google-th'}}
+        lease=Mock(profile=Path('/private/x-th/profile'))
+        with patch.object(accounts,'read_state',return_value={'state':'LOGGED_IN'}),patch.object(accounts,'acquire_capture',return_value=lease),patch.object(x,'discover_profile',return_value=[{'id':'456','url':'https://x.com/creator/status/123'}]) as discover,patch.object(public.facebook,'account_config') as fb,patch.object(public.google,'account_config') as google:
+            result=x.profile_check({'sourceUrl':'https://x.com/creator/media'},config)
+            self.assertTrue(result['complete']);discover.assert_called_once_with('https://x.com/creator/media',10,lease.profile)
+            lease.close.assert_called_once();fb.assert_not_called();google.assert_not_called()
+        with self.assertRaises(ValueError):accounts.account_config({'xAccount':{'key':'x-other'}})
+        with tempfile.TemporaryDirectory() as temp,patch.dict('os.environ',{'HM_X_ACCOUNT_ROOT':temp}):
+            admin=accounts.acquire(config['xAccount']);self.assertIsNone(accounts.acquire_capture(config['xAccount']));admin.close()
+            reader=accounts.acquire_capture(config['xAccount']);self.assertIsNone(accounts.acquire(config['xAccount']));reader.close()
 
     def test_check_uses_media_ids_and_finds_all_videos_in_one_post(self):
         rows=[{'id': str(i), 'formats': [{'url': 'https://video.twimg.com/video.mp4'}]} for i in (456, 789)]

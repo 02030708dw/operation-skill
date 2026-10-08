@@ -216,7 +216,8 @@ def common_options(credentials):
 def single_source(platform,url):
     if platform=='X':
         from hm_x_capture import source
-        return source(url)
+        value=source(url)
+        return None if value.get('kind')=='profile' else value
     if platform=='TikTok':
         from hm_tiktok_capture import source
         value=source(url)
@@ -304,7 +305,12 @@ def run_download(platform,url,limit,output,report_path,config,on_item=lambda *_:
     if entries is None:
         try:
             single=None if platform=='X' else single_source(platform,url)
-            entries=[single] if single else attempt(lambda c:discover(platform,url,limit,c),config,platform,report['attempts'],'DISCOVERY')
+            from hm_x_capture import source as x_source, profile_check
+            if platform=='X' and x_source(url).get('kind')=='profile':
+                report['attempts'].append(dict(stage='DISCOVERY',mode='AUTHENTICATED'))
+                entries=profile_check(dict(sourceUrl=url),config)['entries']
+            else:
+                entries=[single] if single else attempt(lambda c:discover(platform,url,limit,c),config,platform,report['attempts'],'DISCOVERY')
             report.update(entries=entries,discovered=len(entries),discovery=getattr(entries,'discovery',{}));save(report_path,report)
         except Exception as error:
             report['errorCode']=classify(error);entries=[]
