@@ -13,6 +13,26 @@ import hm_pipeline_discovery as discovery
 
 
 class XCaptureTests(unittest.TestCase):
+    def test_local_handoff_resolves_native_ids_without_a_browser_session(self):
+        job={'sourceUrl':'https://x.com/creator/media','localDiscovery':{'readFromTop':True,'urls':[f'https://x.com/creator/status/{i}' for i in range(200,190,-1)]}}
+        def resolve(url, limit):
+            return [{'id':str(int(url.rsplit('/',1)[1])+1000),'url':url}]
+        with patch.object(x,'discover',side_effect=resolve) as discover:
+            result=x.local_profile_check(job)
+        self.assertEqual('SUCCESS',result['outcome']);self.assertEqual('1200',result['entries'][0]['id'])
+        self.assertEqual(10,discover.call_count)
+        self.assertTrue(all(len(call.args)==2 for call in discover.call_args_list))
+
+    def test_local_partial_handoff_keeps_native_ids_but_never_marks_complete(self):
+        job={'sourceUrl':'https://x.com/creator/media','localDiscovery':{'readFromTop':True,'urls':['https://x.com/creator/status/200']}}
+        with patch.object(x,'discover',return_value=[{'id':'999','url':job['localDiscovery']['urls'][0]}]):
+            with self.assertRaises(public.Failure) as caught:x.local_profile_check(job)
+        self.assertEqual('DISCOVERY_INCOMPLETE',caught.exception.code)
+        self.assertEqual('999',caught.exception.entries[0]['id'])
+        for urls in (['https://x.com/other/status/200'],['https://x.com/creator/status/100','https://x.com/creator/status/200']):
+            job['localDiscovery']['urls']=urls
+            with patch.object(x,'discover',return_value=[]),self.assertRaises(public.Failure):x.local_profile_check(job)
+
     def test_normalizes_profiles_posts_and_rejects_untrusted_routes(self):
         self.assertEqual({'id': '123', 'url': 'https://x.com/Creator/status/123'},
             x.source('https://mobile.twitter.com/Creator/status/123/?s=20#video'))

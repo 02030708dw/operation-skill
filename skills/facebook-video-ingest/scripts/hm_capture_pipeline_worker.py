@@ -271,8 +271,16 @@ def _execute_stage(job_file):
                     # wall. Keep them, but never convert that attempt to coverage.
                     if getattr(error,'entries',None):result['entries']=error.entries
                     raise
-            from hm_x_capture import source as x_source, profile_check
-            if job['platform']=='X' and x_source(job['sourceUrl']).get('kind')=='profile':
+            from hm_x_capture import source as x_source, profile_check, local_profile_check
+            if job['platform']=='X' and job.get('localDiscovery'):
+                attempt={'stage':'DISCOVERY','mode':'AUTHENTICATED','sourceMode':'LOCAL_CHROME','metadataMode':'PUBLIC'};attempts.append(attempt)
+                try:result.update(local_profile_check(job))
+                except Exception as error:
+                    attempt.update(result='FAILED',reasonCode=public.classify(error))
+                    if getattr(error,'entries',None):result['entries']=error.entries
+                    raise
+                attempt['result']='PASSED'
+            elif job['platform']=='X' and x_source(job['sourceUrl']).get('kind')=='profile':
                 attempt={'stage':'DISCOVERY','mode':'AUTHENTICATED'};attempts.append(attempt)
                 try:result.update(profile_check(job,config))
                 except Exception as error:

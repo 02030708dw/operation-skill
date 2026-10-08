@@ -92,6 +92,31 @@ def profile_check(job, config):
     finally:lease.close()
 
 
+def local_profile_check(job):
+    """Resolve public native media IDs from an ordered local-browser handoff."""
+    import hm_public_capture as public
+    feed=source(job['sourceUrl']);payload=job.get('localDiscovery') or {}
+    urls=payload.get('urls')
+    if feed.get('kind')!='profile' or payload.get('readFromTop') is not True or not isinstance(urls,list) or len(urls)>10:
+        raise public.Failure('DISCOVERY_INCOMPLETE')
+    previous=None;posts=set();entries=[];media=set()
+    for url in urls:
+        post=source(url)
+        if post.get('kind') or url.split('/')[3].lower()!=feed['handle'] or post['id'] in posts or previous is not None and int(post['id'])>=previous:
+            raise public.Failure('EXTRACTION_ERROR')
+        posts.add(post['id']);previous=int(post['id'])
+        try:resolved=discover(post['url'],10)
+        except Exception as error:
+            failure=public.Failure(public.classify(error));failure.entries=entries;raise failure from None
+        for row in resolved:
+            if row['id'] not in media:
+                media.add(row['id']);entries.append(row)
+            if len(entries)==10:
+                return dict(outcome='SUCCESS',complete=True,validated=True,entries=entries,
+                    evidence='VALIDATED_LATEST_TEN',scope='LATEST_TEN',discoveryMode='LOCAL_CHROME')
+    failure=public.Failure('DISCOVERY_INCOMPLETE');failure.entries=entries;raise failure
+
+
 def discover(url, limit, profile=None):
     import hm_public_capture as public
     import yt_dlp
