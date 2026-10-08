@@ -6,10 +6,81 @@ import os
 from pathlib import Path
 import re
 import subprocess
+from urllib.parse import urlsplit, parse_qs
 
 import hm_public_capture as public
 
 PAGE = 50
+
+
+def valid_public_entries(platform, entries):
+    """Keep at most ten stable platform identities; never queue arbitrary URLs."""
+    found={}
+    for item in entries or []:
+        if not isinstance(item,dict):continue
+        identity=str(item.get('id') or '')
+        try:
+            url=item['url']
+            if not isinstance(url,str) or len(url)>1000 or any(c.isspace() for c in url):continue
+            parsed=urlsplit(url)
+            host=parsed.hostname or ''
+            if parsed.scheme!='https' or parsed.username is not None or parsed.port is not None:continue
+            if platform=='Facebook':
+                if host not in ('facebook.com','www.facebook.com','m.facebook.com','web.facebook.com') or not identity.isascii() or not identity.isdigit():continue
+                parts=parsed.path.strip('/').split('/')
+                linked=parse_qs(parsed.query).get('v',[]) if parsed.path.rstrip('/') in ('/watch','/video.php') else parts[-1:] if 'videos' in parts or 'reel' in parts else []
+                if identity not in linked:continue
+                url='https://www.facebook.com/watch/?v='+identity
+            elif platform=='YouTube':
+                if not re.fullmatch(r'[A-Za-z0-9_-]{11}',identity):continue
+                single=public.single_source(platform,url)
+                if not single or single['id']!=identity:continue
+                url=single['url']
+            elif platform=='TikTok':
+                if host not in ('www.tiktok.com','tiktok.com') or not re.fullmatch(r'/@[^/]+/(video|photo)/'+re.escape(identity)+r'/?',parsed.path) or not identity.isascii() or not identity.isdigit():continue
+                url='https://www.tiktok.com'+parsed.path.rstrip('/')
+            elif platform=='X':
+                # A post can contain several different media IDs. Keep the
+                # provider's media identity rather than substituting the post ID.
+                if not re.fullmatch(r'[0-9]{1,20}',identity):continue
+                url=public.single_source(platform,url)['url']
+            else:continue
+            if len(identity)>160:continue
+            found.setdefault(identity,dict(item,id=identity,url=url))
+        except (KeyError,ValueError,TypeError,AttributeError,public.Failure):continue
+        if len(found)==10:break
+    return list(found.values())
+
+
+def partial_result(entries, code, evidence='PUBLIC_LINKS_PARTIAL'):
+    return dict(outcome='INCOMPLETE',complete=False,validated=False,entries=entries,
+                errorCode=code,evidence=evidence,scope='LATEST_TEN')
+
+
+def public_check(job):
+    """Find links anonymously; full feed coverage is never a download gate."""
+    # X needs metadata to identify every media item within the same post.
+    single=None if job['platform']=='X' else public.single_source(job['platform'],job['sourceUrl'])
+    direct=valid_public_entries(job['platform'],[single]) if single else []
+    if direct:
+        return partial_result(direct,'DISCOVERY_NOT_CHECKED','DIRECT_VIDEO_LINK')
+    try:
+        result=check(job,{})
+    except public.Failure as error:
+        entries=valid_public_entries(job['platform'],getattr(error,'entries',[]))
+        if not entries:raise
+        result=partial_result(entries,error.code)
+        if error.code=='RATE_LIMITED':result['retryAfterSeconds']=max(1800,public.retry_after(error) or 0)
+        return result
+    entries=valid_public_entries(job['platform'],result.get('entries'))
+    if result.get('outcome')=='SUCCESS' and len(entries)==len(result.get('entries') or []):
+        return dict(result,entries=entries)
+    return partial_result(entries,result.get('errorCode') or 'DISCOVERY_INCOMPLETE')
+
+
+def incomplete(entries, code='DISCOVERY_INCOMPLETE'):
+    error=public.Failure(code);error.entries=entries
+    return error
 
 
 def page_result(entries, *, exhausted, validated, cursor, frontier, limit=PAGE):
@@ -51,14 +122,14 @@ def check(job, credentials):
         first=dict(job,latestTen=False,cursor={},knownVideoIds=[],pageLimit=10)
         page=check(first,credentials)
         if not page.get('validated') or not (len(page.get('entries') or []) >= 10 or page.get('complete')):
-            raise public.Failure('DISCOVERY_INCOMPLETE')
+            raise incomplete(page.get('entries') or [])
         seen=set();latest=[]
         for item in page['entries']:
             if item['id'] not in seen:
                 seen.add(item['id']);latest.append(item)
             if len(latest)==10:break
         if len(latest)<10 and not page.get('complete'):
-            raise public.Failure('DISCOVERY_INCOMPLETE')
+            raise incomplete(latest)
         return dict(outcome='SUCCESS',complete=True,validated=True,entries=latest,
                     evidence='VALIDATED_LATEST_TEN',scope='LATEST_TEN')
     cursor=job.get('cursor') or {}
@@ -79,10 +150,19 @@ def youtube(url,cursor,frontier,credentials,limit=PAGE):
             playliststart=offset+1,playlistend=offset+limit+1,lazy_playlist=True)) as ydl:
         data=ydl.extract_info(url,download=False)
         if not data or data.get('entries') is None:raise public.Failure('EXTRACTION_ERROR')
-        rows=list(itertools.islice(data['entries'],limit+1))
+        rows=[]
+        try:
+            for item in itertools.islice(data['entries'],limit+1):rows.append(item)
+        except Exception as error:
+            entries=[dict(id=row['id'],url='https://www.youtube.com/watch?v='+row['id']) for row in rows
+                     if isinstance(row,dict) and re.fullmatch(r'[A-Za-z0-9_-]{11}',str(row.get('id','')))]
+            raise incomplete(entries,public.classify(error)) from None
     entries=[]
     for item in rows:
-        if not item or not re.fullmatch(r'[\w-]{11}',str(item.get('id',''))):raise public.Failure('EXTRACTION_ERROR')
+        if not item or not re.fullmatch(r'[A-Za-z0-9_-]{11}',str(item.get('id',''))):
+            valid=[dict(id=row['id'],url='https://www.youtube.com/watch?v='+row['id']) for row in rows
+                   if isinstance(row,dict) and re.fullmatch(r'[A-Za-z0-9_-]{11}',str(row.get('id','')))]
+            raise incomplete(valid,'EXTRACTION_ERROR')
         entries.append(dict(id=item['id'],url='https://www.youtube.com/watch?v='+item['id']))
     # The extra row is a lookahead and is fetched again on the next page.
     return page_result(entries[:limit],exhausted=len(rows)<=limit,validated=bool(data.get('id')),
@@ -104,9 +184,9 @@ def facebook(url,cursor,frontier,credentials,limit=PAGE):
     data=json.loads(lines[-1].split(' ',1)[1])
     if data.get('errorCode'):
         failure=public.Failure(data['errorCode']);failure.entries=data.get('entries') or [];raise failure
-    if not data.get('validated') or not isinstance(data.get('cursor'),dict):raise public.Failure('DISCOVERY_INCOMPLETE')
+    if not data.get('validated') or not isinstance(data.get('cursor'),dict):raise incomplete(data.get('entries') or [])
     entries=data.get('entries') or []
-    if any(not str(entry.get('id','')).isdigit() for entry in entries):raise public.Failure('EXTRACTION_ERROR')
+    if any(not isinstance(entry,dict) or not str(entry.get('id','')).isdigit() for entry in entries):raise incomplete(entries,'EXTRACTION_ERROR')
     return page_result(entries[:limit],exhausted=bool(data.get('sourceExhausted')) and len(entries)<=limit,
         validated=True,cursor=dict(facebook=data['cursor'],buffer=entries[limit:],sourceExhausted=bool(data.get('sourceExhausted'))),frontier=set(),limit=limit)
 

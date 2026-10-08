@@ -133,7 +133,7 @@ def supervise():
                         limit = 2 if platform == 'Facebook' else 1
                         if stage != 'MEDIA' and sum(x[3]==region and x[4]==platform and x[5]!='MEDIA' for x in active)>=limit: continue
                         cooldown = root/'tenants'/region/'public-cooldown'/(platform+'.json')
-                        if stage!='MEDIA' and cooldown.exists() and json.loads(cooldown.read_text()).get('until',0)>time.time(): continue
+                        if stage!='MEDIA' and platform_cooling_down(cooldown,state.get('windowedMode',False)): continue
                         if stage=='DOWNLOAD':
                             import shutil
                             if not os.getenv('HM_EPHEMERAL_MEDIA_ROOT') and shutil.disk_usage(config['mediaRoot']).free < int(os.getenv('HM_MIN_FREE_DISK_BYTES',str(20*1024**3))): continue
@@ -247,6 +247,14 @@ def execute_stage(job_file):
 
 
 
+def platform_cooling_down(path, windowed):
+    if not path.exists():return False
+    saved=json.loads(path.read_text())
+    # Legacy rate-limit receipts have no reasonCode. A single video's challenge
+    # must not pause every other public video or source on that platform.
+    return saved.get('until',0)>time.time() and (not windowed or saved.get('reasonCode') in (None,'RATE_LIMITED'))
+
+
 def _execute_stage(job_file):
     import hm_public_capture as public
     job_file=Path(job_file);job=json.loads(job_file.read_text());config=dict(runner.tenant_config(job));config['legacyMediaRoot']=config.get('mediaRoot')
@@ -255,7 +263,7 @@ def _execute_stage(job_file):
     phase=job['stage']
     try:
         if job['stage']=='CHECK':
-            from hm_pipeline_discovery import check
+            from hm_pipeline_discovery import check, public_check
             def discover(credentials):
                 try:return check(job,credentials)
                 except public.Failure as error:
@@ -263,7 +271,18 @@ def _execute_stage(job_file):
                     # wall. Keep them, but never convert that attempt to coverage.
                     if getattr(error,'entries',None):result['entries']=error.entries
                     raise
-            result.update(public.attempt(discover,config,job['platform'],attempts,'DISCOVERY'))
+            if job.get('windowedMode'):
+                attempt={'stage':'DISCOVERY','mode':'PUBLIC'};attempts.append(attempt)
+                try:
+                    discovered=public_check(job)
+                except Exception as error:
+                    attempt.update(result='FAILED',reasonCode=public.classify(error))
+                    raise
+                attempt.update(result='PASSED' if discovered['outcome']=='SUCCESS' else 'PARTIAL')
+                if discovered.get('errorCode'):attempt['reasonCode']=discovered['errorCode']
+                result.update(discovered)
+            else:
+                result.update(public.attempt(discover,config,job['platform'],attempts,'DISCOVERY'))
         elif job.get('legacyAdopt'):
             phase='REVIEW_STORAGE'
             result.update(outcome='SUCCESS',video=adopt_legacy_original(job,config))
@@ -366,6 +385,9 @@ def _execute_stage(job_file):
                     video['deliveryPaths']=paths
                 atomic_json(saved,video);result.update(outcome='SUCCESS',video=video)
         result['attempts']=attempts
+        if job.get('windowedMode') and result.get('errorCode')=='RATE_LIMITED':
+            cooldown=Path(os.environ['HM_SERVER_STATE_DIR'])/'public-cooldown'/(job['platform']+'.json')
+            atomic_json(cooldown,{'until':time.time()+max(1800,result.get('retryAfterSeconds',0)),'reasonCode':'RATE_LIMITED'})
     except Exception as error:
         if job.get('windowedMode') and job['stage']=='DOWNLOAD' and not os.getenv('HM_JOB_MEDIA_ROOT'):
             cleanup_pipeline_media(directory,saved)
@@ -377,7 +399,7 @@ def _execute_stage(job_file):
             result['failureStage']='VALIDATION' if code=='VIDEO_TRACK_MISSING' else phase
         delay=max(1800,public.retry_after(error) or 0)
         if code=='RATE_LIMITED':result['retryAfterSeconds']=delay
-        if code in public.STOP:
+        if code in public.STOP and (not job.get('windowedMode') or code=='RATE_LIMITED'):
             cooldown=Path(os.environ['HM_SERVER_STATE_DIR'])/'public-cooldown'/(job['platform']+'.json')
             atomic_json(cooldown,{'until':time.time()+delay,'reasonCode':code})
     atomic_json(result_file(job_file),result)

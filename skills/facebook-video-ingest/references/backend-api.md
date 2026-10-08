@@ -2,6 +2,16 @@
 
 Use this reference when changing the Worker/backend protocol or diagnosing a rejected callback. The backend wraps successful data as `{"code": 200, "message": "success", "data": ...}`.
 
+## 窗口模式的匿名发现与独立下载
+
+`windowedMode=true` 的 CHECK 仅匿名发现链接，不把账号登录和完整主页检查作为下载前提。已确定平台视频标识的 Facebook、YouTube、TikTok 单条地址直接返回 `DIRECT_VIDEO_LINK`；X 继续解析同帖多个媒体标识。
+
+主页未完整验证时返回 `outcome=INCOMPLETE`、`complete=false`、`validated=false`、`entries` 和原始 `errorCode`。有效条目最多十个并按平台视频标识去重，后端仍应接收这些链接；不能因此更新完整覆盖时间。完整最新十条及可靠的空列表继续使用 `VALIDATED_LATEST_TEN`。
+
+DOWNLOAD 各自先匿名尝试，只有实际需要登录的单条视频才尝试已有授权会话。单条失败不能阻塞整个博主、取消兄弟视频或产生整个平台的验证码冷却；真正的 `RATE_LIMITED` 继续保留冷却。无证据的历史失败不应改为成功或自动反复下载。
+
+本地旧模式保留原续页和账号协议。兼容发布先更新支持部分发现的后端，再更新 Worker，不能先让新 Worker 对旧后端提交部分结果。
+
 ## Authentication
 
 Send `X-HM-Worker-Token` on every internal request. Send `X-HM-Worker-Id` on the per-video endpoint. The token is environment-only and must never be logged.
