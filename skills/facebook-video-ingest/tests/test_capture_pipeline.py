@@ -68,6 +68,22 @@ class PipelineTests(unittest.TestCase):
             finally:
                 for lock in held:lock.close()
 
+    def test_continuous_blogger_checks_do_not_starve_imports_with_one_free_discovery_slot(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ,{'HM_CAPTURE_SLOTS':'8'}):
+            root=Path(temp);_,first=pipeline.stage_lock(root,'CHECK');_,occupied=pipeline.stage_lock(root,'CHECK');first.close()
+            turn=pipeline.DiscoveryTurn();started=[]
+            try:
+                for _ in range(8):
+                    running=[]
+                    for stage in turn.stages():
+                        if stage not in ('CHECK','X_IMPORT'):continue
+                        _,lock=pipeline.stage_lock(root,stage)
+                        if lock:
+                            running.append(lock);started.append(stage);turn.started(stage)
+                    for lock in running:lock.close()
+                self.assertEqual(['CHECK','X_IMPORT']*4,started)
+            finally:occupied.close()
+
     def test_truncated_and_stalled_discovery_is_not_success(self):
         rows=[{'id':str(i)} for i in range(50)]
         result=discovery.page_result(rows,exhausted=False,validated=True,cursor={'offset':50},frontier=set())

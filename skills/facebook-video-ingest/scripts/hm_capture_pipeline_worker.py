@@ -64,6 +64,17 @@ class Rotation:
                 yield region, platform
 
 
+class DiscoveryTurn:
+    """Share discovery slots fairly even while blogger checks stay busy."""
+    def __init__(self):self.preferred='CHECK'
+    def stages(self):
+        other='X_IMPORT' if self.preferred=='CHECK' else 'CHECK'
+        return (self.preferred,'DOWNLOAD',other,'MEDIA')
+    def started(self,stage):
+        if stage in ('CHECK','X_IMPORT'):
+            self.preferred='X_IMPORT' if stage=='CHECK' else 'CHECK'
+
+
 def slots(stage):
     total = min(8, max(1, int(os.getenv('HM_CAPTURE_SLOTS', '8'))))
     checks = min(2, total)
@@ -98,6 +109,7 @@ def supervise():
     os.environ['HM_SERVER_STATE_DIR'] = str(root)
     configs = json.loads(Path(os.environ['HM_TENANT_CONFIG']).read_text())
     rotations = {stage:Rotation([r for r in REGIONS if r in configs]) for stage in ('CHECK','DOWNLOAD','X_IMPORT','MEDIA')}
+    discovery_turn=DiscoveryTurn()
     active = []; stopping = False; states={};checked_at=0
     def stop(*_):
         nonlocal stopping
@@ -117,7 +129,8 @@ def supervise():
                     held.close(); log.close(); active.remove(item)
             if stopping:
                 time.sleep(.5); continue
-            for stage, rotation in rotations.items():
+            for stage in discovery_turn.stages():
+                rotation=rotations[stage]
                 slot, held = stage_lock(root, stage)
                 if held is None: continue
                 try:
@@ -163,6 +176,7 @@ def supervise():
                         child = subprocess.Popen([sys.executable,__file__,'job',str(spec)], env=environment,
                             stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=True,pass_fds=tuple(inherited))
                         active.append((child,held,log,region,platform,stage));held=None
+                        discovery_turn.started(stage)
                         break
                 finally:
                     if held: held.close()
