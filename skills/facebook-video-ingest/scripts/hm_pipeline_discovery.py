@@ -21,6 +21,12 @@ def page_result(entries, *, exhausted, validated, cursor, frontier, limit=PAGE):
 
 
 def check(job, credentials):
+    if job['platform']=='X':
+        from hm_x_capture import discover
+        entries=discover(job['sourceUrl'],10)
+        return dict(outcome='SUCCESS',complete=True,validated=True,entries=entries,
+            evidence='VALIDATED_LATEST_TEN' if job.get('latestTen') else 'SINGLE_VIDEO_METADATA',
+            scope='LATEST_TEN' if job.get('latestTen') else 'HISTORY')
     single=public.single_source(job['platform'],job['sourceUrl'])
     if single:
         # Metadata inspection confirms accessibility; a syntactically valid URL alone isn't a check.

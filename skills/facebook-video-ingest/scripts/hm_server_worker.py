@@ -27,7 +27,7 @@ def validate_spec(spec: dict) -> dict:
             raise ValueError("Invalid execution tenant")
         result["tenant"] = tenant
     platform=spec.get("platform", "Facebook")
-    if platform not in {"Facebook","YouTube","TikTok"}:raise ValueError("Invalid capture platform")
+    if platform not in {"Facebook","YouTube","TikTok","X"}:raise ValueError("Invalid capture platform")
     if platform=="YouTube" and (not tenant or result["kind"]!="CAPTURE" or not (tenant_config(result).get("googleAccount") or tenant_config(result).get("capturePolicy")=="PUBLIC_FIRST")):
         raise ValueError("YouTube is not enabled for this tenant")
     policy=tenant_config(result).get("capturePolicy","ACCOUNT_REQUIRED") if tenant else "ACCOUNT_REQUIRED"
@@ -36,8 +36,8 @@ def validate_spec(spec: dict) -> dict:
     enabled=tenant_config(result).get("enabledPlatforms") if tenant else None
     if enabled is not None and result["kind"]=="CAPTURE" and platform not in enabled:
         raise ValueError("Capture platform is disabled for this tenant")
-    if platform=="TikTok" and (not tenant or result["kind"]!="CAPTURE" or policy!="PUBLIC_FIRST" or not enabled or platform not in enabled):
-        raise ValueError("TikTok is not enabled for this tenant")
+    if platform in {"TikTok","X"} and (not tenant or result["kind"]!="CAPTURE" or policy!="PUBLIC_FIRST" or not enabled or platform not in enabled):
+        raise ValueError(platform+" is not enabled for this tenant")
     result["capturePolicy"]=policy
     result["platform"]=platform
     if os.getenv("HM_TENANT_CONFIG"):
@@ -223,8 +223,8 @@ def run(spec: dict) -> int:
             account_lock.close()
             raise
     platform_lock=None
-    if spec.get("platform")=="TikTok" and spec["kind"]=="CAPTURE":
-        platform_lock=lock_file(execution_root / "locks" / "platform-TikTok.lock")
+    if spec.get("platform") in {"TikTok","X"} and spec["kind"]=="CAPTURE":
+        platform_lock=lock_file(execution_root / "locks" / ("platform-"+spec["platform"]+".lock"))
         if platform_lock is None:
             os.environ.update(worker_environment(spec));status(spec,"RETRY");return 0
     slots = [spec["slot"]]

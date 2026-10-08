@@ -18,7 +18,7 @@ import urllib.request
 import hm_server_worker as runner
 
 REGIONS = ('ph', 'th', 'vn', 'id')
-PLATFORMS = ('Facebook', 'YouTube', 'TikTok')
+PLATFORMS = ('Facebook', 'YouTube', 'TikTok', 'X')
 PREFIX = '/api/internal/capture/pipeline'
 
 

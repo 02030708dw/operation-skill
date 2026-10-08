@@ -112,7 +112,7 @@ def clean_environment(env):
 
 @contextlib.contextmanager
 def authenticated_session(config,platform):
-    if platform=='TikTok': raise Failure('ACCOUNT_NOT_CONFIGURED')
+    if platform in ('TikTok','X'): raise Failure('ACCOUNT_NOT_CONFIGURED')
     provider=google if platform=='YouTube' else facebook
     account=provider.account_config(config)
     if not account: raise Failure('ACCOUNT_NOT_CONFIGURED')
@@ -133,14 +133,14 @@ def authenticated_session(config,platform):
 
 
 def saved_session_available(config,platform):
-    if platform=='TikTok': return False
+    if platform in ('TikTok','X'): return False
     provider=google if platform=='YouTube' else facebook
     account=provider.account_config(config)
     return bool(account and provider.read_state(account).get('state') in ('AVAILABLE','LOGGED_IN'))
 
 
 def account_outcome(config,platform,code):
-    if platform=='TikTok': return
+    if platform in ('TikTok','X'): return
     provider=google if platform=='YouTube' else facebook
     if not provider.account_config(config):return
     prefix='GOOGLE_' if platform=='YouTube' else 'FACEBOOK_'
@@ -214,6 +214,9 @@ def common_options(credentials):
 
 
 def single_source(platform,url):
+    if platform=='X':
+        from hm_x_capture import source
+        return source(url)
     if platform=='TikTok':
         from hm_tiktok_capture import source
         value=source(url)
@@ -231,6 +234,9 @@ def single_source(platform,url):
 
 
 def discover(platform,url,limit,credentials):
+    if platform=='X':
+        from hm_x_capture import discover as discover_x
+        return discover_x(url,limit)
     if platform=='TikTok':
         from hm_tiktok_capture import discover as discover_tiktok
         return discover_tiktok(url,limit)
@@ -256,6 +262,10 @@ def download_item(platform,item,output,credentials):
     if platform=='TikTok':
         from hm_tiktok_capture import download
         return download(item,output)
+    if platform=='X':
+        from hm_x_capture import source
+        item=dict(item,url=source(item['url'])['url'])
+        credentials={}
     import yt_dlp
     from yt_dlp.postprocessor.common import PostProcessor
     captured=[]
@@ -275,6 +285,9 @@ def download_item(platform,item,output,credentials):
     with yt_dlp.YoutubeDL(options) as ydl:
         ydl.add_post_processor(CaptureFile(ydl),when='after_move')
         info=ydl.extract_info(item['url'],download=False)
+        if platform=='X':
+            from hm_x_capture import select_info
+            info=select_info(info,item['id'])
         if (info.get('duration') or 0)>1200:return dict(item,status='filtered-duration')
         workspace.reserve_input(info.get('filesize') or info.get('filesize_approx') or sum(f.get('filesize') or f.get('filesize_approx') or 0 for f in info.get('requested_formats',[])))
         ydl.process_ie_result(info,download=True)
@@ -290,13 +303,13 @@ def run_download(platform,url,limit,output,report_path,config,on_item=lambda *_:
     entries=report.get('entries')
     if entries is None:
         try:
-            single=single_source(platform,url)
+            single=None if platform=='X' else single_source(platform,url)
             entries=[single] if single else attempt(lambda c:discover(platform,url,limit,c),config,platform,report['attempts'],'DISCOVERY')
             report.update(entries=entries,discovered=len(entries),discovery=getattr(entries,'discovery',{}));save(report_path,report)
         except Exception as error:
             report['errorCode']=classify(error);entries=[]
     legacy_ids=set()
-    archives=[] if platform=='TikTok' else [output/'.download-archive.txt'] if platform=='YouTube' else list(output.parent.rglob('.yt-dlp-archive.txt'))
+    archives=[] if platform in ('TikTok','X') else [output/'.download-archive.txt'] if platform=='YouTube' else list(output.parent.rglob('.yt-dlp-archive.txt'))
     prefix='youtube ' if platform=='YouTube' else 'facebook '
     for archive in archives:
         if archive.is_file():legacy_ids.update(line[len(prefix):].strip() for line in archive.read_text().splitlines() if line.startswith(prefix))
