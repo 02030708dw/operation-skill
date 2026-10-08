@@ -274,7 +274,8 @@ def download_item(platform,item,output,credentials):
         def run(self,info):
             path=Path(info['filepath'])
             if not path.is_file() or path.stat().st_size==0:raise Failure('DOWNLOAD_FAILED')
-            captured.append(dict(id=str(info['id']),url=item['url'],title=info.get('title') or str(info['id']),
+            captured.append(dict(id=str(info['id']),url=item['url'],title=(info.get('description') or item.get('title') or info.get('title') or '未获取标题') if platform=='X' else info.get('title') or str(info['id']),
+                sourceName=info.get('uploader') or item.get('sourceName') or info.get('uploader_id'),sourceHandle=info.get('uploader_id') or item.get('sourceHandle'),
                 upload_date=info.get('upload_date'),duration=info.get('duration'),path=str(path),bytes=path.stat().st_size,expectAudio=info.get('acodec') not in (None,'none')))
             return [],info
     options=dict(common_options(credentials),noplaylist=True,continuedl=True,overwrites=False,

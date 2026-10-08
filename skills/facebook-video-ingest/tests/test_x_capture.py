@@ -79,6 +79,19 @@ class XCaptureTests(unittest.TestCase):
         self.assertEqual(rows[1], x.select_info({'_type': 'playlist', 'entries': rows}, '789'))
         with self.assertRaises(public.Failure): x.select_info(rows[0], '789')
 
+    def test_explicit_video_selector_and_original_author_metadata(self):
+        rows=[dict(id=str(i),formats=[{'url':'https://video.twimg.com/video.mp4'}]) for i in (456,789)]
+        ydl=Mock();ydl.__enter__=Mock(return_value=ydl);ydl.__exit__=Mock(return_value=False)
+        ydl.extract_info.return_value=dict(_type='playlist',entries=rows,uploader='Mina 美女',uploader_id='Creator',description='原帖标题 🌅')
+        with patch('yt_dlp.YoutubeDL',return_value=ydl) as factory:
+            result=x.discover('https://x.com/Creator/status/123/video/2',10)
+            self.assertEqual(['789'],[row['id'] for row in result])
+            self.assertEqual('Mina 美女',result[0]['sourceName']);self.assertEqual('原帖标题 🌅',result[0]['title'])
+            self.assertEqual('https://x.com/Creator/status/123/video/2',result[0]['url'])
+            ydl.extract_info.assert_called_with('https://x.com/Creator/status/123',download=False)
+            self.assertNotIn('cookiefile',factory.call_args.args[0])
+            with self.assertRaises(public.Failure):x.discover('https://x.com/Creator/status/123/video/3',10)
+
     def test_does_not_treat_external_links_empty_posts_or_live_streams_as_native_video(self):
         for info in ({'id': 'youtube-id', 'formats': [{}]}, {'id': '123'},
                      {'_type': 'playlist', 'entries': []},

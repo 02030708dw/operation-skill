@@ -123,10 +123,21 @@ def discover(url, limit, profile=None):
     post = source(url)
     if post.get('kind')=='profile':return discover_profile(url,limit,profile)
     with yt_dlp.YoutubeDL(dict(public.common_options({}), skip_download=True, noplaylist=True)) as ydl:
-        info = ydl.extract_info(post['url'], download=False)
+        info = ydl.extract_info(re.sub(r'/video/[0-9]+$', '', post['url']), download=False)
     if not info:
         raise public.Failure('EXTRACTION_ERROR')
     rows = videos(info)
+    selector=re.search(r'/video/([0-9]+)$',post['url'])
+    if selector:
+        index=int(selector[1])-1
+        if index>=len(rows):raise public.Failure('UNSUPPORTED_CONTENT')
+        rows=[rows[index]]
     if len(rows) > limit:
         raise public.Failure('DISCOVERY_INCOMPLETE')
-    return list({str(row['id']): {'id': str(row['id']), 'url': post['url']} for row in rows}.values())
+    result={}
+    for row in rows:
+        handle=row.get('uploader_id') or info.get('uploader_id') or post['url'].split('/')[3]
+        if handle in ('i','web'):handle=None
+        title=row.get('description') or info.get('description') or row.get('title') or info.get('title')
+        result[str(row['id'])]=dict(id=str(row['id']),url=post['url'],sourceName=row.get('uploader') or info.get('uploader') or handle,sourceHandle=handle,title=title or '未获取标题',titleSource='POST_TEXT' if title else 'NONE',titleStatus='AVAILABLE' if title else 'NO_TEXT')
+    return list(result.values())

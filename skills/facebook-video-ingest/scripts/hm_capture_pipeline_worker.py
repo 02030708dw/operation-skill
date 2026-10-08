@@ -67,7 +67,7 @@ class Rotation:
 def slots(stage):
     total = min(8, max(1, int(os.getenv('HM_CAPTURE_SLOTS', '8'))))
     checks = min(2, total)
-    return range(1, checks+1) if stage == 'CHECK' else range(checks+1, total+1)
+    return range(1, checks+1) if stage in ('CHECK','X_IMPORT') else range(checks+1, total+1)
 
 
 def stage_lock(root, stage):
@@ -97,7 +97,7 @@ def supervise():
     root = Path(os.environ['HM_PIPELINE_GLOBAL_ROOT'])
     os.environ['HM_SERVER_STATE_DIR'] = str(root)
     configs = json.loads(Path(os.environ['HM_TENANT_CONFIG']).read_text())
-    rotations = {stage:Rotation([r for r in REGIONS if r in configs]) for stage in ('CHECK','DOWNLOAD','MEDIA')}
+    rotations = {stage:Rotation([r for r in REGIONS if r in configs]) for stage in ('CHECK','DOWNLOAD','X_IMPORT','MEDIA')}
     active = []; stopping = False; states={};checked_at=0
     def stop(*_):
         nonlocal stopping
@@ -124,7 +124,7 @@ def supervise():
                     for region, platform in rotation.candidates():
                         config = configs[region]
                         state=states.get(region)
-                        if not state or not state['enabled'] or state.get('pauseClaims') or (stage=='CHECK' and not state['acceptNew']):continue
+                        if not state or not state['enabled'] or state.get('pauseClaims') or (stage in ('CHECK','X_IMPORT') and not state['acceptNew']):continue
                         if platform not in config.get('enabledPlatforms', ['Facebook']): continue
                         ready=[r for r in state.get('ready',[]) if r['stage']==stage and r['platform']==platform]
                         if 'ready' in state and not any(r['count']>0 for r in ready):continue
@@ -232,7 +232,7 @@ def execute_stage(job_file):
     import hm_media_workspace as workspace
     enabled=bool(os.getenv('HM_EPHEMERAL_MEDIA_ROOT'))
     job_data=json.loads(Path(job_file).read_text()) if enabled else {}
-    required=64*1024**2 if job_data.get('stage')=='CHECK' else max(512*1024**2,int(job_data.get('download',{}).get('fileSize',0))*3+64*1024**2)
+    required=64*1024**2 if job_data.get('stage') in ('CHECK','X_IMPORT') else max(512*1024**2,int(job_data.get('download',{}).get('fileSize',0))*3+64*1024**2)
     admission=workspace.job(job_data['tenant'],job_data['jobNo'],required) if enabled else contextlib.nullcontext()
     try:
         with admission, tempfile.TemporaryDirectory(prefix='hp-', dir=workspace.temporary_root()) as temporary:
@@ -262,7 +262,13 @@ def _execute_stage(job_file):
     attempts=[];result={'leaseVersion':job['leaseVersion']}
     phase=job['stage']
     try:
-        if job['stage']=='CHECK':
+        if job['stage']=='X_IMPORT':
+            from hm_x_capture import discover as discover_post
+            attempt={'stage':'DISCOVERY','mode':'PUBLIC'};attempts.append(attempt)
+            entries=discover_post(job['sourceUrl'],10)
+            attempt['result']='PASSED'
+            result.update(outcome='SUCCESS',complete=True,validated=True,entries=entries)
+        elif job['stage']=='CHECK':
             from hm_pipeline_discovery import check, public_check
             def discover(credentials):
                 try:return check(job,credentials)
@@ -354,7 +360,10 @@ def _execute_stage(job_file):
                     path=Path(item['path']).resolve(strict=True)
                     if not path.is_relative_to(Path(config['mediaRoot']).resolve()):raise ValueError('REGION_PATH_INVALID')
                     video=dict(originalUrl=job['entry']['url'],canonicalUrl=job['entry']['url'],
-                        platformVideoId=job['entry']['id'],title=backend_title(item.get('title') or job['entry']['id']),
+                        platformVideoId=job['entry']['id'],title=backend_title(item.get('title') or job['entry'].get('title') or job['entry']['id']),
+                        sourceName=(item.get('sourceName') or job['entry'].get('sourceName') or '').encode('utf-16-le')[:240].decode('utf-16-le','ignore') or None,
+                        sourceHandle=item.get('sourceHandle') or job['entry'].get('sourceHandle'),
+                        titleSource=job['entry'].get('titleSource','ORIGINAL'),titleStatus=job['entry'].get('titleStatus','AVAILABLE'),
                         localPath=str(path),fileName=path.name,fileSize=path.stat().st_size,fileSha256=digest(path),
                         durationSeconds=int(item.get('duration') or 0),expectAudio=bool(item.get('expectAudio')),attempts=attempts)
             elif video is None:
