@@ -236,7 +236,7 @@ def process_one(args, backend, token, worker_id, pipeline, lane=None):
     root = args.state_dir/'media-compat-jobs'; root.mkdir(parents=True, exist_ok=True)
     def call(suffix, value):
         return pipeline.api_call(backend, token, 'POST', '/api/internal/capture/media-compat/'+suffix,
-            {'workerId': worker_id, **value}, retry_transient=True)
+            {'workerId': worker_id, **value}, retry_transient=not suffix.endswith('/check'))
     def deliver(path, saved):
         try:
             ack = call(saved['jobNo']+'/complete', saved['receipt'])
@@ -314,7 +314,13 @@ def process_one(args, backend, token, worker_id, pipeline, lane=None):
             failure=workspace.storage_failure(exc) or exc
             code = str(failure) if isinstance(failure, (JobFailure, media.CompatibilityError, storage.StorageFailure, workspace.WorkspaceFailure)) else 'MEDIA_COMPAT_IO_FAILED'
             retryable = getattr(failure, 'retryable', not isinstance(failure, (JobFailure, media.CompatibilityError)))
-            receipt.update(status='FAILED', errorCode=code, retryable=retryable)
+            # A child that imported the old normalizer immediately before the
+            # atomic script swap must still be able to report its failure.
+            diagnostic = (media.failure_diagnostic(exc) if hasattr(media, 'failure_diagnostic') else
+                          dict(stage='MEDIA', kind='UNEXPECTED_EXCEPTION', errorType=type(exc).__name__[:64]))
+            receipt.update(status='FAILED', errorCode=code, retryable=retryable, diagnostic=diagnostic)
+            print(json.dumps(dict(event='media_job_failed', region=job.get('region'), jobNo=job['jobNo'],
+                                  lane=lane, errorCode=code, diagnostic=diagnostic)), flush=True)
         path = root/(job['jobNo']+'-a'+str(job['executionVersion'])+'.json')
         with journal_lock(root):
             saved={'jobNo': job['jobNo'], 'workerId': worker_id, 'receipt': receipt, 'job': job}

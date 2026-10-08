@@ -7,11 +7,14 @@ import json
 import os
 from pathlib import Path
 import threading
+import time
 from urllib.parse import quote
 
 
 class StorageFailure(RuntimeError):
-    pass
+    def __init__(self, code):
+        super().__init__(code)
+        self.retryable = code not in {"LEASE_CANCELLED", "SOURCE_CHANGED", "REFERENCE_UNAVAILABLE"}
 
 
 def configuration(region: str) -> dict:
@@ -84,28 +87,60 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+class LeaseHeartbeat:
+    """Tolerate brief transport failures, never work past the confirmed lease."""
+    def __init__(self, check, clock=time.monotonic, max_failures=3, max_silence=90):
+        self.check, self.clock = check, clock
+        self.max_failures, self.max_silence = max_failures, max_silence
+        self.last_confirmed = clock()
+        self.confirmed, self.failures, self.reason = False, 0, None
+
+    def poll(self):
+        try:
+            result = self.check()
+            if not isinstance(result, dict) or not isinstance(result.get("active"), bool):
+                raise ValueError("invalid heartbeat response")
+            if not result["active"]:
+                reason = result.get("reason")
+                self.reason = reason if reason in {"SOURCE_CHANGED", "REFERENCE_UNAVAILABLE"} else "LEASE_CANCELLED"
+                return
+            self.last_confirmed, self.confirmed, self.failures = self.clock(), True, 0
+        except Exception as error:
+            self.failures += 1
+            if getattr(error, "retryable", True) is False:
+                self.reason = "LEASE_CANCELLED"
+            elif self.failures >= self.max_failures:
+                self.reason = "LEASE_HEARTBEAT_LOST"
+
+    def guard(self, *_):
+        if self.reason:
+            raise StorageFailure(self.reason)
+        # The backend lease lasts 120 seconds. Leave 30 seconds for an
+        # in-flight heartbeat and callback, even if that request is blocked.
+        if self.clock() - self.last_confirmed >= self.max_silence:
+            raise StorageFailure("LEASE_HEARTBEAT_LOST")
+
+
 @contextlib.contextmanager
 def lease(check):
-    stopped, cancelled = threading.Event(), threading.Event()
+    stopped = threading.Event()
+    monitor = LeaseHeartbeat(check)
+    monitor.poll()
+    while not monitor.confirmed:
+        monitor.guard()
+        stopped.wait(2)
+        monitor.poll()
+    monitor.guard()
     def heartbeat():
         while not stopped.wait(15):
-            try:
-                if not check().get("active"):
-                    cancelled.set()
-            except Exception:
-                cancelled.set()
-    def guard(*_):
-        if cancelled.is_set():
-            raise StorageFailure("LEASE_CANCELLED")
-    if not check().get("active"):
-        raise StorageFailure("LEASE_CANCELLED")
+            monitor.poll()
     thread = threading.Thread(target=heartbeat, daemon=True)
     thread.start()
     try:
-        yield guard
+        yield monitor.guard
     finally:
         stopped.set()
-        thread.join(timeout=35)
+        thread.join(timeout=1)
 
 
 def execute(job: dict, args, pipeline, guard):
@@ -175,7 +210,7 @@ def process_one(args, backend: str, token: str, worker_id: str, pipeline) -> boo
         return False
     root = args.state_dir / "review-storage"
     def call(suffix, payload):
-        return pipeline.api_call(backend, token, "POST", "/api/internal/capture/review-storage/" + suffix, {"workerId": worker_id, **payload}, retry_transient=True)
+        return pipeline.api_call(backend, token, "POST", "/api/internal/capture/review-storage/" + suffix, {"workerId": worker_id, **payload}, retry_transient=not suffix.endswith('/check'))
     # Replay committed results before claiming new work. Files remain untouched until a separate cleanup claim.
     for journal in sorted(root.glob("*.json")):
         value = json.loads(journal.read_text())

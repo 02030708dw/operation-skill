@@ -11,6 +11,44 @@ sys.path.insert(0,str(SCRIPTS))
 import hm_review_storage as storage
 
 class ReviewStorageTest(unittest.TestCase):
+    def test_heartbeat_tolerates_two_transient_failures_and_resets_on_success(self):
+        responses=iter([{'active':True},TimeoutError(),ConnectionError(),{'active':True},TimeoutError()])
+        now=[0]
+        def check():
+            value=next(responses)
+            if isinstance(value,Exception):raise value
+            return value
+        monitor=storage.LeaseHeartbeat(check,clock=lambda:now[0])
+        for at in (0,15,30,45,60):
+            now[0]=at;monitor.poll();monitor.guard()
+        self.assertEqual(monitor.failures,1)
+        self.assertEqual(monitor.last_confirmed,45)
+
+    def test_three_failed_heartbeats_stop_processing_with_distinct_reason(self):
+        monitor=storage.LeaseHeartbeat(lambda:(_ for _ in ()).throw(TimeoutError()))
+        for _ in range(3):monitor.poll()
+        with self.assertRaisesRegex(storage.StorageFailure,'^LEASE_HEARTBEAT_LOST$'):monitor.guard()
+
+    def test_blocked_heartbeat_cannot_extend_confirmed_lease(self):
+        now=[0];monitor=storage.LeaseHeartbeat(lambda:{'active':True},clock=lambda:now[0])
+        monitor.poll();now[0]=89;monitor.guard();now[0]=90
+        with self.assertRaisesRegex(storage.StorageFailure,'^LEASE_HEARTBEAT_LOST$'):monitor.guard()
+
+    def test_explicit_source_change_and_auth_rejection_stop_immediately(self):
+        monitor=storage.LeaseHeartbeat(lambda:{'active':False,'reason':'SOURCE_CHANGED'})
+        monitor.poll()
+        with self.assertRaisesRegex(storage.StorageFailure,'^SOURCE_CHANGED$'):monitor.guard()
+        class Rejected(Exception):retryable=False
+        def check():raise Rejected()
+        monitor=storage.LeaseHeartbeat(check);monitor.poll()
+        with self.assertRaisesRegex(storage.StorageFailure,'^LEASE_CANCELLED$'):monitor.guard()
+
+    def test_invalid_heartbeat_response_is_bounded_not_confirmation(self):
+        monitor=storage.LeaseHeartbeat(lambda:{'active':'true'})
+        for _ in range(3):monitor.poll()
+        self.assertFalse(monitor.confirmed)
+        with self.assertRaisesRegex(storage.StorageFailure,'^LEASE_HEARTBEAT_LOST$'):monitor.guard()
+
     def test_copy_does_not_overwrite_a_racing_destination(self):
         params={"headers":{"x-amz-copy-source":"bucket/review/PH/source"}}
         storage.protect_copy_destination(params)

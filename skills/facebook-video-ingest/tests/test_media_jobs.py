@@ -123,6 +123,27 @@ class MediaJobsTest(unittest.TestCase):
                 jobs.execute(self.job,self.args,self.pipeline,lambda:None,'CONVERT')
         refetch.assert_not_called()
         self.assertEqual(self.s3.writes,0)
+    def test_failed_conversion_delivers_safe_diagnostic_and_releases_lane(self):
+        calls=[];kwargs=[]
+        def api(_backend,_token,_method,path,body,**options):
+            calls.append((path,body));kwargs.append((path,options))
+            if path.endswith('/claim'):return self.job
+            if path.endswith('/check'):return {'active':True}
+            return {'acknowledged':True}
+        pipeline=SimpleNamespace(api_call=api,BackendError=RuntimeError)
+        error=media.CompatibilityError('TRANSCODE_PROCESS_FAILED',{'stage':'TRANSCODE','kind':'INPUT_CORRUPT','errorType':'CalledProcessError','exitCode':1})
+        output=io.StringIO()
+        with mock.patch.dict(os.environ,{'HM_REVIEW_KEY_FILE':'configured','HM_TENANT_CONFIG':'',
+                'HM_MEDIA_JOB_LOCK':str(self.base/'jobs.lock')}), \
+                mock.patch.object(jobs.capacity,'slot',return_value=contextlib.nullcontext(object())), \
+                mock.patch.object(jobs,'execute',side_effect=error), contextlib.redirect_stdout(output):
+            self.assertTrue(jobs.process_one(self.args,'backend','PRIVATE_TOKEN','worker',pipeline,'CONVERT'))
+        receipt=next(body for path,body in calls if path.endswith('/complete'))
+        self.assertEqual(receipt['errorCode'],'TRANSCODE_PROCESS_FAILED')
+        self.assertEqual(receipt['diagnostic']['kind'],'INPUT_CORRUPT')
+        self.assertFalse(next(options for path,options in kwargs if path.endswith('/check'))['retry_transient'])
+        self.assertNotIn('PRIVATE_TOKEN',output.getvalue())
+        self.assertFalse(list((self.base/'media-compat-jobs').glob('*.json')))
     def test_changed_source_and_cross_region_are_rejected(self):
         self.job['sourceETag']='wrong'
         with self.assertRaises(jobs.JobFailure):jobs.execute(self.job,self.args,self.pipeline,lambda:None)

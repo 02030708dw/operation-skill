@@ -13,6 +13,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import hm_media_compat as media
 
 
+class MediaDiagnosticTest(unittest.TestCase):
+    def test_process_failure_is_classified_without_leaking_stderr_or_arguments(self):
+        error=subprocess.CalledProcessError(1,['ffmpeg','https://private/?token=SECRET'],stderr=b'Invalid NAL unit private-key=SECRET /private/file.mp4')
+        diagnostic=media.failure_diagnostic(error,'TRANSCODE')
+        self.assertEqual(diagnostic,{'stage':'TRANSCODE','kind':'INPUT_CORRUPT','errorType':'CalledProcessError','exitCode':1})
+        self.assertNotIn('SECRET',json.dumps(diagnostic))
+        with mock.patch.object(media.subprocess,'run',side_effect=error):
+            with self.assertRaises(media.CompatibilityError) as caught:media.run(['ffmpeg','private.mp4'])
+        self.assertEqual(caught.exception.diagnostic['kind'],'INPUT_CORRUPT')
+
+    def test_timeout_and_bucket_errors_have_distinct_safe_categories(self):
+        self.assertEqual(media.failure_diagnostic(subprocess.TimeoutExpired(['ffmpeg','SECRET'],7200))['kind'],'PROCESS_TIMEOUT')
+        class ClientError(Exception):response={'ResponseMetadata':{'HTTPStatusCode':403},'Error':{'Message':'SECRET'},'headers':{'key':'SECRET'}}
+        diagnostic=media.failure_diagnostic(ClientError('SECRET'))
+        self.assertEqual(diagnostic['kind'],'STORAGE_ACCESS_DENIED');self.assertEqual(diagnostic['httpStatus'],403)
+        self.assertNotIn('SECRET',json.dumps(diagnostic))
+
+
 @unittest.skipUnless(shutil.which(os.environ.get('FFMPEG', 'ffmpeg')) and shutil.which(os.environ.get('FFPROBE', 'ffprobe')), 'FFmpeg tools required')
 class MediaCompatibilityTest(unittest.TestCase):
     def setUp(self):

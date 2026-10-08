@@ -6,6 +6,7 @@ import json
 import math
 import os
 from pathlib import Path
+import errno
 import struct
 import subprocess
 import tempfile
@@ -14,7 +15,9 @@ VERSION = 1
 
 
 class CompatibilityError(RuntimeError):
-    pass
+    def __init__(self, code, diagnostic=None):
+        super().__init__(code)
+        self.diagnostic = diagnostic
 
 
 class ConversionRequired(CompatibilityError):
@@ -29,6 +32,44 @@ def sha256(path):
     return h.hexdigest()
 
 
+def failure_diagnostic(error, stage='MEDIA'):
+    """Return bounded categories only; never serialize stderr, URLs or SDK headers."""
+    if getattr(error, 'diagnostic', None):
+        return error.diagnostic
+    result = dict(stage=stage, kind='UNEXPECTED_EXCEPTION', errorType=type(error).__name__[:64])
+    if str(error) in {'LEASE_HEARTBEAT_LOST', 'LEASE_CANCELLED', 'REFERENCE_UNAVAILABLE', 'SOURCE_CHANGED'}:
+        result.update(stage='HEARTBEAT', kind='HEARTBEAT_UNAVAILABLE' if str(error)=='LEASE_HEARTBEAT_LOST' else 'LEASE_REVOKED')
+    if isinstance(error, subprocess.TimeoutExpired):
+        result['kind'] = 'PROCESS_TIMEOUT'
+    elif isinstance(error, subprocess.CalledProcessError):
+        result.update(kind='PROCESS_EXIT', exitCode=error.returncode)
+        stderr = error.stderr or b''
+        text = (stderr.decode('utf-8', 'replace') if isinstance(stderr, bytes) else str(stderr)).lower()
+        for kind, phrases in (
+            ('INPUT_CORRUPT', ('invalid data found', 'moov atom not found', 'corrupt', 'invalid nal', 'error while decoding')),
+            ('CODEC_UNAVAILABLE', ('unknown encoder', 'decoder not found', 'encoder not found')),
+            ('MEMORY_EXHAUSTED', ('cannot allocate memory', 'out of memory')),
+            ('DISK_FULL', ('no space left on device', 'disk quota exceeded')),
+            ('INVALID_ARGUMENT', ('invalid argument', 'error initializing output stream')),
+        ):
+            if any(phrase in text for phrase in phrases):
+                result['kind'] = kind
+                break
+    elif isinstance(error, OSError):
+        result['kind'] = {errno.ENOENT: 'FILE_MISSING', errno.EACCES: 'FILE_PERMISSION_DENIED',
+                          errno.ENOSPC: 'DISK_FULL', errno.EDQUOT: 'DISK_FULL'}.get(error.errno, 'OS_ERROR')
+    response = getattr(error, 'response', None)
+    if isinstance(response, dict):
+        status = response.get('ResponseMetadata', {}).get('HTTPStatusCode')
+        if isinstance(status, int):
+            result['httpStatus'] = status
+            result['kind'] = {403: 'STORAGE_ACCESS_DENIED', 404: 'STORAGE_OBJECT_MISSING',
+                              412: 'SOURCE_CHANGED', 429: 'STORAGE_THROTTLED'}.get(status, 'STORAGE_REQUEST_FAILED')
+    if type(error).__name__ in {'EndpointConnectionError', 'ConnectionClosedError', 'ReadTimeoutError', 'ConnectTimeoutError'}:
+        result['kind'] = 'STORAGE_NETWORK_ERROR'
+    return result
+
+
 def run(argv):
     try:
         return subprocess.run(argv, check=True, capture_output=True, timeout=7200).stdout
@@ -37,7 +78,8 @@ def run(argv):
         full=hm_media_workspace.storage_failure(exc)
         if full:raise full from None
         # Do not leak input URLs, paths or ffmpeg stderr into public worker messages.
-        raise CompatibilityError('MEDIA_COMPAT_PROCESS_FAILED') from exc
+        stage = 'PROBE' if Path(argv[0]).name.startswith('ffprobe') else 'DECODE' if 'null' in argv else 'TRANSCODE'
+        raise CompatibilityError('MEDIA_COMPAT_PROCESS_FAILED', failure_diagnostic(exc, stage)) from exc
 
 
 def probe(path):
@@ -192,14 +234,14 @@ def _normalize(source, *, allow_conversion=True):
                              *video_args, '-tag:v', 'avc1', *audio_args,
                              '-movflags', '+faststart', str(temporary)])
                     except CompatibilityError as exc:
-                        raise CompatibilityError('TRANSCODE_PROCESS_FAILED') from exc
+                        raise CompatibilityError('TRANSCODE_PROCESS_FAILED', failure_diagnostic(exc, 'TRANSCODE')) from exc
                 try:
                     info = probe(temporary)
                     if not compatible(temporary, info): raise CompatibilityError('MEDIA_COMPAT_OUTPUT_UNSUPPORTED')
                     validate(original, info)
                     decode(temporary)
                 except CompatibilityError as exc:
-                    raise CompatibilityError('TRANSCODE_'+str(exc).removeprefix('MEDIA_COMPAT_')) from exc
+                    raise CompatibilityError('TRANSCODE_'+str(exc).removeprefix('MEDIA_COMPAT_'), failure_diagnostic(exc, 'TRANSCODE')) from exc
                 if sha256(source) != source_hash: raise CompatibilityError('MEDIA_COMPAT_SOURCE_CHANGED')
                 result = dict(path=str(output), sha256=sha256(temporary), fileSize=temporary.stat().st_size,
                               durationSeconds=float(info['format']['duration']), converted=True,
