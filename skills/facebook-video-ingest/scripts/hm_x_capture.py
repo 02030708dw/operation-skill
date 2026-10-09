@@ -6,12 +6,39 @@ import os
 from pathlib import Path
 import subprocess
 import time
+import unicodedata
 from urllib.parse import urlsplit
 
 HOSTS = {'x.com', 'www.x.com', 'twitter.com', 'www.twitter.com', 'mobile.twitter.com'}
 POST = re.compile(r'/(?:[A-Za-z0-9_]{1,15}|i/web)/status/([0-9]{1,20})(?:/video/[1-9][0-9]?)?/?')
 PROFILE = re.compile(r'/([A-Za-z0-9_]{1,15})(?:/media)?/?')
 RESERVED = {'i','home','explore','settings','messages','search','notifications','compose','login','logout','signup','tos','privacy','account','accounts','hashtag','share'}
+
+
+def clean_title(value):
+    """X appends media/share URLs to post text; they are not a caption."""
+    text = unicodedata.normalize('NFC', str(value or ''))
+    text = re.sub(r'https?://[^\s<>]+', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'(?<![\w/])(?:www\.)?t\.co/[A-Za-z0-9_]+', '', text, flags=re.IGNORECASE)
+    return re.sub(r'[\s\x00-\x1f\x7f]+', ' ', text).strip()
+
+
+def title_metadata(info, parent=None):
+    parent = parent or {}
+    # A real description, including a blank or URL-only one, takes precedence
+    # over yt-dlp's synthetic "author - ..." title.
+    candidates = (info, parent)
+    raw = next((row['description'] for row in candidates if row.get('description') is not None), None)
+    if raw is None:
+        raw = info.get('title') or parent.get('title') or ''
+        author = info.get('uploader') or parent.get('uploader')
+        if author and raw.startswith(author + ' - '):
+            raw = raw[len(author) + 3:]
+    title = clean_title(raw)
+    if title == '未获取标题':
+        title = ''
+    return dict(title=title or '未获取标题', titleSource='POST_TEXT' if title else 'NONE',
+                titleStatus='AVAILABLE' if title else 'NO_TEXT')
 
 
 def source(url):
@@ -146,6 +173,5 @@ def discover(url, limit, profile=None):
     for row in rows:
         handle=row.get('uploader_id') or info.get('uploader_id') or post['url'].split('/')[3]
         if handle in ('i','web'):handle=None
-        title=row.get('description') or info.get('description') or row.get('title') or info.get('title')
-        result[str(row['id'])]=dict(id=str(row['id']),url=post['url'],sourceName=row.get('uploader') or info.get('uploader') or handle,sourceHandle=handle,title=title or '未获取标题',titleSource='POST_TEXT' if title else 'NONE',titleStatus='AVAILABLE' if title else 'NO_TEXT')
+        result[str(row['id'])]=dict(id=str(row['id']),url=post['url'],sourceName=row.get('uploader') or info.get('uploader') or handle,sourceHandle=handle,**title_metadata(row, info))
     return list(result.values())

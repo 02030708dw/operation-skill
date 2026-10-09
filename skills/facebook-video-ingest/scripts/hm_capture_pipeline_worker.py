@@ -377,7 +377,7 @@ def _execute_stage(job_file):
                         platformVideoId=job['entry']['id'],title=backend_title(item.get('title') or job['entry'].get('title') or job['entry']['id']),
                         sourceName=(item.get('sourceName') or job['entry'].get('sourceName') or '').encode('utf-16-le')[:240].decode('utf-16-le','ignore') or None,
                         sourceHandle=item.get('sourceHandle') or job['entry'].get('sourceHandle'),
-                        titleSource=job['entry'].get('titleSource','ORIGINAL'),titleStatus=job['entry'].get('titleStatus','AVAILABLE'),
+                        titleSource=item.get('titleSource',job['entry'].get('titleSource','ORIGINAL')),titleStatus=item.get('titleStatus',job['entry'].get('titleStatus','AVAILABLE')),
                         localPath=str(path),fileName=path.name,fileSize=path.stat().st_size,fileSha256=digest(path),
                         durationSeconds=int(item.get('duration') or 0),expectAudio=bool(item.get('expectAudio')),attempts=attempts)
             elif video is None:

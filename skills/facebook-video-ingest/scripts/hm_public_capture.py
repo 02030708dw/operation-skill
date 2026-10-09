@@ -275,7 +275,9 @@ def download_item(platform,item,output,credentials):
         def run(self,info):
             path=Path(info['filepath'])
             if not path.is_file() or path.stat().st_size==0:raise Failure('DOWNLOAD_FAILED')
-            captured.append(dict(id=str(info['id']),url=item['url'],title=(info.get('description') or item.get('title') or info.get('title') or '未获取标题') if platform=='X' else info.get('title') or str(info['id']),
+            from hm_x_capture import title_metadata
+            metadata=title_metadata(info,item) if platform=='X' else dict(title=info.get('title') or str(info['id']))
+            captured.append(dict(id=str(info['id']),url=item['url'],**metadata,
                 sourceName=info.get('uploader') or item.get('sourceName') or info.get('uploader_id'),sourceHandle=info.get('uploader_id') or item.get('sourceHandle'),
                 upload_date=info.get('upload_date'),duration=info.get('duration'),path=str(path),bytes=path.stat().st_size,expectAudio=info.get('acodec') not in (None,'none')))
             return [],info
@@ -387,7 +389,7 @@ def video_record(item):
         try:published=dt.datetime.strptime(item['upload_date'],'%Y%m%d').strftime('%Y-%m-%dT00:00:00')
         except ValueError:pass
     return dict(platformVideoId=item['id'],originalUrl=item['url'],canonicalUrl=item['url'],title=item.get('title') or item['id'],
-        titleSource='ORIGINAL' if item.get('title') else 'NONE',titleStatus='AVAILABLE' if item.get('title') else 'PENDING',
+        titleSource=item.get('titleSource', 'ORIGINAL' if item.get('title') else 'NONE'),titleStatus=item.get('titleStatus', 'AVAILABLE' if item.get('title') else 'PENDING'),
         localPath=str(path) if good else None,fileName=path.name if good else None,fileSize=path.stat().st_size if good else None,sha256=digest,
         durationSeconds=round(item['duration']) if item.get('duration') else None,publishedAt=published,
         statistics=dict(attemptId=hashlib.sha256(item['id'].encode()).hexdigest()[:32],occurredAt=item['observedAt'],outcome='CACHE' if item['status']=='skipped' else 'SUCCESS' if good else 'LOGIN_REQUIRED' if item['status']=='login-required' else 'FAILURE') if item.get('observedAt') else None,

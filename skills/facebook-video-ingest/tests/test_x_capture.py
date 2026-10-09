@@ -98,6 +98,39 @@ class XCaptureTests(unittest.TestCase):
                      {'id': '123', 'formats': [{}], 'is_live': True}):
             with self.assertRaises(public.Failure): x.videos(info)
 
+    def test_caption_removes_links_and_preserves_real_text(self):
+        for raw, expected in [
+            ('wataa https://t.co/9afmgHj2Wl', 'wataa'),
+            ('tummy\nhttps://t.co/QLyAhRl0sD', 'tummy'),
+            ('hey u, yes u https://t.co/CjTFdgxttq', 'hey u, yes u'),
+            ('  中文 🌅\u00a0#旅行 @Creator\nhttps://example.com/share?a=1 ', '中文 🌅 #旅行 @Creator'),
+            ('HTTPS://T.CO/Ab123 https://t.co/Ab123', ''),
+            ('t.co/Ab123 www.t.co/Ab123', ''),
+        ]:
+            self.assertEqual(expected, x.clean_title(raw))
+        for raw in ('', 'https://t.co/Ab123', '未获取标题'):
+            self.assertEqual(dict(title='未获取标题',titleSource='NONE',titleStatus='NO_TEXT'),
+                x.title_metadata(dict(description=raw,title='Creator - '+raw)))
+        self.assertEqual('wataa',x.title_metadata(dict(title='Creator - wataa https://t.co/Ab123',uploader='Creator'))['title'])
+
+    def test_discovery_and_download_apply_the_same_caption_policy(self):
+        import hm_media_workspace as workspace
+        for raw, expected, state in [('wataa https://t.co/Ab123','wataa','AVAILABLE'),
+                                     ('https://t.co/Ab123','未获取标题','NO_TEXT')]:
+            info=dict(id='456',formats=[{}],description=raw,title='Creator - '+raw,uploader='Creator')
+            ydl=Mock();ydl.__enter__=Mock(return_value=ydl);ydl.__exit__=Mock(return_value=False)
+            ydl.extract_info.return_value=info;ydl._postprocessor_hooks=[];ydl.params={}
+            with patch('yt_dlp.YoutubeDL',return_value=ydl):
+                entry=x.discover('https://x.com/Creator/status/123/video/1',10)[0]
+            with tempfile.TemporaryDirectory() as tmp:
+                path=Path(tmp)/'456.mp4';path.write_bytes(b'media')
+                ydl.process_ie_result.side_effect=lambda row,download: ydl.add_post_processor.call_args.args[0].run(dict(row,filepath=str(path)))
+                with patch('yt_dlp.YoutubeDL',return_value=ydl),patch.object(public,'resolve_ffmpeg',return_value='/ffmpeg'),patch.object(workspace,'reserve_input'):
+                    result=public.download_item('X',entry,Path(tmp),{'cookiefile':'must-not-read'})
+            for value in (entry,result):
+                self.assertEqual(expected,value['title']);self.assertEqual(state,value['titleStatus'])
+                self.assertEqual('NONE' if state=='NO_TEXT' else 'POST_TEXT',value['titleSource'])
+
     def test_anonymous_no_video_is_not_reported_as_a_download_or_login_failure(self):
         from yt_dlp.utils import DownloadError
         ydl=Mock();ydl.__enter__=Mock(return_value=ydl);ydl.__exit__=Mock(return_value=False)
