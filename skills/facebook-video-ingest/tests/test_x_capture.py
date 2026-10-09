@@ -98,6 +98,26 @@ class XCaptureTests(unittest.TestCase):
                      {'id': '123', 'formats': [{}], 'is_live': True}):
             with self.assertRaises(public.Failure): x.videos(info)
 
+    def test_anonymous_no_video_is_not_reported_as_a_download_or_login_failure(self):
+        from yt_dlp.utils import DownloadError
+        ydl=Mock();ydl.__enter__=Mock(return_value=ydl);ydl.__exit__=Mock(return_value=False)
+        ydl.extract_info.side_effect=DownloadError('ERROR: [twitter] 123: No video could be found in this tweet')
+        with patch('yt_dlp.YoutubeDL',return_value=ydl) as factory:
+            with self.assertRaises(public.Failure) as caught:x.discover('https://x.com/Creator/status/123/video/1',10)
+        self.assertEqual('X_VIDEO_UNAVAILABLE',public.classify(caught.exception))
+        self.assertFalse(public.requires_login(caught.exception.code,[]))
+        self.assertNotIn('cookiefile',factory.call_args.args[0])
+        self.assertNotIn('cookiesfrombrowser',factory.call_args.args[0])
+
+    def test_explicit_login_and_network_errors_keep_their_original_classification(self):
+        from yt_dlp.utils import DownloadError
+        ydl=Mock();ydl.__enter__=Mock(return_value=ydl);ydl.__exit__=Mock(return_value=False)
+        for message,code in [('You must log in to view this tweet','LOGIN_REQUIRED'),('Connection timed out','NETWORK_ERROR')]:
+            ydl.extract_info.side_effect=DownloadError(message)
+            with patch('yt_dlp.YoutubeDL',return_value=ydl),self.assertRaises(DownloadError) as caught:
+                x.discover('https://x.com/Creator/status/123',10)
+            self.assertEqual(code,public.classify(caught.exception))
+
     def test_login_errors_never_use_facebook_or_google_accounts(self):
         accounts={'facebookAccount': {'key': 'fb'}, 'googleAccount': {'key': 'google'}}
         with patch.object(public.facebook, 'account_config') as fb, patch.object(public.google, 'account_config') as google:

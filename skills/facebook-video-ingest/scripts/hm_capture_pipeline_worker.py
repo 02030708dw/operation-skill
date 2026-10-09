@@ -432,6 +432,8 @@ def _execute_stage(job_file):
         if job.get('windowedMode') and job['stage']=='DOWNLOAD' and not os.getenv('HM_JOB_MEDIA_ROOT'):
             cleanup_pipeline_media(directory,saved)
         code=public.classify(error)
+        if job['stage']=='X_IMPORT' and attempts:
+            attempts[-1].update(result='FAILED',reasonCode=code)
         if job.get('windowedMode') and (job['stage']=='DOWNLOAD' or job.get('legacyAdopt')) and error.__class__.__name__=='StorageFailure':
             code=str(error) if str(error).replace('_','').isalnum() and len(str(error))<=80 else 'REVIEW_STORAGE_FAILED'
         result.update(outcome='RESOURCE_WAIT' if code=='MEDIA_WORKSPACE_BUSY' else 'RATE_LIMITED' if code=='RATE_LIMITED' else 'LOGIN_REQUIRED' if public.requires_login(code,attempts) else 'FAILED',errorCode=code,attempts=attempts)

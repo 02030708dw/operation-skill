@@ -16,6 +16,21 @@ import hm_server_worker as runner
 
 
 class PipelineTests(unittest.TestCase):
+    def test_failed_x_import_records_public_discovery_reason_without_stopping_next_link(self):
+        import hm_x_capture as x
+        import hm_public_capture as public
+        with tempfile.TemporaryDirectory() as temp,patch.object(runner,'tenant_config',return_value={}):
+            job=Path(temp)/'job.json'
+            job.write_text(json.dumps(dict(stage='X_IMPORT',leaseVersion=3,sourceUrl='https://x.com/creator/status/123',windowedMode=True)))
+            with patch.object(x,'discover',side_effect=public.Failure('X_VIDEO_UNAVAILABLE')):
+                pipeline._execute_stage(job)
+            result=json.loads(pipeline.result_file(job).read_text())
+            self.assertEqual('FAILED',result['outcome'])
+            self.assertEqual('X_VIDEO_UNAVAILABLE',result['errorCode'])
+            self.assertEqual([dict(stage='DISCOVERY',mode='PUBLIC',result='FAILED',reasonCode='X_VIDEO_UNAVAILABLE')],result['attempts'])
+            with patch.object(x,'discover',return_value=[{'id':'456'}]):pipeline._execute_stage(job)
+            self.assertEqual('SUCCESS',json.loads(pipeline.result_file(job).read_text())['outcome'])
+
     def test_title_limit_counts_java_utf16_units_without_splitting_emoji(self):
         self.assertEqual('a'*299,pipeline.backend_title('a'*299+'😀'))
         self.assertEqual('a'*298+'😀',pipeline.backend_title('a'*298+'😀'+'b'))

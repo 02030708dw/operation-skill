@@ -37,6 +37,7 @@ MESSAGES = {
     'DISCOVERY_INCOMPLETE':'主页分页证据不完整，保留继续点，不能计为成功检查。',
     'DISCOVERY_EMPTY':'来源页未发现可下载视频，未能枚举本次视频列表。',
     'DOWNLOAD_FAILED':'未获得可验证的视频文件，请检查链接或查看平台访问情况。',
+    'X_VIDEO_UNAVAILABLE':'匿名请求未取得视频，帖子可能受限或没有视频。',
     'PROFILE_ID_UNAVAILABLE':'主页未返回可解析的账号编号，未能枚举；不等同于需要登录。',
     'EXTRACTION_ERROR':'平台返回内容无法解析。',
     'VALIDATION_FAILED':'视频音画校验失败，未计入下载成功。',

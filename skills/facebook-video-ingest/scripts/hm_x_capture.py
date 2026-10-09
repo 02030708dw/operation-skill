@@ -122,8 +122,16 @@ def discover(url, limit, profile=None):
     import yt_dlp
     post = source(url)
     if post.get('kind')=='profile':return discover_profile(url,limit,profile)
-    with yt_dlp.YoutubeDL(dict(public.common_options({}), skip_download=True, noplaylist=True)) as ydl:
-        info = ydl.extract_info(re.sub(r'/video/[0-9]+$', '', post['url']), download=False)
+    try:
+        with yt_dlp.YoutubeDL(dict(public.common_options({}), skip_download=True, noplaylist=True)) as ydl:
+            info = ydl.extract_info(re.sub(r'/video/[0-9]+$', '', post['url']), download=False)
+    except yt_dlp.utils.DownloadError as error:
+        # X also returns an empty TweetTombstone to anonymous requests. The
+        # extractor's no-video error cannot distinguish that from a text post.
+        # Do not assert login, deletion or lack of video without evidence.
+        if 'No video could be found in this tweet' in str(error):
+            raise public.Failure('X_VIDEO_UNAVAILABLE') from None
+        raise
     if not info:
         raise public.Failure('EXTRACTION_ERROR')
     rows = videos(info)
